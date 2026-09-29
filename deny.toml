@@ -1,5 +1,5 @@
 # cargo-deny config: each section is checked by `cargo deny check` in the security workflow
-# 文档:https://embarkstudios.github.io/cargo-deny/
+# Documentation: https://embarkstudios.github.io/cargo-deny/
 
 [graph]
 # Scan the dependency surface of every feature combination (dev-dependencies included)
@@ -17,11 +17,12 @@ allow = [
   "Unicode-3.0",
   "Unicode-DFS-2016",
   "Zlib",
-  # webpki-roots 0.26+ 的根证书数据许可
+  # License for webpki-roots 0.26+ root certificate data.
   "CDLA-Permissive-2.0",
 ]
 
-# ring 的 SPDX 声明非标准 (OpenSSL 衍生条款),按 cargo-deny 官方模板显式澄清
+# ring uses a non-standard SPDX declaration (OpenSSL-derived terms); clarify
+# it explicitly following the cargo-deny template.
 [[licenses.clarify]]
 name = "ring"
 expression = "ISC AND MIT AND OpenSSL"
@@ -29,7 +30,7 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 [advisories]
 version = 2
-# yanked 版本只警告;RustSec 漏洞默认即 fail
+# Warn on yanked versions; RustSec advisories fail by default.
 yanked = "warn"
 # RustCrypto RSA 0.10.0-rc.18 is still affected by Marvin timing side
 # channels and upstream has not published a fixed release. RSA is opt-in in
@@ -37,7 +38,8 @@ yanked = "warn"
 ignore = ["RUSTSEC-2023-0071"]
 
 [bans]
-# 依赖树中同一 crate 多版本：先警告，收紧为 deny 前观察实际多寡
+# Warn on multiple versions of the same crate while the dependency graph is
+# monitored; tighten this to deny after the actual graph is stable.
 multiple-versions = "warn"
 
 [sources]

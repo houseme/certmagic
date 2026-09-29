@@ -47,8 +47,8 @@ certmagic = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
-默认构建使用 AWS-LC-RS 加密后端，并同时启用 RSA 密钥生成与 ZeroSSL
-签发方。如果需要更轻量、可移植的 Ring 构建，可关闭默认 feature 并显式选择所需能力：
+默认构建使用 AWS-LC-RS 加密后端，并启用 ZeroSSL 签发方。RSA 密钥生成为显式 opt-in。
+如果需要更轻量、可移植的 Ring 构建，可关闭默认 feature 并显式选择所需能力：
 
 ```toml
 [dependencies]
@@ -57,9 +57,12 @@ certmagic = { version = "0.1", default-features = false, features = [
 ] }
 ```
 
-默认启用了 `rsa`；但它会引入 RustCrypto `rsa` crate。只签发 ECDSA 或
-Ed25519 证书的部署可以像上例一样省略 `rsa`，以缩小依赖树并避开仅影响 RSA
-路径的安全公告。
+`ring` 和 `aws-lc-rs` provider feature 会同时选择匹配的 `x509-parser` 签名验证后端（分别为 `verify` 和 `verify-aws`），因此证书验证后端与 rustls、rcgen、reqwest 保持一致。使用 `--no-default-features` 时应明确选择一个 provider，并按需打开 runtime feature。
+
+`rsa` feature 现在是显式 opt-in，因为它会引入 RustCrypto `rsa` crate。
+只签发 ECDSA 或 Ed25519 证书的部署应保持关闭，以缩小依赖树并避免 RSA
+路径的 timing side-channel 风险。RustSec `RUSTSEC-2023-0071` 仍被显式跟踪，
+因为上游尚未发布修复版本。
 
 ## 快速开始
 
@@ -120,6 +123,10 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 `rustls::ServerConfig`。需要复用策略和后端配置时，可使用
 `ConfigBuilder::new().policy(Policy::default()).storage(storage).build()`。
 
+`Cache::new` 会自动启动续期/OCSP 维护。需要显式生命周期时，可使用
+`Cache::new_without_maintenance`，再调用 `start_maintenance`；`stop_and_wait`
+会取消并加入任务而不消费 cache。停止后的 cache 不能重新启动。
+
 ## 与 rustls 集成
 
 三种路径，按部署形态选择：
@@ -140,9 +147,9 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 | `ocsp`              | ✔   | OCSP 装订生命周期（手写 RFC 6960 编解码） |
 | `zerossl`           | ✔   | ZeroSSL ACME/EAB 与 REST API 签发方        |
 | `local-cache`       |      | 节点本地读穿存储缓存                      |
-| `rsa`               | ✔   | RSA 2048/4096/8192 密钥生成               |
-| `ring`              |     | Ring 加密后端（可移植替代方案）            |
-| `aws-lc-rs`         | ✔   | AWS-LC 加密后端（含 P-521 CSR 签名）      |
+| `rsa`               |     | 显式启用的 RSA 2048/4096/8192 密钥生成     |
+| `ring`              |     | Ring 加密后端与 `x509-parser/verify`       |
+| `aws-lc-rs`         | ✔   | AWS-LC 加密后端与 `x509-parser/verify-aws`（含 P-521 CSR 签名） |
 | `integration-tests` |      | Pebble 端到端测试                         |
 
 ## 测试
@@ -150,13 +157,29 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 ```sh
 cargo test                          # 单元测试（离线）
 cargo test --lib --all-features     # 全 feature 组合
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+shellcheck tests/*.sh
+
+# RustSec 审计：RUSTSEC-2023-0071 是显式 opt-in RSA 例外
+cargo audit --file Cargo.lock --deny warnings --ignore RUSTSEC-2023-0071
 
 # 对 Pebble（Let's Encrypt 参考服务器）的真实 ACME 端到端测试：
-./tests/run-pebble.sh               # 自动安装 Pebble + challtestsrv
+./tests/run-pebble.sh               # 默认 DNS-01
+PEBBLE_CHALLENGE=http-01 ./tests/run-pebble.sh
+PEBBLE_CHALLENGE=tls-alpn-01 ./tests/run-pebble.sh
+
+# 确定性边界检查（强制 Cargo 离线模式）：
+./tests/external-validation.sh --offline
+# 显式本地 Pebble lane（不访问生产 CA）：
+./tests/external-validation.sh --pebble
+# 临时 loopback 端口上的监听器检查（不需要 CA 或公网 DNS）：
+./tests/external-validation.sh --loopback-challenges
 ```
 
-Pebble 测试覆盖完整生命周期——账户注册、经 challtestsrv 的 DNS-01 校验、签发、存储持久化、强制续期——正是它保证了若干协议细节的正确性（全小写
-`application/jose+json`、挑战 token 可选、订单 `ready` → `finalize` 顺序等）。
+Pebble 测试覆盖完整生命周期——账户注册、选定的 HTTP-01/TLS-ALPN-01/DNS-01
+校验、签发、存储持久化和强制续期；HTTP-01 与 TLS-ALPN-01 模式会关闭
+challtestsrv 的预置 challenge responder，让 certmagic 自己在配置的高端口上提供验证响应。
 
 ## 项目结构
 

@@ -2,7 +2,6 @@
 name = "certmagic"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98.1"
 license = "Apache-2.0"
 repository = "https://github.com/houseme/certmagic"
 homepage = "https://github.com/houseme/certmagic"
