@@ -14,6 +14,7 @@ test -f "$workflow"
 grep -Fq 'workflow_dispatch:' "$workflow"
 grep -Fq 'environment:' "$workflow"
 grep -Fq 'name: external-validation' "$workflow"
+# shellcheck disable=SC2016 # Match the literal GitHub Actions expression.
 grep -Fq 'ZEROSSL_API_KEY: ${{ secrets.ZEROSSL_API_KEY }}' "$workflow"
 if grep -Eq '^  (push|pull_request|schedule|workflow_call):' "$workflow"; then
   echo "external validation workflow must remain manual-only" >&2

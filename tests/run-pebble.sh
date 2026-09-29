@@ -93,8 +93,8 @@ sleep 1
 pebble_pid=$!
 
 wait_for_port() {
-  local port="$1" name="$2" i
-  for i in $(seq 1 30); do
+  local port="$1" name="$2"
+  for _ in $(seq 1 30); do
     if [[ -n "$challtestsrv_pid" ]] && ! kill -0 "$challtestsrv_pid" 2>/dev/null; then
       echo "${name} dependency exited before readiness" >&2
       return 1
