@@ -46,7 +46,9 @@ jobs:
       # Scan the checked-in lockfile, including development dependencies.
       # Refresh RustSec on every run so new advisories affect unchanged code.
       - name: Audit locked dependencies
-        run: cargo audit --file Cargo.lock --deny warnings
+        # RSA is an opt-in feature and RustCrypto has no fixed release for
+        # RUSTSEC-2023-0071 yet; deny every other advisory.
+        run: cargo audit --file Cargo.lock --deny warnings --ignore RUSTSEC-2023-0071
 
   cargo-deny:
     name: Cargo deny (licenses / bans / sources)

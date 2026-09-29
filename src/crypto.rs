@@ -137,7 +137,7 @@ pub(crate) fn pkcs8_of(key_type: KeyType) -> Result<PrivateKeyDer<'static>> {
     if let Some(bits) = key_type.rsa_bit_len() {
         use rsa::RsaPrivateKey;
         use rsa::pkcs8::EncodePrivateKey;
-        let mut rng = rsa::rand_core::OsRng;
+        let mut rng = rand::rng();
         let key_pair = RsaPrivateKey::new(&mut rng, bits)
             .map_err(|e| Error::Config(ConfigError::Invalid(format!("rsa keygen: {e}"))))?;
         let der = key_pair

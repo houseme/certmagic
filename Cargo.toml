@@ -29,7 +29,7 @@ x509-parser = "0.18.1"
 ring = { version = "0.17.14", optional = true }
 aws-lc-rs = { version = "1.18.1", optional = true }
 p521 = { version = "0.14.0", features = ["ecdsa"] }
-rsa = { version = "0.9", optional = true, features = ["sha2", "getrandom"] }
+rsa = { version = "0.10.0-rc.18", optional = true, features = ["sha2", "getrandom"] }
 
 # HTTP
 reqwest = { version = "0.13.5", default-features = false, features = ["form", "http2", "json"] }
@@ -63,7 +63,6 @@ tokio = { version = "1.53.1", features = ["test-util"] }
 # available for portable builds (use it with `--no-default-features`).
 default = [
     "aws-lc-rs",
-    "rsa",
     "zerossl",
     "file-storage",
     "http-01",
@@ -89,7 +88,8 @@ aws-lc-rs = [
     "x509-parser/verify-aws",
 ]
 # RSA key generation uses RustCrypto's RSA implementation and rcgen's
-# selected signing backend for CSR generation.
+# selected signing backend for CSR generation. It is intentionally opt-in:
+# RustSec RUSTSEC-2023-0071 has no upstream fixed release yet.
 rsa = ["dep:rsa", "aws-lc-rs", "rcgen/aws_lc_rs"]
 file-storage = []
 http-01 = []

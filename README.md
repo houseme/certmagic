@@ -87,10 +87,11 @@ respectively), so certificate verification uses the same backend as rustls,
 rcgen, and reqwest. Select exactly one provider in a `--no-default-features`
 build; optional runtime modules each have an independent feature flag.
 
-The `rsa` feature is enabled by default, but it pulls in the RustCrypto `rsa`
-crate. Deployments that only issue ECDSA or Ed25519 certificates can omit
-`rsa` (as in the example above) to keep the dependency tree smaller and avoid
-RSA-specific advisories.
+The `rsa` feature is opt-in because it pulls in the RustCrypto `rsa` crate.
+Deployments that only issue ECDSA or Ed25519 certificates should leave it off
+to keep the dependency tree smaller and avoid RSA-specific timing-sidechannel
+risk. RustSec `RUSTSEC-2023-0071` remains explicitly tracked because the
+upstream project has not published a fixed release yet.
 
 ## Quick start
 
@@ -177,7 +178,7 @@ Three paths, pick per deployment:
 | `ocsp`              | ✔      | OCSP stapling lifecycle (hand-rolled RFC 6960 codec)     |
 | `zerossl`           | ✔      | ZeroSSL ACME/EAB and REST API issuers                    |
 | `local-cache`       |         | Node-local read-through storage cache                    |
-| `rsa`               | ✔      | RSA 2048/4096/8192 key generation                       |
+| `rsa`               |        | Opt-in RSA 2048/4096/8192 key generation                |
 | `ring`              |         | Ring crypto provider and `x509-parser/verify`             |
 | `aws-lc-rs`         | ✔      | AWS-LC crypto provider and `x509-parser/verify-aws` (including P-521 CSR signing) |
 | `integration-tests` |         | Pebble end-to-end tests                                  |
