@@ -1,0 +1,75 @@
+name: Audit
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/audit.yml'
+  pull_request:
+  schedule:
+    # Weekly rescan even without pushes: RustSec advisories are disclosed
+    # continuously, and published vulnerabilities must be caught promptly.
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-audit:
+    name: RustSec dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-audit-0.22.2
+          cache-bin: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install the pinned audit tool
+        run: cargo install cargo-audit --locked --version 0.22.2
+      # Scan the checked-in lockfile, including development dependencies.
+      # Refresh RustSec on every run so new advisories affect unchanged code.
+      - name: Audit locked dependencies
+        run: cargo audit --file Cargo.lock --deny warnings
+
+  cargo-deny:
+    name: Cargo deny (licenses / bans / sources)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  dependency-review:
+    name: Dependency review (PR dependency changes)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # GitHub's official action performs vulnerability review only; license
+      # auditing is handled by cargo-deny + deny.toml.
+      - uses: actions/dependency-review-action@v5

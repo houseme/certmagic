@@ -1,0 +1,304 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/**'
+      - 'tests/**'
+      - 'examples/**'
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGO_INCREMENTAL: "0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  format:
+    name: Formatting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: crate-ci/typos@v1
+
+  test:
+    name: Tests (${{ matrix.os }} / ${{ matrix.toolchain }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+        toolchain: [stable, nightly]
+        exclude:
+          # Keep the nightly lane focused: deep platform coverage rides on stable.
+          - os: macos-15
+            toolchain: nightly
+          - os: windows-2025
+            toolchain: nightly
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.toolchain }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version
+      # cargo test includes doctests; --all-targets alone would skip them.
+      - name: Default features
+        run: cargo test --locked --no-fail-fast
+      - name: All features
+        if: runner.os == 'Linux' && matrix.toolchain == 'stable'
+        run: cargo test --locked --all-features --no-fail-fast
+
+  clippy:
+    name: Clippy (${{ matrix.toolchain }})
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, nightly]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ matrix.toolchain }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Default features
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: All features
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  features:
+    name: Feature set - ${{ matrix.features }}
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - 'ring'                  # Portable provider + x509-parser/verify
+          - 'aws-lc-rs'             # AWS-LC provider + x509-parser/verify-aws
+          - 'ring,file-storage'
+          - 'ring,http-01'
+          - 'ring,dns-01'
+          - 'ring,ocsp'
+          - 'ring,zerossl'
+          - 'ring,local-cache'
+          - 'rsa'                   # RSA implies the AWS-LC-RS provider
+          - 'aws-lc-rs,rsa,zerossl'  # Default crypto/issuer capabilities
+          - 'ring,file-storage,local-cache'
+          - 'ring,http-01,zerossl'
+          # Exercise every optional runtime module without the default
+          # FileStorage backend. These lanes ensure portable/custom-storage
+          # builds remain usable for both crypto providers.
+          - 'ring,http-01,dns-01,ocsp,zerossl,local-cache'
+          - 'aws-lc-rs,http-01,dns-01,ocsp,zerossl,local-cache'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features-${{ matrix.features }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test
+        run: |
+          ARGS=()
+          if [ -n "${{ matrix.features }}" ]; then
+            ARGS+=(--features "${{ matrix.features }}")
+          fi
+          cargo test --locked --no-default-features "${ARGS[@]}"
+      - name: Clippy
+        run: |
+          ARGS=()
+          if [ -n "${{ matrix.features }}" ]; then
+            ARGS+=(--features "${{ matrix.features }}")
+          fi
+          cargo clippy --locked --no-default-features "${ARGS[@]}" --all-targets -- -D warnings
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          ARGS=()
+          if [ -n "${{ matrix.features }}" ]; then
+            ARGS+=(--features "${{ matrix.features }}")
+          fi
+          cargo doc --locked --no-default-features "${ARGS[@]}" --no-deps
+
+  offline-validation:
+    name: Offline validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # This lane is intentionally independent from the external Pebble lane.
+    # The script uses Cargo's offline mode and never reads provider secrets.
+    env:
+      CARGO_NET_OFFLINE: "true"
+      CERTMAGIC_EXTERNAL_CONFIRM: ""
+      ZEROSSL_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: offline-validation
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The validation command itself is forced offline, but a clean runner
+      # still needs its locked dependency graph populated once. This fetch is
+      # Cargo registry traffic only; it never contacts a CA or reads secrets.
+      - name: Prime locked Cargo dependencies
+        env:
+          CARGO_NET_OFFLINE: "false"
+        run: cargo fetch --locked
+      - name: Run offline validation
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: ./tests/external-validation.sh --offline
+
+  shell-smoke:
+    name: Validation shell smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Only placeholder values are used by this job. It must remain safe on
+    # every pull request and must not be converted into an external smoke.
+    env:
+      CERTMAGIC_EXTERNAL_CONFIRM: ""
+      ZEROSSL_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run network-free contract smoke tests
+        run: ./tests/external-validation-smoke.sh
+
+  loopback-challenges:
+    name: Loopback challenge listeners
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # This lane exercises local HTTP-01/TLS-ALPN-01 listeners only. It has no
+    # CA credentials and does not contact public DNS or a public endpoint.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loopback-challenges
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Prime locked Cargo dependencies
+        env:
+          CARGO_NET_OFFLINE: "false"
+        run: cargo fetch --locked
+      - name: Run loopback listener checks
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: ./tests/external-validation.sh --loopback-challenges
+
+  pebble-integration:
+    name: Pebble ACME integration (${{ matrix.challenge }})
+    strategy:
+      fail-fast: false
+      matrix:
+        challenge: [dns-01, http-01, tls-alpn-01]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Pebble is a local ACME reference server. No production CA, public
+    # challenge endpoint, or repository secret is used by this job.
+    env:
+      PEBBLE_VERSION: v2.10.1
+      CHALLTESTSRV_VERSION: v2.10.1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.24.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: integration-${{ matrix.challenge }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run Pebble challenge lane
+        env:
+          PEBBLE_CHALLENGE: ${{ matrix.challenge }}
+        run: ./tests/run-pebble.sh
+
+  package:
+    name: Package verification
+    needs: [format, test, clippy, features, offline-validation, shell-smoke, loopback-challenges, pebble-integration]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      # Packaging extracts another source tree under target/package. Cache only
+      # registry data here so cache cleanup does not traverse the extracted crate.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Verification only: CI has no registry token or publishing step.
+      - name: Inspect package contents
+        run: cargo package --locked --list
+      - name: Build and verify the package
+        run: cargo package --locked
+      - name: Run examples (compile only on CI)
+        run: |
+          cargo build --locked --example basic_https
+          cargo build --locked --example on_demand
+          cargo build --locked --example custom_dns01

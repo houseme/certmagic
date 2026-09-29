@@ -1,0 +1,42 @@
+# cargo-deny config: each section is checked by `cargo deny check` in the security workflow
+# 文档:https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Scan the dependency surface of every feature combination (dev-dependencies included)
+all-features = true
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  # webpki-roots 0.26+ 的根证书数据许可
+  "CDLA-Permissive-2.0",
+]
+
+# ring 的 SPDX 声明非标准 (OpenSSL 衍生条款),按 cargo-deny 官方模板显式澄清
+[[licenses.clarify]]
+name = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[advisories]
+version = 2
+# yanked 版本只警告;RustSec 漏洞默认即 fail
+yanked = "warn"
+
+[bans]
+# 依赖树中同一 crate 多版本：先警告，收紧为 deny 前观察实际多寡
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

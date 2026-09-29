@@ -1,0 +1,96 @@
+name: External validation (manual)
+
+# This workflow is deliberately manual-only.  It is not part of pull-request,
+# push, release, or reusable CI; running it can consume CA quota and make
+# requests to operator-owned public infrastructure.
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: External validation lane to run
+        required: true
+        type: choice
+        options:
+          - zerossl-rest
+          - zerossl-acme
+          - public-http-01
+          - public-tls-alpn-01
+          - distributed-http-01
+      domain:
+        description: Disposable DNS name (never a production hostname)
+        required: false
+        type: string
+      public_http01_url:
+        description: Public HTTP-01 challenge URL, when required
+        required: false
+        type: string
+      public_tlsalpn_host:
+        description: Public TLS-ALPN-01 host, when required
+        required: false
+        type: string
+      public_tlsalpn_port:
+        description: Public TLS-ALPN-01 port (defaults to 443)
+        required: false
+        default: "443"
+        type: string
+      distributed_http01_urls:
+        description: Space-separated URLs for at least two distinct node paths
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: external-validation-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  external:
+    name: ${{ inputs.lane }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Create this environment with required reviewers and put the short-lived
+    # secrets below in the environment, not in repository-wide secrets.
+    environment:
+      name: external-validation
+    env:
+      # This is the wrapper's explicit safety switch, not a credential.  The
+      # protected environment above is the second, human approval gate.
+      CERTMAGIC_EXTERNAL_CONFIRM: I_UNDERSTAND_EXTERNAL_NETWORK
+      CERTMAGIC_EXTERNAL_DOMAIN: ${{ inputs.domain }}
+      CERTMAGIC_PUBLIC_HTTP01_URL: ${{ inputs.public_http01_url }}
+      CERTMAGIC_PUBLIC_TLSALPN_HOST: ${{ inputs.public_tlsalpn_host }}
+      CERTMAGIC_PUBLIC_TLSALPN_PORT: ${{ inputs.public_tlsalpn_port }}
+      CERTMAGIC_DISTRIBUTED_HTTP01_URLS: ${{ inputs.distributed_http01_urls }}
+      # These values must be configured as environment secrets.  The wrapper
+      # never prints them and the workflow does not upload command output as
+      # an artifact.
+      ZEROSSL_API_KEY: ${{ secrets.ZEROSSL_API_KEY }}
+      CERTMAGIC_EXTERNAL_EMAIL: ${{ secrets.CERTMAGIC_EXTERNAL_EMAIL }}
+      CERTMAGIC_PUBLIC_HTTP01_EXPECTED: ${{ secrets.CERTMAGIC_PUBLIC_HTTP01_EXPECTED }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run selected external validation lane
+        # The input is constrained by workflow_dispatch's choice type.  Keep
+        # it in an environment variable rather than interpolating it into a
+        # shell fragment, and let the validation wrapper enforce all contracts.
+        env:
+          CERTMAGIC_VALIDATION_LANE: ${{ inputs.lane }}
+        run: |
+          set -euo pipefail
+          case "$CERTMAGIC_VALIDATION_LANE" in
+            zerossl-rest|zerossl-acme|public-http-01|public-tls-alpn-01|distributed-http-01)
+              ./tests/external-validation.sh "--$CERTMAGIC_VALIDATION_LANE"
+              ;;
+            *)
+              echo "unsupported validation lane" >&2
+              exit 2
+              ;;
+          esac

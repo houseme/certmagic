@@ -1,0 +1,116 @@
+[package]
+name = "certmagic"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/houseme/certmagic"
+homepage = "https://github.com/houseme/certmagic"
+documentation = "https://docs.rs/certmagic"
+description = "Automatic TLS certificate acquisition, renewal, and maintenance for Rust servers"
+keywords = ["tls", "acme", "letsencrypt", "https", "certificate"]
+categories = ["network-programming", "cryptography", "asynchronous"]
+exclude = ["docs/", ".github/"]
+
+[dependencies]
+# async runtime
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "fs", "io-util", "signal"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+futures = "0.3.34"
+
+# TLS
+rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["tls12"] }
+rustls-pki-types = "1.15.1"
+
+# X.509 / keys
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem"] }
+x509-parser = "0.18.1"
+ring = { version = "0.17.14", optional = true }
+aws-lc-rs = { version = "1.18.1", optional = true }
+p521 = { version = "0.14.0", features = ["ecdsa"] }
+rsa = { version = "0.9", optional = true, features = ["sha2", "getrandom"] }
+
+# HTTP
+reqwest = { version = "0.13.5", default-features = false, features = ["form", "http2", "json"] }
+
+# serialization / errors / logging
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+async-trait = "0.1.92"
+
+# utilities
+base64 = "0.23.1"
+rand = "0.10.3"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+hex = "0.4.3"
+time = { version = "0.3.55", features = ["formatting", "parsing", "serde", "std"] }
+idna = "1.1.0"
+url = "2.5.8"
+hickory-resolver = { version = "0.26.3", optional = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["test-util"] }
+
+[features]
+# Production-oriented default: AWS-LC-RS is the rustls/reqwest/rcgen
+# provider, with RSA key generation and ZeroSSL support
+# available without additional feature flags. The `ring` feature below remains
+# available for portable builds (use it with `--no-default-features`).
+default = [
+    "aws-lc-rs",
+    "rsa",
+    "zerossl",
+    "file-storage",
+    "http-01",
+    "dns-01",
+    "ocsp",
+]
+# Select the rustls/reqwest/rcgen and ACME crypto provider. Only the selected
+# backend is enabled; `ring` remains available for portable builds.
+ring = [
+    "dep:ring",
+    "rustls/ring",
+    "tokio-rustls/ring",
+    "rcgen/ring",
+    "reqwest/rustls-no-provider",
+    "x509-parser/verify",
+]
+aws-lc-rs = [
+    "dep:aws-lc-rs",
+    "rustls/aws_lc_rs",
+    "tokio-rustls/aws_lc_rs",
+    "rcgen/aws_lc_rs",
+    "reqwest/rustls",
+    "x509-parser/verify-aws",
+]
+# RSA key generation uses RustCrypto's RSA implementation and rcgen's
+# selected signing backend for CSR generation.
+rsa = ["dep:rsa", "aws-lc-rs", "rcgen/aws_lc_rs"]
+file-storage = []
+http-01 = []
+dns-01 = ["dep:hickory-resolver"]
+ocsp = []
+zerossl = []
+local-cache = []
+integration-tests = []
+
+[profile.dev]
+opt-level = 0
+debug = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = "warn"
+dbg_macro = "warn"
