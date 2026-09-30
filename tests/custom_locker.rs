@@ -168,3 +168,16 @@ async fn manual_untracking_does_not_release_a_scoped_acquisition() {
         "foreign guard must not untrack a manual owner"
     );
 }
+
+#[test]
+fn default_canonical_identity_preserves_opaque_custom_backend_keys() {
+    let backend = CustomLocker {
+        semaphore: Arc::new(Semaphore::new(1)),
+        releases: Arc::new(AtomicUsize::new(0)),
+    };
+    use certmagic::Storage;
+    assert_eq!(
+        backend.canonical_key("opaque:../key\\tail").unwrap(),
+        "opaque:../key\\tail"
+    );
+}

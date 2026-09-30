@@ -235,8 +235,12 @@ impl RedisStorage {
 
 #[async_trait]
 impl Storage for RedisStorage {
+    fn canonical_key<'a>(&self, key: &'a str) -> Result<std::borrow::Cow<'a, str>> {
+        super::key::canonical_path(key, false)
+    }
+
     async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
-        let key = normalize(key, false)?;
+        let key = self.canonical_key(key)?;
         let mut command = script(STORE, &self.data_key(&key));
         command.arg(value);
         self.query::<i64>(command, "store").await?;
@@ -244,16 +248,16 @@ impl Storage for RedisStorage {
     }
 
     async fn load(&self, key: &str) -> Result<Vec<u8>> {
-        let key = normalize(key, false)?;
+        let key = self.canonical_key(key)?;
         let mut command = ::redis::cmd("HGET");
         command.arg(self.data_key(&key)).arg("value");
         self.query::<Option<Vec<u8>>>(command, "load")
             .await?
-            .ok_or(Error::Storage(StorageError::NotFound(key)))
+            .ok_or(Error::Storage(StorageError::NotFound(key.into_owned())))
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let key = normalize(key, false)?;
+        let key = self.canonical_key(key)?;
         let mut command = ::redis::cmd("DEL");
         command.arg(self.data_key(&key));
         self.query::<u64>(command, "delete").await?;
@@ -271,7 +275,7 @@ impl Storage for RedisStorage {
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
-        let key = normalize(key, false)?;
+        let key = self.canonical_key(key)?;
         let mut command = ::redis::cmd("EXISTS");
         command.arg(self.data_key(&key));
         if self.query::<bool>(command, "exists").await? {
@@ -281,10 +285,10 @@ impl Storage for RedisStorage {
     }
 
     async fn list(&self, prefix: &str, recursive: bool) -> Result<Vec<String>> {
-        let prefix = normalize(prefix, true)?;
+        let prefix = super::key::canonical_path(prefix, true)?;
         let children = self.scan_children(&prefix, false).await?;
         if children.is_empty() && !prefix.is_empty() {
-            return Err(Error::Storage(StorageError::NotFound(prefix)));
+            return Err(Error::Storage(StorageError::NotFound(prefix.into_owned())));
         }
         if recursive {
             return Ok(children.into_iter().collect());
@@ -306,10 +310,10 @@ impl Storage for RedisStorage {
     }
 
     async fn stat(&self, key: &str) -> Result<KeyInfo> {
-        let key = normalize(key, false)?;
+        let key = self.canonical_key(key)?;
         if let Some((size, modified)) = self.record_stat(&key).await? {
             return Ok(KeyInfo {
-                key,
+                key: key.into_owned(),
                 size,
                 modified: timestamp(modified)?,
                 is_terminal: true,
@@ -317,7 +321,7 @@ impl Storage for RedisStorage {
         }
         let children = self.scan_children(&key, false).await?;
         if children.is_empty() {
-            return Err(Error::Storage(StorageError::NotFound(key)));
+            return Err(Error::Storage(StorageError::NotFound(key.into_owned())));
         }
         let mut modified = OffsetDateTime::UNIX_EPOCH;
         // Virtual prefixes have no timestamp of their own. Derive the newest
@@ -328,7 +332,7 @@ impl Storage for RedisStorage {
             }
         }
         Ok(KeyInfo {
-            key,
+            key: key.into_owned(),
             size: 0,
             modified,
             is_terminal: false,
@@ -631,25 +635,6 @@ fn millis(duration: Duration) -> Option<u64> {
 fn timestamp(milliseconds: i64) -> Result<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(milliseconds) * 1_000_000)
         .map_err(|_| storage_error("invalid Redis modification timestamp"))
-}
-fn normalize(key: &str, allow_root: bool) -> Result<String> {
-    let mut components = Vec::new();
-    for component in key.split('/') {
-        if component.is_empty() || component == "." {
-            continue;
-        }
-        if component == ".."
-            || component.contains(['\0', '\\', ':'])
-            || component.ends_with([' ', '.'])
-        {
-            return Err(Error::Storage(StorageError::InvalidKey(key.into())));
-        }
-        components.push(component);
-    }
-    if components.is_empty() && !allow_root {
-        return Err(Error::Storage(StorageError::InvalidKey(key.into())));
-    }
-    Ok(components.join("/"))
 }
 fn escape_glob(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());

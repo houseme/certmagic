@@ -131,36 +131,8 @@ impl FileStorage {
     /// particular, accepting `..` (or a Windows backslash separator) here
     /// would let a caller escape the configured storage root.
     fn checked_filename(&self, key: &str) -> Result<PathBuf> {
-        if key.is_empty() {
-            return Err(Error::Storage(StorageError::InvalidKey("empty key".into())));
-        }
-        // Keep the on-disk key syntax deliberately narrower than the host
-        // filesystem syntax.  Backslashes are separators on Windows, while
-        // `:` introduces drive prefixes and alternate data streams there;
-        // accepting either would make a key safe on Unix but unsafe (or
-        // ambiguous) on Windows.  Reject keys which normalize to the storage
-        // root as well: `delete("/")` must never be able to remove `root`.
-        let mut has_component = false;
-        for component in key.trim_matches('/').split('/') {
-            if component.is_empty() || component == "." {
-                continue;
-            }
-            if component == ".."
-                || component.contains('\0')
-                || component.contains('\\')
-                || component.contains(':')
-                // Windows strips trailing spaces/dots from path components;
-                // rejecting these avoids cross-platform key collisions.
-                || component.ends_with([' ', '.'])
-            {
-                return Err(Error::Storage(StorageError::InvalidKey(key.to_owned())));
-            }
-            has_component = true;
-        }
-        if !has_component {
-            return Err(Error::Storage(StorageError::InvalidKey(key.to_owned())));
-        }
-        Ok(self.filename(key))
+        let key = self.canonical_key(key)?;
+        Ok(self.root.join(key.as_ref()))
     }
 
     fn checked_prefix(&self, prefix: &str) -> Result<PathBuf> {
@@ -380,6 +352,10 @@ fn spawn_heartbeat(path: PathBuf, owner: String, ct: CancellationToken) {
 
 #[async_trait]
 impl Storage for FileStorage {
+    fn canonical_key<'a>(&self, key: &'a str) -> Result<std::borrow::Cow<'a, str>> {
+        super::key::canonical_path(key, false)
+    }
+
     async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
         let path = self.checked_filename(key)?;
         let dir = path

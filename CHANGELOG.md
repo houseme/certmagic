@@ -8,6 +8,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Add default-preserving `Storage::canonical_key` so decorators can share cache
+  identity and coordination across backend aliases without rewriting opaque keys.
 - Add optional `redis-storage` with isolated namespaces, binary values,
   server-side timestamps, prefix SCAN operations, reconnecting Tokio connections
   and ownership-checked leases with automatic renewal.
@@ -27,6 +29,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   no longer allocate registry IDs or acquire the process-wide registry on Drop.
 - Require manual `track_lock` registrations to be explicitly paired with
   `untrack_lock`; unrelated guard drops no longer remove them by name.
+- Replace LocalCache's global I/O serialization with reusable per-key gates,
+  coalesced cache fills and a prefix-delete barrier; cache hits bypass slow I/O.
 - Update resolved Quinn dependencies to `quinn-proto 0.11.19` and
   `quinn-udp 0.5.16` after refreshing the dependency lockfile.
 - Update the transitive `yoke-derive` dependency to 0.8.4.
@@ -53,6 +57,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   caller snapshots from leaving index entries that hide later certificates.
 - Serialize acknowledged release waiters while retaining cancellation fallback
   and allowing another waiter to retry a cancelled acknowledgement.
+- Keep FileStorage/Redis path aliases coherent through LocalCache updates and
+  prefix deletion, using one shared path validation and normalization policy.
 - Distinguish queued background release requests from acknowledged completion,
   so explicit release waiters cannot report success before the backend confirms.
 - Track automatic lock ownership by acquisition identity and callback, preventing

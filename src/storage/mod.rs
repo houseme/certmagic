@@ -20,6 +20,9 @@ use tokio_util::sync::CancellationToken;
 use crate::crypto::hash_certificate_chain;
 use crate::error::{Error, Result, StorageError};
 
+#[cfg(any(feature = "file-storage", feature = "redis-storage"))]
+mod key;
+
 mod locking;
 pub use locking::{
     LockGuard, LockHandle, LockRelease, Locker, acquire, acquire_lock, acquire_with_timeout,
@@ -68,6 +71,15 @@ pub struct KeyInfo {
 /// - [`Storage::load`] on a missing key yields [`StorageError::NotFound`].
 #[async_trait]
 pub trait Storage: Locker {
+    /// Canonical identity for a value or non-root prefix. Decorators use this
+    /// to share cached values and coordination across backend key aliases.
+    /// The default preserves opaque keys. Overrides must be idempotent and
+    /// agree with all storage operations; hierarchical aliases must preserve
+    /// slash-delimited parent/child relationships.
+    fn canonical_key<'a>(&self, key: &'a str) -> Result<std::borrow::Cow<'a, str>> {
+        Ok(std::borrow::Cow::Borrowed(key))
+    }
+
     /// Store `value` at `key`, creating or overwriting.
     async fn store(&self, key: &str, value: &[u8]) -> Result<()>;
 

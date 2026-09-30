@@ -207,6 +207,17 @@ Manual `track_lock(storage, name)` registrations must be paired with
 automatic registration; dropping an unrelated same-name guard no longer removes
 manual ownership. Prefer the automatic acquisition helpers for new adapters.
 
+LocalCache serves hits without awaiting backend operations and serializes
+misses/writes per canonical key. Prefix deletion excludes fills and writes;
+concurrent misses for one key share the resulting fill. Cached entries retain
+and reuse their key gates; eviction or the last in-flight operation reclaims
+unused gates. Custom backends with aliases should override
+`Storage::canonical_key`; its default preserves opaque keys, while FileStorage
+and Redis normalize slash paths. Nested decorators forward this identity.
+Changes made outside this cache remain invisible until eviction. Cancellation
+cannot retract a dispatched backend write: after an ambiguous outcome, read
+from the authoritative backend rather than assuming the local cache is current.
+
 Certificate/private-key resources can use an independent `CertStore` through
 `ConfigBuilder::cert_store`; accounts, challenge publications, locks and OCSP
 remain on `Storage`. A transactional database or a versioned object bundle can

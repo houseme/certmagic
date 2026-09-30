@@ -670,3 +670,16 @@ async fn issuance_and_renewal_do_not_publish_after_detected_lease_loss() {
         );
     }
 }
+
+#[cfg(feature = "local-cache")]
+#[tokio::test]
+#[ignore = "requires local redis-server; starts an isolated instance"]
+async fn redis_cache_uses_the_same_identity_for_path_aliases() {
+    let server = Server::start().await;
+    let local = certmagic::localcache::LocalCache::new(server.storage("cache-alias").await);
+    local.store("dir/key", b"old").await.unwrap();
+    local.store("./dir//key/", b"new").await.unwrap();
+    assert_eq!(local.load("/dir/key").await.unwrap(), b"new");
+    local.delete("dir/./").await.unwrap();
+    assert!(local.load("dir/key").await.is_err());
+}
