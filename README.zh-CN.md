@@ -150,6 +150,7 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 | `rsa`               |     | 显式启用的 RSA 2048/4096/8192 密钥生成     |
 | `ring`              |     | Ring 加密后端与 `x509-parser/verify`       |
 | `aws-lc-rs`         | ✔   | AWS-LC 加密后端与 `x509-parser/verify-aws`（含 P-521 CSR 签名） |
+| `redis-storage`     |     | 可选 Redis 存储与所有者校验租约锁         |
 | `integration-tests` |      | Pebble 端到端测试                         |
 
 `https` / `https_on` 包装器仅协商 HTTP/1.1，接收不超过 1 MiB 的 Content-Length
@@ -158,19 +159,22 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 ## 存储后端选择
 
 当前内置持久化后端为 FileStorage；LocalCache 是节点本地读缓存，不是分布式权威存储。
-Redis、SQL、etcd 和对象存储客户端目前均未内置。
+新增可选的 `redis-storage` 适配器；SQL、etcd 和对象存储适配器尚未内置。
 
 自定义后端实现 `Storage` 和 `Locker`，通过 `ConfigBuilder::storage` 注入。
 `LockGuard::new` 已开放，未启用 `file-storage` 时也能创建后端自有的锁句柄。
 释放回调必须保留本次获取的所有者 token，并避免阻塞异步执行器；网络后端可排队执行
 校验 token 后的释放，并通过带过期时间的租约处理运行时退出后的恢复。
+新增 `LockRelease::release_async` 与 `LockGuard::release_and_wait().await` 用于等待释放确认；
+`is_valid()` 仅反映本地租约健康，不是 fencing。自动清理按获取实例追踪，同名或不同后端的
+锁不会因旧句柄释放而被取消追踪。
 
 证书与私钥还可通过 `ConfigBuilder::cert_store` 单独接入 `CertStore`；账号、挑战记录、
 锁和 OCSP 仍走 `Storage`。数据库事务或带版本的完整证书资源对象，可以提供比通用三键
 适配器更强的原子性。通用适配器现已并发读取三项内容及存在性，但这不是后端事务快照。
 
 **建议保留默认文件后端，将 Redis 作为可选适配器。** 单机握手缓存命中不需要 Redis；
-多实例且已有 Redis 基础设施时，再实现命名空间、所有者校验、续租、持久化和故障恢复契约。
+多实例且已有 Redis 基础设施时，可以显式启用 `redis-storage`，并配置持久化、容量和故障恢复策略。
 Redis 异步复制后的故障切换不能自动保证锁互斥，持久化策略也需要明确，参见
 [Redis 锁文档](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
 与[持久化文档](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)。
@@ -180,6 +184,53 @@ Redis 异步复制后的故障切换不能自动保证锁互斥，持久化策�
 所有权检查，不能仅更换服务就宣称具备 fencing。
 
 性能基准、原始样本及适用范围见 [benches/README.md](benches/README.md)。
+
+## Redis 适配器
+
+该能力目前属于 **Unreleased**，已发布的 0.1.0 不包含此 feature；请在当前仓库源码
+或 path 依赖中使用，等待后续版本发布。
+
+启用 `features = ["redis-storage"]`，通过
+`RedisStorage::connect(url, RedisStorageOptions { namespace: "my-service".into(), ..Default::default() }).await?`
+创建后端，再传给 `Config::builder().storage(storage).build()`。示例见
+[examples/redis_storage.rs](examples/redis_storage.rs)。
+
+- 单端点连接，支持密码/ACL URL、验证证书的 `rediss://` 与 redis-rs Unix socket URL。
+- 默认租约 30 秒、心跳 10 秒、命令超时 5 秒、获取锁轮询 100 毫秒；心跳与命令预算之和必须小于租约。
+- 值与服务端修改时间原子保存在同一 Redis hash 中，不设置过期时间；锁采用独立键空间和 `SET NX PX`。
+- Lua 续租/释放先校验本次获取的 token；旧持有者不能操作新锁，心跳不缩短显式延长的租约。
+- 前缀遍历使用转义后的 SCAN，删除分批执行；并发前缀修改不提供原子快照。
+- `Drop` 是 best-effort 清理；需要确认释放时使用 `release_and_wait().await`，进程/运行时退出由 TTL 恢复。
+
+**边界：** 当前不是 Redlock，不实现 Cluster/Sentinel 自动发现，也不提供写入侧 fencing。
+签发/续期会在检测到租约丢失后停止重试和发布，但这些检查点不能替代原子写入 fencing。
+证书通用三键适配器仍不是跨键崩溃事务。账号和私钥的持久化、非淘汰容量策略以及 ACL/TLS
+需要由部署配置保证，库不会修改 Redis 服务端配置或输出连接 URL。
+
+真实实例测试会启动独立临时目录、回环端口的 Redis，不使用生产 URL：
+
+```sh
+cargo test --locked --features redis-storage --test redis_storage -- --include-ignored
+cargo test --locked --no-default-features --features ring,redis-storage --test redis_storage -- --include-ignored
+```
+
+可通过 `CERTMAGIC_REDIS_SERVER` 指定本地服务端二进制。网络测试默认忽略，纯配置测试正常运行。
+本机验证使用 Redis 8.10.2，覆盖 AOF 重启恢复、认证、续租、连接失效、取消和旧持有者保护；
+未据此宣称验证了 TLS 握手、Cluster/Sentinel、Valkey 或 Dragonfly。
+
+| 其他后端 | 适配方向 | 当前状态与关键边界 |
+| --- | --- | --- |
+| Valkey | 复用 Redis 协议适配器 | 候选，需先运行同一兼容测试套件 |
+| etcd | `Storage` + 事务/revision/lease 锁 | 需独立适配；真正 fencing 仍需写入侧所有权上下文 |
+| Consul KV | `Storage` + session 锁 | 需处理 session 失效、续期和 lock-delay |
+| DynamoDB | 条件写、租约记录 | TTL 异步删除，不能直接当成锁过期判定 |
+| redb / RocksDB | 单机嵌入式 KV | 阻塞工作移出 Tokio；不等同于分布式共享存储 |
+| S3 兼容存储/密钥服务 | 优先适配完整资源 `CertStore` | 仍需合适的账号、挑战和锁后端 |
+
+参考 [Valkey 兼容说明](https://valkey.io/topics/migration/)、
+[Consul session](https://developer.hashicorp.com/consul/docs/automate/session)、
+[DynamoDB TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ttl-expired-items.html)。
+以上其他后端是候选方案，目前没有对应的内置适配器。
 
 ## 文件存储协调
 

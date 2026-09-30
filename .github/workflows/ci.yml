@@ -143,6 +143,8 @@ jobs:
           - 'ring,ocsp'
           - 'ring,zerossl'
           - 'ring,local-cache'
+          - 'ring,redis-storage'
+          - 'aws-lc-rs,redis-storage'
           - 'rsa'                   # RSA implies the AWS-LC-RS provider
           - 'aws-lc-rs,rsa,zerossl'  # Default crypto/issuer capabilities
           - 'ring,file-storage,local-cache'
@@ -186,6 +188,28 @@ jobs:
             ARGS+=(--features "${{ matrix.features }}")
           fi
           cargo doc --locked --no-default-features "${ARGS[@]}" --no-deps
+
+  redis-storage:
+    name: Redis storage integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: redis-storage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install local Redis test server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+      - name: Default provider and Redis
+        run: cargo test --locked --features redis-storage --test redis_storage -- --include-ignored
+      - name: Ring and Redis without file storage
+        run: cargo test --locked --no-default-features --features ring,redis-storage --test redis_storage -- --include-ignored
 
   offline-validation:
     name: Offline validation
@@ -290,7 +314,7 @@ jobs:
 
   package:
     name: Package verification
-    needs: [format, test, clippy, features, shellcheck, offline-validation, shell-smoke, loopback-challenges, pebble-integration]
+    needs: [format, test, clippy, features, shellcheck, offline-validation, shell-smoke, loopback-challenges, pebble-integration, redis-storage]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

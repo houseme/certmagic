@@ -83,4 +83,5 @@ must not be used to claim a comparable filesystem speedup.
   custom backend guards no longer require FileStorage.
 - All-target/all-feature Clippy (`-D warnings`), strict rustdoc, formatting and
   whitespace checks passed. Production CA/Pebble entry points were disabled.
-- No Redis, etcd, database or S3 service was benchmarked or implemented here.
+- No Redis, etcd, database or S3 service was benchmarked in these measurements.
+  Redis adapter integration tests are separate from this performance evidence.

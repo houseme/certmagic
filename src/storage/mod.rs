@@ -25,6 +25,10 @@ use crate::error::{Error, Result, StorageError};
 pub mod file;
 #[cfg(feature = "file-storage")]
 pub use file::FileStorage;
+#[cfg(feature = "redis-storage")]
+pub mod redis;
+#[cfg(feature = "redis-storage")]
+pub use redis::{RedisStorage, RedisStorageOptions};
 
 /// Storage key prefix for certificates.
 pub const CERTS_PREFIX: &str = "certificates";
@@ -195,23 +199,32 @@ pub trait LockRelease: Send + Sync {
 
 struct ReleaseState {
     callback: Box<dyn LockRelease>,
-    released: std::sync::atomic::AtomicBool,
+    started: std::sync::atomic::AtomicBool,
+    sync_requested: std::sync::atomic::AtomicBool,
+    acknowledged: std::sync::atomic::AtomicBool,
 }
 
 impl ReleaseState {
     fn request(&self) {
-        if !self
-            .released
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        self.started
+            .store(true, std::sync::atomic::Ordering::Release);
+        if !self.acknowledged.load(std::sync::atomic::Ordering::Acquire)
+            && !self
+                .sync_requested
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
             self.callback.release();
         }
     }
 
     async fn wait(&self) -> Result<()> {
-        if !self.released.load(std::sync::atomic::Ordering::Acquire) {
+        self.started
+            .store(true, std::sync::atomic::Ordering::Release);
+        // A queued Drop cleanup is not a backend acknowledgement. An explicit
+        // waiter must still invoke the backend's acknowledged release path.
+        if !self.acknowledged.load(std::sync::atomic::Ordering::Acquire) {
             self.callback.release_async().await?;
-            self.released
+            self.acknowledged
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         Ok(())
@@ -232,7 +245,9 @@ impl LockGuard {
             key: key.into(),
             release: Arc::new(ReleaseState {
                 callback: release,
-                released: std::sync::atomic::AtomicBool::new(false),
+                started: std::sync::atomic::AtomicBool::new(false),
+                sync_requested: std::sync::atomic::AtomicBool::new(false),
+                acknowledged: std::sync::atomic::AtomicBool::new(false),
             }),
             id: NEXT_LOCK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
@@ -244,7 +259,7 @@ impl LockGuard {
     pub fn is_valid(&self) -> bool {
         !self
             .release
-            .released
+            .started
             .load(std::sync::atomic::Ordering::Acquire)
             && self.release.callback.is_valid()
     }
@@ -1358,6 +1373,19 @@ mod guard_release_tests {
         fn release_async(&self) -> futures::future::BoxFuture<'_, Result<()>> {
             Box::pin(std::future::pending())
         }
+    }
+
+    #[tokio::test]
+    async fn a_background_release_request_does_not_acknowledge_an_explicit_waiter() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let guard = LockGuard::new("queued", Box::new(PendingRelease(calls.clone())));
+        guard.release.request();
+        assert!(!guard.is_valid());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let mut acknowledged = Box::pin(guard.release_and_wait());
+        assert!(futures::poll!(&mut acknowledged).is_pending());
+        drop(acknowledged);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

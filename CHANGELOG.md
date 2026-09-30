@@ -8,8 +8,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Add optional `redis-storage` with isolated namespaces, binary values,
+  server-side timestamps, prefix SCAN operations, reconnecting Tokio connections
+  and ownership-checked leases with automatic renewal.
 - Add `LockGuard::release_and_wait` and advisory `is_valid` lease health;
   network backends can acknowledge release and fall back to cleanup on cancellation.
+- Add real Redis integration tests, an opt-in example and a dedicated CI lane.
 - Expose `LockGuard::new` for external storage/locking backends, including builds
   without file-storage; document token-safe release and network lease recovery.
 - Add a dependency-free release benchmark for certificate lookup, local-cache
@@ -39,6 +43,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Distinguish queued background release requests from acknowledged completion,
+  so explicit release waiters cannot report success before the backend confirms.
 - Track automatic lock ownership by acquisition identity and callback, preventing
   old or cross-backend same-name guards from untracking/releasing a newer holder.
   Cancelled shutdown cleanup retains a Drop fallback for pending releases.

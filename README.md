@@ -180,6 +180,7 @@ Three paths, pick per deployment:
 | `ocsp`              | ✔      | OCSP stapling lifecycle (hand-rolled RFC 6960 codec)     |
 | `zerossl`           | ✔      | ZeroSSL ACME/EAB and REST API issuers                    |
 | `local-cache`       |         | Node-local read-through storage cache                    |
+| `redis-storage`     |         | Redis values and owner-checked renewable leases         |
 | `rsa`               |        | Opt-in RSA 2048/4096/8192 key generation                |
 | `ring`              |         | Ring crypto provider and `x509-parser/verify`             |
 | `aws-lc-rs`         | ✔      | AWS-LC crypto provider and `x509-parser/verify-aws` (including P-521 CSR signing) |
@@ -188,14 +189,18 @@ Three paths, pick per deployment:
 ## Choosing a storage backend
 
 FileStorage remains the built-in durable backend. LocalCache is a node-local
-read-through decorator, not a distributed source of truth. Redis, SQL, etcd and
-object-store clients are not bundled with this crate.
+read-through decorator, not a distributed source of truth. `redis-storage` adds
+an optional Redis adapter. SQL, etcd and object-store adapters are not bundled.
 
 Custom backends implement `Storage` and `Locker`, then are supplied through
 `ConfigBuilder::storage`. `LockGuard::new` accepts a backend-owned release
 callback even without the `file-storage` feature. The callback must retain the
 acquisition token and must not release another holder's lease. Network adapters
-should enqueue nonblocking cleanup and use expiring leases for runtime failure.
+can override `LockRelease::release_async` for acknowledged cleanup. Use
+`guard.release_and_wait().await` when acknowledgement matters; Drop remains a
+best-effort fallback. `guard.is_valid()` reports advisory local lease health,
+not write-side fencing. Automatic cleanup tracks acquisitions independently,
+including identical names on separate backends.
 
 Certificate/private-key resources can use an independent `CertStore` through
 `ConfigBuilder::cert_store`; accounts, challenge publications, locks and OCSP
@@ -205,9 +210,9 @@ The generic adapter overlaps its three independent reads/existence checks; this
 does not turn them into an atomic backend snapshot.
 
 Redis is an optional choice for deployments already operating Redis, not a
-prerequisite for faster TLS cache hits. An adapter needs namespace isolation,
-owner-checked lease renewal/release, durable account/key handling and explicit
-failover assumptions. See [Redis locking](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
+prerequisite for faster TLS cache hits. Configure persistence and eviction policy
+for durable account/private-key data; the adapter does not change server settings.
+Redis failover assumptions remain explicit. See [Redis locking](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
 and [persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
 For transactional storage, [PostgreSQL locks](https://www.postgresql.org/docs/current/explicit-locking.html)
 or [etcd transactions and leases](https://etcd.io/docs/v3.6/learning/api/)
@@ -216,6 +221,85 @@ selecting a service alone does not provide fencing for this library's writes.
 
 Reproducible local performance measurements and their limits are documented in
 [benches/README.md](benches/README.md).
+
+## Redis adapter
+
+Redis support is currently **Unreleased**, not part of the published 0.1.0.
+Build this repository checkout with `--features redis-storage`; a local consumer
+can use a path dependency until the next release:
+
+```toml
+certmagic = { path = "../certmagic", features = ["redis-storage"] }
+```
+
+```rust,no_run
+use certmagic::{Config, RedisStorage, RedisStorageOptions};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let storage = RedisStorage::connect(
+    &std::env::var("CERTMAGIC_REDIS_URL")?,
+    RedisStorageOptions { namespace: "my-service".into(), ..Default::default() },
+).await?;
+let config = Config::builder().storage(storage).build()?;
+# config.cache().stop_and_wait().await;
+# Ok(())
+# }
+```
+
+The adapter supports a single Redis endpoint, password/ACL URL authentication,
+`rediss://` with certificate verification and redis-rs Unix socket URLs. It uses
+`redis-rs` connection multiplexing/reconnection, not one connection per operation.
+Defaults are a 30 s lease, 10 s heartbeat, 5 s command timeout and 100 ms lock poll.
+The heartbeat interval plus command budget must be shorter than the lease.
+
+Values and modification timestamps are atomic within one Redis hash and have
+no TTL. Lock keys occupy a separate namespace and use `SET NX PX`; Lua scripts
+verify the acquisition token before renewal or deletion. Explicit extension is
+not shortened by a later heartbeat. Prefix operations use escaped SCAN patterns
+and bounded deletion batches; concurrent prefix changes are not atomic snapshots.
+
+This is a single-endpoint lease adapter, not Redlock or write fencing. Redis
+Cluster and Sentinel discovery are not implemented. Losing a heartbeat fails
+local lease health closed. Issuance/renewal checkpoints stop retries and
+publication after detected lease loss; callers needing fenced writes still
+require a stronger atomic write protocol. `CertStore` remains separate, and the generic three-key resource
+adapter is not a crash-atomic transaction. Persist keys/accounts appropriately
+(e.g. AOF with an explicit fsync policy and a non-evicting capacity plan), use
+ACL/TLS as appropriate, and do not log connection URLs. No automatic server
+configuration changes are performed.
+
+Example: `cargo run --example redis_storage --features redis-storage`.
+Tests start owned temporary Redis instances on loopback ports; they never use a
+configured production Redis URL:
+
+```sh
+cargo test --locked --features redis-storage --test redis_storage -- --include-ignored
+cargo test --locked --no-default-features --features ring,redis-storage --test redis_storage -- --include-ignored
+```
+
+Set `CERTMAGIC_REDIS_SERVER` to an alternate local server binary. Network tests
+are ignored by default; the pure configuration test runs normally. Local evidence
+uses Redis 8.10.2, including AOF restart, authentication, lease loss, cancellation
+and old-holder protection. TLS handshake, Cluster/Sentinel, Valkey and Dragonfly
+are not claimed as validated by those tests.
+
+### Other backend candidates
+
+| Backend | Suitable integration | Required work / current status |
+| --- | --- | --- |
+| Valkey | Reuse the Redis protocol adapter | Candidate; run the same compatibility tests before claiming support |
+| etcd | `Storage` + `Locker` using transactions, revisions and leases | Separate adapter; write-side fencing still needs explicit ownership context |
+| Consul KV | `Storage` + session-based `Locker` | Separate adapter; account for session invalidation and lock-delay |
+| DynamoDB | Conditional writes for storage and lease records | Separate adapter; TTL deletion is asynchronous, so expiry must be checked in conditions |
+| redb / RocksDB | Embedded single-node storage | Separate adapter; move blocking work off Tokio and do not imply distributed locking |
+| S3-compatible / secret services | Prefer a separate complete-resource `CertStore` | Separate adapter; retain a suitable shared lock/account/challenge backend |
+
+See [Valkey compatibility](https://valkey.io/topics/migration/),
+[etcd APIs](https://etcd.io/docs/v3.6/learning/api/),
+[Consul sessions](https://developer.hashicorp.com/consul/docs/automate/session),
+and [DynamoDB expiry semantics](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ttl-expired-items.html).
+Only FileStorage and RedisStorage are implemented here; the other rows are
+integration candidates, not enabled feature flags.
 
 ## File storage coordination
 
