@@ -41,6 +41,7 @@ impl Locker for MemoryStorage {
 #[async_trait]
 impl Storage for MemoryStorage {
     async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.delay().await;
         self.values.lock().unwrap().insert(key.into(), value.into());
         Ok(())
     }
@@ -99,6 +100,11 @@ fn measure(name: &str, iterations: usize, samples: usize, mut operation: impl Fn
             nanos as f64 / iterations as f64
         );
     }
+}
+
+struct NoopRelease;
+impl certmagic::storage::LockRelease for NoopRelease {
+    fn release(&self) {}
 }
 
 fn main() {
@@ -203,6 +209,9 @@ fn main() {
             nanos as f64 / (iterations * 4) as f64
         );
     }
+    measure("untracked_guard_drop", iterations, samples, || {
+        drop(black_box(LockGuard::new("bench", Box::new(NoopRelease))));
+    });
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -213,6 +222,9 @@ fn main() {
             for index in 0..size {
                 local.store(&format!("key{index}"), b"value").await.unwrap();
             }
+        });
+        measure(&format!("local_hit_{size}"), iterations, samples, || {
+            black_box(runtime.block_on(local.load(black_box("key0"))).unwrap());
         });
         measure(
             &format!("local_write_{size}"),
@@ -225,6 +237,19 @@ fn main() {
             },
         );
     }
+    let delayed_local = LocalCache::new(Arc::new(MemoryStorage {
+        latency: Duration::from_millis(2),
+        ..Default::default()
+    }));
+    measure("local_8_writes_simulated_2ms", 20, samples, || {
+        runtime.block_on(async {
+            let keys: Vec<_> = (0..8).map(|index| format!("key{index}")).collect();
+            let writes = keys.iter().map(|key| delayed_local.store(key, b"value"));
+            for result in futures::future::join_all(writes).await {
+                result.unwrap();
+            }
+        });
+    });
     let backend = Arc::new(MemoryStorage {
         latency: Duration::from_millis(2),
         ..Default::default()

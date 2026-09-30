@@ -10,6 +10,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Add default-preserving `Storage::canonical_key` so decorators can share cache
   identity and coordination across backend aliases without rewriting opaque keys.
+- Extend architecture-refactor benchmarks with cached reads, untracked guard
+  release and independent delayed writes; publish ABBA samples, drift exclusions
+  and the measured pure-memory write tradeoff.
 - Add optional `redis-storage` with isolated namespaces, binary values,
   server-side timestamps, prefix SCAN operations, reconnecting Tokio connections
   and ownership-checked leases with automatic renewal.
