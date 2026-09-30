@@ -26,6 +26,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   try_lock nonblocking when another process is updating metadata.
 - Create private storage files with owner-only permissions, clean failed temporary
   writes, and preserve existing destinations when atomic replacement fails.
+- Enforce LocalCache capacity and FIFO eviction, invalidate deleted prefixes,
+  and coordinate cache fills with writes/deletes so stale reads cannot replace
+  newer cached values.
 
 ### Security
 
