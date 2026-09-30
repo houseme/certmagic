@@ -6,12 +6,26 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- FileStorage's lock protocol requires all cooperating instances to upgrade
+  together and a filesystem supporting OS file locks. Keep locks/*.guard
+  sidecars while instances run; see the README for lease/fencing and
+  cross-file crash-atomicity limitations.
+
 ### Fixed
 
 - Release single-flight waiters when leaders are cancelled or panic, and allow
   waiting callers to retry without leaking registry entries.
 - Respect cancellation before rate-limit admission and prevent missed shutdown
   notifications.
+- Serialize FileStorage metadata operations with permanent OS-locked sidecars
+  and holder identities, preventing obsolete heartbeats/releases and competing
+  stale takeovers from affecting a new holder.
+- Preserve extended leases, reject already-cancelled lock acquisitions, and keep
+  try_lock nonblocking when another process is updating metadata.
+- Create private storage files with owner-only permissions, clean failed temporary
+  writes, and preserve existing destinations when atomic replacement fails.
 
 ### Security
 

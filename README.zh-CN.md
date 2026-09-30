@@ -152,6 +152,17 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 | `aws-lc-rs`         | ✔   | AWS-LC 加密后端与 `x509-parser/verify-aws`（含 P-521 CSR 签名） |
 | `integration-tests` |      | Pebble 端到端测试                         |
 
+## 文件存储协调
+
+FileStorage 使用永久保留的 `locks/*.guard` 文件和唯一持有者标识，串行化锁创建、
+心跳、释放及过期接管。共享文件系统必须支持操作系统文件锁；实例运行时不要删除
+这些辅助文件。从旧的仅心跳协议升级时，应先停止所有实例，再以同一版本重新启动。
+
+该机制属于租约协议，不提供 fencing：进程暂停超过租约后恢复，仍可能继续执行原有
+业务写入。需要 fencing 的部署必须使用能强制隔离失效持有者的后端。
+证书、私钥和元数据仍分别写入；`store_tx` 能回滚返回的写入错误，但不具备跨文件的
+崩溃原子性。
+
 ## 测试
 
 ```sh

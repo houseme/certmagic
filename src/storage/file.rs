@@ -3,11 +3,18 @@
 //! - Values are written atomically: temp file in the same directory →
 //!   `sync_all` → rename (close-before-rename ordering for Windows parity).
 //! - Locks are lockfiles created with `create_new` (O_EXCL) holding
-//!   `{"created": …, "updated": …}` JSON; a heartbeat task refreshes `updated`
+//!   `{"created": …, "updated": …, "owner": …}` JSON; a heartbeat task refreshes `updated`
 //!   every 5 s, and locks untouched for > 10 s are treated as stale and taken
 //!   over — enabling crash recovery and multi-instance coordination.
+//! - Permanent `.guard` sidecars serialize metadata updates and takeover using
+//!   OS file locks. All cooperating instances must use this protocol and a
+//!   filesystem supporting cross-process file locks. Do not remove sidecars
+//!   while instances run. Lease takeover cannot fence a paused application from
+//!   writing resources after its lease expires; stronger guarantees require a
+//!   storage backend with fencing.
 
 use std::fmt;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,15 +40,12 @@ pub const LOCK_STALE_THRESHOLD: Duration = Duration::from_secs(2 * 5);
 /// Polling interval while waiting for a lock.
 pub const FILE_LOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Retries reading a just-created (possibly empty) lockfile before declaring
-/// it stale (slow filesystems).
-const STALE_READ_RETRIES: u32 = 8;
-const STALE_READ_DELAY: Duration = Duration::from_millis(250);
-
 #[derive(Debug, Serialize, Deserialize)]
 struct LockMeta {
     created: i128, // unix millis
     updated: i128, // unix millis
+    #[serde(default)]
+    owner: String,
 }
 
 /// The default storage backend rooted at a directory
@@ -172,11 +176,35 @@ impl FileStorage {
             .join(format!("{}.lock", STORAGE_KEYS.safe(name)))
     }
 
-    async fn write_lock_meta(&self, path: &Path, meta: &LockMeta) -> Result<()> {
-        let data = serde_json::to_vec(meta)
-            .map_err(|e| Error::Storage(StorageError::Other(format!("lock meta: {e}"))))?;
-        tokio::fs::write(path, data).await?;
-        Ok(())
+    async fn try_acquire_file_lock(
+        &self,
+        ct: &CancellationToken,
+        name: &str,
+    ) -> Result<Option<LockGuard>> {
+        if ct.is_cancelled() {
+            return Err(Error::Internal("context canceled".into()));
+        }
+        let path = self.lock_filename(name);
+        tokio::fs::create_dir_all(path.parent().expect("locks dir has parent")).await?;
+        let name = name.to_owned();
+        // Construct the guard inside the blocking task. If its async caller
+        // disappears, dropping the undelivered result releases the acquired lock.
+        tokio::select! {
+            biased;
+            () = ct.cancelled() => Err(Error::Internal("context canceled".into())),
+            result = tokio::task::spawn_blocking(move || acquire_file_lock(path, name)) =>
+                result.map_err(|error| Error::Internal(format!("lock task: {error}")))?,
+        }
+    }
+}
+
+struct TempFileCleanup(Option<PathBuf>);
+
+impl Drop for TempFileCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -187,39 +215,162 @@ fn now_millis() -> i128 {
 
 fn is_stale(meta: &LockMeta) -> bool {
     let reference = meta.updated.max(meta.created);
-    now_millis().saturating_sub(reference) as u128 > LOCK_STALE_THRESHOLD.as_millis()
+    now_millis().saturating_sub(reference) > LOCK_STALE_THRESHOLD.as_millis() as i128
+}
+
+/// A permanent sidecar serializes metadata transactions, including takeover.
+/// Never unlink it: all processes must lock the same inode. It is held only
+/// during short filesystem operations, never during issuance or an async wait.
+fn coordination_file(path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    Ok(options.open(path.with_extension("guard"))?)
+}
+
+fn coordinate_lock<T>(path: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let coordination = coordination_file(path)?;
+    coordination.lock()?;
+    operation()
+}
+
+fn try_coordinate_lock<T>(path: &Path, operation: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+    let coordination = coordination_file(path)?;
+    match coordination.try_lock() {
+        Ok(()) => operation().map(Some),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+fn read_lock_meta(path: &Path) -> Result<Option<LockMeta>> {
+    match std::fs::read(path) {
+        Ok(data) => Ok(serde_json::from_slice(&data).ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_lock_meta(path: &Path, meta: &LockMeta) -> Result<()> {
+    let data = serde_json::to_vec(meta)
+        .map_err(|error| Error::Storage(StorageError::Other(format!("lock meta: {error}"))))?;
+    std::fs::write(path, data)?;
+    Ok(())
+}
+
+fn remove_lock_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn acquire_file_lock(path: PathBuf, name: String) -> Result<Option<LockGuard>> {
+    try_coordinate_lock(&path, || {
+        if let Some(meta) = read_lock_meta(&path)? {
+            if !is_stale(&meta) {
+                return Ok(None);
+            }
+        } else if let Ok(metadata) = std::fs::metadata(&path) {
+            // A legacy writer or interrupted write may leave an empty/partial
+            // record. Give it the same freshness interval before takeover.
+            if metadata.modified()?.elapsed().unwrap_or_default() <= LOCK_STALE_THRESHOLD {
+                return Ok(None);
+            }
+        }
+        remove_lock_file(&path)?;
+        let now = now_millis();
+        let meta = LockMeta {
+            created: now,
+            updated: now,
+            owner: format!("{:032x}", rand::rng().random::<u128>()),
+        };
+        let heartbeat = CancellationToken::new();
+        let release = FileLockRelease {
+            path: path.clone(),
+            owner: meta.owner.clone(),
+            heartbeat: heartbeat.clone(),
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        let data = serde_json::to_vec(&meta)
+            .map_err(|error| Error::Storage(StorageError::Other(format!("lock meta: {error}"))))?;
+        if let Err(error) = file.write_all(&data) {
+            drop(file);
+            let _ = remove_lock_file(&path);
+            return Err(error.into());
+        }
+        drop(file);
+        spawn_heartbeat(path.clone(), meta.owner, heartbeat);
+        Ok(Some(LockGuard::new(name, Box::new(release))))
+    })
+    .map(Option::flatten)
 }
 
 struct FileLockRelease {
     path: PathBuf,
+    owner: String,
     heartbeat: CancellationToken,
 }
 
 impl LockRelease for FileLockRelease {
     fn release(&self) {
         self.heartbeat.cancel();
-        // Synchronous removal: release() must be callable from Drop.
-        if let Err(err) = std::fs::remove_file(&self.path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(path = %self.path.display(), error = %err, "lockfile removal failed");
+        // Drop is synchronous. The sidecar is held only for short metadata
+        // operations by cooperating FileStorage implementations.
+        let result = coordinate_lock(&self.path, || {
+            if read_lock_meta(&self.path)?.is_some_and(|meta| meta.owner == self.owner) {
+                remove_lock_file(&self.path)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            tracing::warn!(path = %self.path.display(), %error, "lockfile removal failed");
         }
     }
 }
 
-async fn spawn_heartbeat(path: PathBuf, ct: CancellationToken) {
+fn refresh_owned_lock(path: &Path, owner: &str) -> Result<bool> {
+    coordinate_lock(path, || {
+        let Some(mut meta) = read_lock_meta(path)? else {
+            return Ok(false);
+        };
+        if meta.owner != owner {
+            return Ok(false);
+        }
+        meta.updated = meta.updated.max(now_millis());
+        write_lock_meta(path, &meta)?;
+        Ok(true)
+    })
+}
+
+fn spawn_heartbeat(path: PathBuf, owner: String, ct: CancellationToken) {
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                biased;
                 () = ct.cancelled() => break,
                 () = tokio::time::sleep(LOCK_FRESHNESS_INTERVAL) => {
-                    // Truncate + rewrite `updated`.
-                    let meta = LockMeta {
-                        created: now_millis(),
-                        updated: now_millis(),
-                    };
-                    if let Ok(data) = serde_json::to_vec(&meta) {
-                        let _ = tokio::fs::write(&path, data).await;
+                    let path = path.clone();
+                    let owner = owner.clone();
+                    match tokio::task::spawn_blocking(move || refresh_owned_lock(&path, &owner)).await {
+                        Ok(Ok(true)) => {},
+                        Ok(Ok(false)) => break,
+                        error => {
+                            tracing::warn!(?error, "lock heartbeat failed");
+                            break;
+                        }
                     }
                 }
             }
@@ -242,29 +393,24 @@ impl Storage for FileStorage {
             std::process::id(),
             rand::rng().random::<u64>()
         ));
-        {
-            let mut f = tokio::fs::File::create(&tmp).await?;
-            f.write_all(value).await?;
-            f.sync_all().await?;
-        }
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await;
-        }
-        #[cfg(windows)]
-        {
-            // rename() fails if the destination exists on Windows.
-            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-                tokio::fs::remove_file(&path).await?;
-            }
-        }
+        options.mode(0o600);
+        let mut cleanup = TempFileCleanup(None);
+        let mut f = options.open(&tmp).await?;
+        cleanup.0 = Some(tmp.clone());
+        f.write_all(value).await?;
+        f.sync_all().await?;
+        drop(f);
+        // std/Tokio rename replaces an existing file on Windows as well.
+        // Removing the destination first creates a gap and loses it on failure.
         match tokio::fs::rename(&tmp, &path).await {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                Err(err.into())
+            Ok(()) => {
+                cleanup.0 = None;
+                Ok(())
             }
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -360,178 +506,48 @@ impl Storage for FileStorage {
 #[async_trait]
 impl super::Locker for FileStorage {
     async fn lock(&self, ct: &CancellationToken, name: &str) -> Result<LockGuard> {
-        let lock_path = self.lock_filename(name);
-        tokio::fs::create_dir_all(lock_path.parent().expect("locks dir has parent")).await?;
-
         loop {
-            // Attempt atomic creation (O_EXCL equivalent).
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-                .await
-            {
-                Ok(_) => {
-                    let created = now_millis();
-                    if let Err(err) = self
-                        .write_lock_meta(
-                            &lock_path,
-                            &LockMeta {
-                                created,
-                                updated: created,
-                            },
-                        )
-                        .await
-                    {
-                        // A lockfile without valid metadata is treated as
-                        // stale by peers.  Remove it before returning so a
-                        // transient metadata-write failure does not strand
-                        // every future caller behind the stale-lock timeout.
-                        if let Err(cleanup) = tokio::fs::remove_file(&lock_path).await {
-                            tracing::warn!(
-                                path = %lock_path.display(),
-                                error = %cleanup,
-                                "failed to clean up lockfile after metadata write failure"
-                            );
-                        }
-                        return Err(err);
-                    }
-                    let heartbeat = CancellationToken::new();
-                    spawn_heartbeat(lock_path.clone(), heartbeat.clone()).await;
-                    return Ok(LockGuard::new(
-                        name.to_owned(),
-                        Box::new(FileLockRelease {
-                            path: lock_path,
-                            heartbeat,
-                        }),
-                    ));
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Read the existing lockfile; an empty file may be a
-                    // just-created lock from a slow writer (retry a few times).
-                    let mut meta: Option<LockMeta> = None;
-                    for _ in 0..STALE_READ_RETRIES {
-                        match tokio::fs::read(&lock_path).await {
-                            Ok(data) if !data.is_empty() => {
-                                meta = serde_json::from_slice(&data).ok();
-                                break;
-                            }
-                            _ => {
-                                tokio::select! {
-                                    () = ct.cancelled() =>
-                                        return Err(Error::Internal("context canceled".into())),
-                                    () = tokio::time::sleep(STALE_READ_DELAY) => {}
-                                }
-                            }
-                        }
-                    }
-
-                    match meta {
-                        Some(m) if !is_stale(&m) => {
-                            // Healthy lock: poll until it disappears.
-                            tokio::select! {
-                                () = ct.cancelled() =>
-                                    return Err(Error::Internal("context canceled".into())),
-                                () = tokio::time::sleep(FILE_LOCK_POLL_INTERVAL) => {}
-                            }
-                        }
-                        _ => {
-                            // Stale or unparsable: take over by deleting it.
-                            // (A race with the stale holder is resolved by the
-                            // next loop iteration re-attempting create_new.)
-                            if let Err(err) = tokio::fs::remove_file(&lock_path).await {
-                                return Err(Error::Storage(StorageError::StaleLock(format!(
-                                    "{}: {err}",
-                                    lock_path.display()
-                                ))));
-                            }
-                            tracing::warn!(
-                                lock = %name,
-                                "took over stale lockfile"
-                            );
-                        }
-                    }
-                }
-                Err(err) => return Err(err.into()),
+            if let Some(guard) = self.try_acquire_file_lock(ct, name).await? {
+                return Ok(guard);
+            }
+            tokio::select! {
+                () = ct.cancelled() => return Err(Error::Internal("context canceled".into())),
+                () = tokio::time::sleep(FILE_LOCK_POLL_INTERVAL) => {},
             }
         }
     }
 
     async fn unlock(&self, name: &str) -> Result<()> {
-        let lock_path = self.lock_filename(name);
-        match tokio::fs::remove_file(&lock_path).await {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err.into()),
+        let path = self.lock_filename(name);
+        if !tokio::fs::try_exists(&path).await? {
+            return Ok(());
         }
+        tokio::task::spawn_blocking(move || coordinate_lock(&path, || remove_lock_file(&path)))
+            .await
+            .map_err(|error| Error::Internal(format!("unlock task: {error}")))?
     }
 
     async fn try_lock(&self, ct: &CancellationToken, name: &str) -> Result<Option<LockGuard>> {
-        // Two attempts, no waiting.
-        let lock_path = self.lock_filename(name);
-        tokio::fs::create_dir_all(lock_path.parent().expect("locks dir has parent")).await?;
-        if (0..2).next().is_some() {
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-                .await
-            {
-                Ok(_) => {
-                    let created = now_millis();
-                    if let Err(err) = self
-                        .write_lock_meta(
-                            &lock_path,
-                            &LockMeta {
-                                created,
-                                updated: created,
-                            },
-                        )
-                        .await
-                    {
-                        if let Err(cleanup) = tokio::fs::remove_file(&lock_path).await {
-                            tracing::warn!(
-                                path = %lock_path.display(),
-                                error = %cleanup,
-                                "failed to clean up lockfile after metadata write failure"
-                            );
-                        }
-                        return Err(err);
-                    }
-                    let heartbeat = CancellationToken::new();
-                    spawn_heartbeat(lock_path.clone(), heartbeat.clone()).await;
-                    return Ok(Some(LockGuard::new(
-                        name.to_owned(),
-                        Box::new(FileLockRelease {
-                            path: lock_path,
-                            heartbeat,
-                        }),
-                    )));
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let _ = ct;
-                    return Ok(None);
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
-        Ok(None)
+        self.try_acquire_file_lock(ct, name).await
     }
 
     async fn renew_lock_lease(&self, name: &str, lease: Duration) -> Result<()> {
-        let lock_path = self.lock_filename(name);
-        let data = tokio::fs::read(&lock_path).await?;
-        let mut meta: LockMeta = serde_json::from_slice(&data)
-            .map_err(|e| Error::Storage(StorageError::Other(format!("lock metadata: {e}"))))?;
-        if is_stale(&meta) {
-            return Err(Error::Storage(StorageError::StaleLock(name.to_owned())));
-        }
-        // The backend heartbeat remains authoritative; the caller's lease is
-        // used as a minimum freshness extension for external coordinators.
-        let now = now_millis();
-        let extension = i128::try_from(lease.as_millis()).unwrap_or(i128::MAX);
-        meta.updated = now.max(meta.updated.saturating_add(extension));
-        self.write_lock_meta(&lock_path, &meta).await
+        let path = self.lock_filename(name);
+        let name = name.to_owned();
+        tokio::task::spawn_blocking(move || {
+            coordinate_lock(&path, || {
+                let mut meta = read_lock_meta(&path)?
+                    .ok_or_else(|| Error::Storage(StorageError::StaleLock(name.clone())))?;
+                if is_stale(&meta) {
+                    return Err(Error::Storage(StorageError::StaleLock(name)));
+                }
+                let extension = i128::try_from(lease.as_millis()).unwrap_or(i128::MAX);
+                meta.updated = meta.updated.max(now_millis().saturating_add(extension));
+                write_lock_meta(&path, &meta)
+            })
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("lease task: {error}")))?
     }
 }
 
@@ -549,6 +565,198 @@ mod tests {
     async fn temp_storage() -> (Arc<FileStorage>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         (FileStorage::new(dir.path()), dir)
+    }
+
+    #[test]
+    fn review_metadata_lock_process_child() {
+        let Some(root) = std::env::var_os("CERTMAGIC_REVIEW_LOCK_ROOT") else {
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let storage = FileStorage::new(PathBuf::from(root));
+            assert!(
+                storage
+                    .try_lock(&CancellationToken::new(), "process-test")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn review_metadata_exclusion_across_processes() {
+        let (storage, directory) = temp_storage().await;
+        let path = storage.lock_filename("process-test");
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let coordination = coordination_file(&path).unwrap();
+        coordination.lock().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::file::tests::review_metadata_lock_process_child",
+                "--nocapture",
+            ])
+            .env("CERTMAGIC_REVIEW_LOCK_ROOT", directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn review_try_lock_does_not_wait_for_metadata_writer() {
+        let (storage, _) = temp_storage().await;
+        let path = storage.lock_filename("busy-metadata");
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        let coordination = coordination_file(&path).unwrap();
+        coordination.lock().unwrap();
+        let ct = CancellationToken::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            storage.try_lock(&ct, "busy-metadata"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn review_old_owner_cannot_refresh_or_release_replacement() {
+        let (storage, _) = temp_storage().await;
+        let ct = CancellationToken::new();
+        let old = storage.lock(&ct, "takeover").await.unwrap();
+        let path = storage.lock_filename("takeover");
+        let old_owner = coordinate_lock(&path, || {
+            let mut meta = read_lock_meta(&path)?.unwrap();
+            meta.created -= 60_000;
+            meta.updated -= 60_000;
+            write_lock_meta(&path, &meta)?;
+            Ok(meta.owner)
+        })
+        .unwrap();
+        let replacement = storage.try_lock(&ct, "takeover").await.unwrap().unwrap();
+        assert!(!refresh_owned_lock(&path, &old_owner).unwrap());
+        old.release();
+        assert!(storage.try_lock(&ct, "takeover").await.unwrap().is_none());
+        replacement.release();
+        assert!(!refresh_owned_lock(&path, &old_owner).unwrap());
+        assert!(!path.exists(), "heartbeat must not recreate released locks");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn review_stale_takeover_has_exactly_one_winner() {
+        let (storage, _) = temp_storage().await;
+        let ct = CancellationToken::new();
+        let old = storage.lock(&ct, "race").await.unwrap();
+        let path = storage.lock_filename("race");
+        coordinate_lock(&path, || {
+            let mut meta = read_lock_meta(&path)?.unwrap();
+            meta.created -= 60_000;
+            meta.updated -= 60_000;
+            write_lock_meta(&path, &meta)
+        })
+        .unwrap();
+        let attempts = (0..16).map(|_| storage.try_lock(&ct, "race"));
+        let guards = futures::future::join_all(attempts).await;
+        assert_eq!(
+            guards
+                .iter()
+                .filter(|guard| matches!(guard, Ok(Some(_))))
+                .count(),
+            1
+        );
+        assert!(guards.iter().all(Result::is_ok));
+        drop(old);
+        assert!(storage.try_lock(&ct, "race").await.unwrap().is_none());
+        drop(guards);
+    }
+
+    #[tokio::test]
+    async fn review_heartbeat_preserves_extended_lease() {
+        let (storage, _) = temp_storage().await;
+        let ct = CancellationToken::new();
+        let _guard = storage.lock(&ct, "extended").await.unwrap();
+        storage
+            .renew_lock_lease("extended", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let path = storage.lock_filename("extended");
+        let before = read_lock_meta(&path).unwrap().unwrap();
+        assert!(refresh_owned_lock(&path, &before.owner).unwrap());
+        let after = read_lock_meta(&path).unwrap().unwrap();
+        assert_eq!(before.created, after.created);
+        assert!(after.updated >= before.updated);
+        assert!(storage.try_lock(&ct, "extended").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn review_cancelled_lock_does_not_acquire() {
+        let (storage, _) = temp_storage().await;
+        let ct = CancellationToken::new();
+        ct.cancel();
+        assert!(storage.lock(&ct, "cancelled").await.is_err());
+        assert!(storage.try_lock(&ct, "cancelled").await.is_err());
+        assert!(!storage.lock_filename("cancelled").exists());
+    }
+
+    #[tokio::test]
+    async fn review_failed_replacement_preserves_destination_and_cleans_temporary_file() {
+        let (storage, directory) = temp_storage().await;
+        storage
+            .store("destination/keep", b"original")
+            .await
+            .unwrap();
+        assert!(storage.store("destination", b"replacement").await.is_err());
+        assert_eq!(storage.load("destination/keep").await.unwrap(), b"original");
+        assert!(!std::fs::read_dir(directory.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".cm-tmp-")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review_stored_private_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (storage, _) = temp_storage().await;
+        storage.store("private/key", b"secret").await.unwrap();
+        let mode = std::fs::metadata(storage.filename("private/key"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn review_future_lease_is_not_stale() {
+        let now = now_millis();
+        assert!(!is_stale(&LockMeta {
+            created: now,
+            updated: now + 60_000,
+            owner: String::new()
+        }));
+        assert!(is_stale(&LockMeta {
+            created: now - 60_000,
+            updated: now - 60_000,
+            owner: String::new()
+        }));
     }
 
     #[tokio::test]
@@ -692,6 +900,7 @@ mod tests {
         let ancient = LockMeta {
             created: now_millis() - 60_000,
             updated: now_millis() - 60_000,
+            owner: String::new(),
         };
         tokio::fs::write(&lock_path, serde_json::to_vec(&ancient).unwrap())
             .await

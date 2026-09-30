@@ -183,6 +183,20 @@ Three paths, pick per deployment:
 | `aws-lc-rs`         | ✔      | AWS-LC crypto provider and `x509-parser/verify-aws` (including P-521 CSR signing) |
 | `integration-tests` |         | Pebble end-to-end tests                                  |
 
+## File storage coordination
+
+FileStorage serializes lock creation, heartbeats, release, and stale takeover
+using permanent `locks/*.guard` sidecars and unique holder IDs. The shared
+filesystem must support OS file locks; never delete the sidecars while an
+instance is running. Stop all instances before upgrading from the earlier
+heartbeat-only protocol, then restart them on the same version.
+
+This is a lease protocol, not a fencing service: a process paused past lease
+expiry can resume application writes after another instance takes over.
+Deployments requiring fencing must supply a backend that enforces it.
+Certificate resources still use separate certificate/key/metadata writes;
+`store_tx` rolls back reported errors but is not a crash-atomic transaction.
+
 ## Testing
 
 ```sh
