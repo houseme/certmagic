@@ -8,6 +8,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Add optional `etcd-storage` using etcd-client 0.20 with namespaced binary
+  records, paginated revision snapshots, renewable leases, multi-endpoint
+  connections, password authentication and TLS/mutual TLS.
+- Add three-node etcd fault/recovery and mutual-TLS integration tests, an explicit
+  example, feature-matrix coverage and an isolated CI lane. Etcd builds require protoc.
 - Add backend-owned write-fence contexts, guarded storage transactions and
   private-key moves, and guarded CertStore publication with fail-closed defaults.
 - Add default-preserving `Storage::canonical_key` so decorators can share cache
@@ -28,6 +33,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Use etcd transactions for complete-resource reads and existence snapshots.
 - Route Config issuance, renewal and compromised-key archival through guarded
   operations, checking destination compatibility before contacting an issuer.
 - Read complete certificate resources through bulk storage hooks that preserve
@@ -65,6 +71,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Reject expired/replaced etcd owners in the same transaction as certificate
+  publication or private-key archival, closing the local lease-check/write race.
+- Invalidate etcd ownership when a pending renewal is cancelled, preventing a
+  delayed keep-alive response from falsely extending a subsequent local deadline.
 - Use stored SANs when removing or replacing certificates, preventing stale
   caller snapshots from leaving index entries that hide later certificates.
 - Serialize acknowledged release waiters while retaining cancellation fallback

@@ -443,6 +443,8 @@ pub use storage::{
     ocsp_key, ocsp_staple_key, safe_key, site_cert_key, site_meta_key, site_private_key,
     store_certificate, store_tx, track_lock, try_acquire, try_acquire_lock, untrack_lock,
 };
+#[cfg(feature = "etcd-storage")]
+pub use storage::{EtcdStorage, EtcdStorageOptions, EtcdTlsOptions};
 #[cfg(feature = "redis-storage")]
 pub use storage::{RedisStorage, RedisStorageOptions};
 /// Alias for the sliding-window rate limiter.

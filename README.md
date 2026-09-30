@@ -181,6 +181,7 @@ Three paths, pick per deployment:
 | `zerossl`           | ✔      | ZeroSSL ACME/EAB and REST API issuers                    |
 | `local-cache`       |         | Node-local read-through storage cache                    |
 | `redis-storage`     |         | Redis values and owner-checked renewable leases         |
+| `etcd-storage`      |         | Etcd leases, snapshot reads and guarded publication     |
 | `rsa`               |        | Opt-in RSA 2048/4096/8192 key generation                |
 | `ring`              |         | Ring crypto provider and `x509-parser/verify`             |
 | `aws-lc-rs`         | ✔      | AWS-LC crypto provider and `x509-parser/verify-aws` (including P-521 CSR signing) |
@@ -190,7 +191,9 @@ Three paths, pick per deployment:
 
 FileStorage remains the built-in durable backend. LocalCache is a node-local
 read-through decorator, not a distributed source of truth. `redis-storage` adds
-an optional Redis adapter. SQL, etcd and object-store adapters are not bundled.
+an optional Redis adapter. `etcd-storage` adds transaction-checked publication
+for deployments using etcd for coordination. SQL and object-store adapters are
+not bundled.
 
 Custom backends implement `Storage` and `Locker`, then are supplied through
 `ConfigBuilder::storage`. `LockGuard::new` accepts a backend-owned release
@@ -214,7 +217,8 @@ and reuse their key gates; eviction or the last in-flight operation reclaims
 unused gates. Custom backends with aliases should override
 `Storage::canonical_key`; its default preserves opaque keys, while FileStorage
 and Redis normalize slash paths. Nested decorators forward this identity.
-Changes made outside this cache remain invisible until eviction. Cancellation
+Single-key hits see outside changes only after eviction; grouped resource reads
+delegate to the backend instead of mixing cached entries. Cancellation
 cannot retract a dispatched backend write: after an ambiguous outcome, read
 from the authoritative backend rather than assuming the local cache is current.
 
@@ -237,6 +241,86 @@ selecting a service alone does not provide fencing for this library's writes.
 
 Reproducible local performance measurements and their limits are documented in
 [benches/README.md](benches/README.md).
+
+## Etcd adapter and guarded publication
+
+Etcd support is **Unreleased**, not part of the published 0.1.0. Enable
+`etcd-storage`; builds enabling this feature (including `--all-features`) need
+`protoc` on PATH. The optional client uses the crate's selected Ring/AWS-LC TLS
+provider; default builds do not pull in the etcd/gRPC dependency graph.
+
+```rust,ignore
+use certmagic::{Config, EtcdStorage, EtcdStorageOptions};
+
+let storage = EtcdStorage::connect(
+    &["http://127.0.0.1:2379", "http://127.0.0.1:22379", "http://127.0.0.1:32379"],
+    EtcdStorageOptions { namespace: "my-service".into(), ..Default::default() },
+).await?;
+let config = Config::builder().storage(storage).build()?;
+```
+
+All endpoints must belong to one cluster and use the same transport scheme.
+HTTPS supports WebPKI roots or `EtcdTlsOptions` with custom CA/mutual-TLS PEMs.
+Username/password credentials belong in options, not endpoint URLs. Debug and
+backend error output omit credentials, PEMs and remote status bodies.
+
+Config obtains/renews under its existing per-subject lock, then calls
+`CertStore::save_with_lock`. The key-value adapter delegates all three certificate
+components to `Storage::store_tx_with_lock`. Etcd compares the lock's revision,
+lease ID and random token in the **same transaction** as those writes. Private-key
+archival uses `move_private_key_with_lock` / `move_with_lock`, comparing source
+revision and destination absence as well. An expired or replaced acquisition
+cannot overwrite a newer certificate or archive/remove its private key.
+
+`LockRelease::write_fence` provides an opaque backend context. Guards requiring a
+fence are rejected by default implementations; a custom CertStore must support
+both guarded operations explicitly. Config checks compatibility before CA work.
+Etcd contexts work with clones/decorators of the originating storage handle;
+a separately connected handle or a different backend is rejected. An etcd lock
+combined with an arbitrary S3/secret-store CertStore does **not** provide a
+cross-system transaction. Those adapters remain separate work.
+
+Complete certificate reads use `load_many` and existence checks use `exists_many`.
+Etcd performs each group in one transaction; LocalCache delegates bundle reads
+together to avoid mixing cached generations. Generic backends retain their
+parallel-read behavior. Prefix listing uses pagination at a fixed revision;
+compaction errors are returned rather than silently switching snapshots.
+
+Persistent values use a versioned binary envelope with a **writer-clock**
+modification timestamp; etcd revisions, not timestamps, determine ownership.
+Values never inherit the lock lease. Records/batch writes are limited to 1 MiB,
+with up to 64 guarded keys. Prefix deletion is an atomic exact-key plus child-range
+transaction. Prefix stat derives the newest observed child timestamp.
+
+Leases default to 30 seconds with a 10-second keep-alive interval. Etcd TTL is
+fixed at acquisition: explicit renewal refreshes it, but a request exceeding the
+configured duration is rejected. Cancellation of an in-flight renewal discards
+local ownership rather than reusing a delayed stream reply. Drop queues lease
+revocation; `release_and_wait` awaits it, with TTL as the process/runtime-failure
+fallback. Connection loss fails local lease health conservatively. Operations
+may return timeout/unavailable errors during leader changes; ambiguous write
+outcomes are not blindly retried. Linearizable writes require a quorum.
+
+These guarantees cover guarded publication and private-key archival. Plain
+`store`, `delete`, legacy `save`/`move_private_key`, account/challenge writes and
+storage cleanup are not automatically fenced. FileStorage/Redis guards keep
+their previous advisory-health behavior. This is not a guarantee against actors
+that bypass guarded APIs or an atomic transaction spanning independent systems.
+
+Run the explicit local integration lane (requires Docker and `protoc`):
+
+```sh
+docker pull quay.io/coreos/etcd:v3.6.5
+cargo test --locked --no-default-features --features ring,etcd-storage,local-cache \
+  --test etcd_storage --test custom_locker -- --include-ignored
+```
+
+Tests create uniquely named, owned containers/networks with loopback client ports,
+and remove them on exit. They cover a three-member cluster, ownership replacement,
+concurrent snapshot reads, Config obtain/renew publication, private-key archival,
+keep-alive, cancellation/runtime loss, leader loss, quorum loss/recovery, password
+authentication, and a separate mutual-TLS server. No CA or production endpoint is
+contacted. The explicit example is `examples/etcd_storage.rs`.
 
 ## Redis adapter
 
@@ -304,7 +388,7 @@ are not claimed as validated by those tests.
 | Backend | Suitable integration | Required work / current status |
 | --- | --- | --- |
 | Valkey | Reuse the Redis protocol adapter | Candidate; run the same compatibility tests before claiming support |
-| etcd | `Storage` + `Locker` using transactions, revisions and leases | Separate adapter; write-side fencing still needs explicit ownership context |
+| etcd | `Storage` + `Locker`, guarded transactions and snapshot reads | Implemented behind `etcd-storage`; protected writes require the originating backend context |
 | Consul KV | `Storage` + session-based `Locker` | Separate adapter; account for session invalidation and lock-delay |
 | DynamoDB | Conditional writes for storage and lease records | Separate adapter; TTL deletion is asynchronous, so expiry must be checked in conditions |
 | redb / RocksDB | Embedded single-node storage | Separate adapter; move blocking work off Tokio and do not imply distributed locking |
@@ -314,7 +398,7 @@ See [Valkey compatibility](https://valkey.io/topics/migration/),
 [etcd APIs](https://etcd.io/docs/v3.6/learning/api/),
 [Consul sessions](https://developer.hashicorp.com/consul/docs/automate/session),
 and [DynamoDB expiry semantics](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ttl-expired-items.html).
-Only FileStorage and RedisStorage are implemented here; the other rows are
+FileStorage, RedisStorage and EtcdStorage are implemented here; the other rows are
 integration candidates, not enabled feature flags.
 
 ## File storage coordination

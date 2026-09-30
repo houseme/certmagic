@@ -151,6 +151,7 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 | `ring`              |     | Ring 加密后端与 `x509-parser/verify`       |
 | `aws-lc-rs`         | ✔   | AWS-LC 加密后端与 `x509-parser/verify-aws`（含 P-521 CSR 签名） |
 | `redis-storage`     |     | 可选 Redis 存储与所有者校验租约锁         |
+| `etcd-storage`      |     | etcd 租约、快照读取和受保护的证书发布     |
 | `integration-tests` |      | Pebble 端到端测试                         |
 
 `https` / `https_on` 包装器仅协商 HTTP/1.1，接收不超过 1 MiB 的 Content-Length
@@ -159,7 +160,7 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 ## 存储后端选择
 
 当前内置持久化后端为 FileStorage；LocalCache 是节点本地读缓存，不是分布式权威存储。
-新增可选的 `redis-storage` 适配器；SQL、etcd 和对象存储适配器尚未内置。
+提供可选的 `redis-storage` 与 `etcd-storage`；SQL 和对象存储适配器尚未内置。
 
 自定义后端实现 `Storage` 和 `Locker`，通过 `ConfigBuilder::storage` 注入。
 `LockGuard::new` 已开放，未启用 `file-storage` 时也能创建后端自有的锁句柄。
@@ -176,7 +177,7 @@ LocalCache 命中不等待后端操作，缺失读取与写入按规范化后的
 前缀删除会等待在途填充和写入结束。缓存项复用对应的键锁；淘汰或最后一个在途操作结束后，
 无用键锁自动回收。存在键别名的自定义后端应覆盖 `Storage::canonical_key`；默认保留原始键，
 FileStorage 和 Redis 使用统一的路径规范化，嵌套装饰器透传此身份。
-外部实例的修改仍需淘汰后才能看到。取消不能撤回已发给后端的写入；结果不确定时应读取
+单键缓存需淘汰后才能看到外部修改；整组资源读取直接交给后端。取消不能撤回已发给后端的写入；结果不确定时应读取
 权威后端，不能假定本地缓存已与其同步。
 
 证书与私钥还可通过 `ConfigBuilder::cert_store` 单独接入 `CertStore`；账号、挑战记录、
@@ -194,6 +195,51 @@ Redis 异步复制后的故障切换不能自动保证锁互斥，持久化策�
 所有权检查，不能仅更换服务就宣称具备 fencing。
 
 性能基准、原始样本及适用范围见 [benches/README.md](benches/README.md)。
+
+## Etcd 适配器与写入侧保护
+
+此功能属于 **Unreleased**，不包含在已发布的 0.1.0 中。启用 `etcd-storage`；
+构建此功能（包括 `--all-features`）需安装 `protoc`。默认构建不引入 etcd/gRPC 依赖；
+TLS 使用所选择的 Ring 或 AWS-LC provider。
+
+通过 `EtcdStorage::connect(&endpoints, EtcdStorageOptions { namespace, ..Default::default() })`
+连接同一集群的多个端点，再传给 `Config::builder().storage(storage)`。
+端点必须使用相同协议。支持 HTTPS、WebPKI/自定义 CA、双向 TLS 和用户名密码；
+认证信息放在 options 中，不允许嵌入 URL，日志与 Debug 不输出凭据或 PEM。
+
+签发和续期通过 `CertStore::save_with_lock` 发布完整证书资源，默认键值适配器将三项写入
+交给 `Storage::store_tx_with_lock`。etcd 在同一事务中校验锁的 revision、lease ID 和 token，
+并写入证书、私钥和元数据。泄露私钥归档通过 `move_private_key_with_lock` / `move_with_lock`
+原子完成，同时比较源 revision 和目标不存在条件，避免旧持有者覆盖、归档或移除新私钥。
+
+`LockRelease::write_fence` 携带后端专用上下文；不支持该上下文的默认实现会直接报错，
+Config 在联系 CA 前就检查兼容性。etcd 上下文支持原存储句柄的克隆及装饰器，
+不同连接实例或不同后端会被拒绝。etcd 锁搭配任意 S3/秘密存储并不自动具备跨系统原子性，
+这些 `CertStore` 适配器仍属后续工作。
+
+完整资源的 `load_many` / `exists_many` 在 etcd 中使用事务快照；LocalCache 整组透传，
+避免缓存的旧版本和后端新版本混合。普通后端保留并发读取行为。前缀列表按固定 revision
+分页，若历史已压缩则返回错误。数据使用版本化二进制封装，修改时间来自写入节点时钟；
+所有权由 revision 判断。数据不绑定锁 TTL；记录和写入批次限制为 1 MiB，每批最多 64 个键。
+
+默认租约 30 秒，每 10 秒保活。etcd 获取锁时确定 TTL；显式续租可以刷新，但不支持临时
+扩展到超过配置的时长。取消在途续租后立即放弃本地所有权，防止错用迟到响应。
+`Drop` 尽力撤销租约，`release_and_wait` 等待确认，进程或运行时退出由 TTL 恢复。
+leader 切换期间可能返回暂时不可用或超时；不盲目重试结果不确定的写入，失去多数节点时
+拒绝写入。普通 `store/delete`、旧 `save/move_private_key`、账号/挑战写入和存储清理
+不自动具备 fencing；FileStorage/Redis 保留此前的本地健康检查语义。
+
+显式运行隔离测试（需要 Docker 和 `protoc`）：
+
+```sh
+docker pull quay.io/coreos/etcd:v3.6.5
+cargo test --locked --no-default-features --features ring,etcd-storage,local-cache \
+  --test etcd_storage --test custom_locker -- --include-ignored
+```
+
+测试创建并清理专属容器与网络，客户端端口仅绑定回环地址；覆盖三节点故障恢复、旧所有者
+拒绝、快照一致性、Config 签发/续期、私钥归档、取消与运行时退出、认证及真实双向 TLS。
+不访问生产集群或 CA。使用示例见 `examples/etcd_storage.rs`。
 
 ## Redis 适配器
 
@@ -231,7 +277,7 @@ cargo test --locked --no-default-features --features ring,redis-storage --test r
 | 其他后端 | 适配方向 | 当前状态与关键边界 |
 | --- | --- | --- |
 | Valkey | 复用 Redis 协议适配器 | 候选，需先运行同一兼容测试套件 |
-| etcd | `Storage` + 事务/revision/lease 锁 | 需独立适配；真正 fencing 仍需写入侧所有权上下文 |
+| etcd | `Storage` + `Locker` + 受保护事务和快照读取 | 已实现 `etcd-storage`；所有权上下文绑定原始后端 |
 | Consul KV | `Storage` + session 锁 | 需处理 session 失效、续期和 lock-delay |
 | DynamoDB | 条件写、租约记录 | TTL 异步删除，不能直接当成锁过期判定 |
 | redb / RocksDB | 单机嵌入式 KV | 阻塞工作移出 Tokio；不等同于分布式共享存储 |

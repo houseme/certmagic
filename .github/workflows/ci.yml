@@ -100,6 +100,9 @@ jobs:
       # cargo test includes doctests; --all-targets alone would skip them.
       - name: Default features
         run: cargo test --locked --no-fail-fast
+      - name: Install protobuf compiler
+        if: runner.os == 'Linux' && matrix.toolchain == 'stable'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: All features
         if: runner.os == 'Linux' && matrix.toolchain == 'stable'
         run: cargo test --locked --all-features --no-fail-fast
@@ -124,6 +127,8 @@ jobs:
         with:
           key: clippy-${{ matrix.toolchain }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Default features
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: All features
@@ -148,6 +153,8 @@ jobs:
           - 'rsa'                   # RSA implies the AWS-LC-RS provider
           - 'aws-lc-rs,rsa,zerossl'  # Default crypto/issuer capabilities
           - 'ring,file-storage,local-cache'
+          - 'ring,etcd-storage,local-cache'
+          - 'aws-lc-rs,etcd-storage,local-cache'
           - 'ring,http-01,zerossl'
           # Exercise every optional runtime module without the default
           # FileStorage backend. These lanes ensure portable/custom-storage
@@ -165,6 +172,9 @@ jobs:
         with:
           key: features-${{ matrix.features }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install protobuf compiler
+        if: contains(matrix.features, 'etcd-storage')
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Test
         run: |
           ARGS=()
@@ -210,6 +220,31 @@ jobs:
         run: cargo test --locked --features redis-storage --test redis_storage -- --include-ignored
       - name: Ring and Redis without file storage
         run: cargo test --locked --no-default-features --features ring,redis-storage --test redis_storage -- --include-ignored
+
+  etcd-storage:
+    name: Etcd three-node and mutual-TLS integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: etcd-storage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install protobuf compiler and test image
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          docker pull quay.io/coreos/etcd:v3.6.5
+      - name: Default provider with etcd
+        run: cargo test --locked --features etcd-storage,local-cache --test etcd_storage -- --include-ignored
+      - name: Ring without file storage
+        run: cargo test --locked --no-default-features --features ring,etcd-storage,local-cache --test etcd_storage --test custom_locker -- --include-ignored
+      - name: Compile explicit example
+        run: cargo check --locked --features etcd-storage --example etcd_storage
 
   offline-validation:
     name: Offline validation
@@ -314,7 +349,7 @@ jobs:
 
   package:
     name: Package verification
-    needs: [format, test, clippy, features, shellcheck, offline-validation, shell-smoke, loopback-challenges, pebble-integration, redis-storage]
+    needs: [format, test, clippy, features, shellcheck, offline-validation, shell-smoke, loopback-challenges, pebble-integration, redis-storage, etcd-storage]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

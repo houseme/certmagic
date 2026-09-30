@@ -20,7 +20,11 @@ use tokio_util::sync::CancellationToken;
 use crate::crypto::hash_certificate_chain;
 use crate::error::{Error, Result, StorageError};
 
-#[cfg(any(feature = "file-storage", feature = "redis-storage",))]
+#[cfg(any(
+    feature = "file-storage",
+    feature = "redis-storage",
+    feature = "etcd-storage"
+))]
 mod key;
 
 mod locking;
@@ -41,6 +45,11 @@ pub use file::FileStorage;
 pub mod redis;
 #[cfg(feature = "redis-storage")]
 pub use redis::{RedisStorage, RedisStorageOptions};
+
+#[cfg(feature = "etcd-storage")]
+pub mod etcd;
+#[cfg(feature = "etcd-storage")]
+pub use etcd::{EtcdStorage, EtcdStorageOptions, EtcdTlsOptions};
 
 /// Storage key prefix for certificates.
 pub const CERTS_PREFIX: &str = "certificates";
