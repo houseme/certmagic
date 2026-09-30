@@ -95,10 +95,10 @@ pub struct Cache {
     maintenance_generation: AtomicU64,
     /// Last maintenance generation that reached its terminal state.
     maintenance_completed_generation: AtomicU64,
-    maintenance_done: Notify,
+    maintenance_done: Arc<Notify>,
     /// The cache's own view: certificates were registered by configs; for a
     /// cache with no `get_config_for_cert`, the registering config is used.
-    pub(crate) owner: RwLock<Option<Arc<crate::config::Config>>>,
+    pub(crate) owner: RwLock<Option<crate::config::CachedConfig>>,
 }
 
 impl std::fmt::Debug for Cache {
@@ -119,6 +119,7 @@ impl Drop for Cache {
         // wakes it if the last owner goes away without an explicit shutdown.
         // This prevents a detached Tokio task from keeping the cache alive.
         self.stop.cancel();
+        self.maintenance_done.notify_waiters();
     }
 }
 
@@ -154,7 +155,7 @@ impl Cache {
             maintenance_finished: AtomicBool::new(true),
             maintenance_generation: AtomicU64::new(0),
             maintenance_completed_generation: AtomicU64::new(0),
-            maintenance_done: Notify::new(),
+            maintenance_done: Arc::new(Notify::new()),
             owner: RwLock::new(None),
         });
         Ok(cache)
@@ -231,6 +232,26 @@ impl Cache {
             {
                 return;
             }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn observe_maintenance(cache: std::sync::Weak<Self>, generation: u64) {
+        loop {
+            let Some(current) = cache.upgrade() else {
+                return;
+            };
+            let notified = Arc::clone(&current.maintenance_done).notified_owned();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if current
+                .maintenance_completed_generation
+                .load(Ordering::Acquire)
+                >= generation
+            {
+                return;
+            }
+            drop(current);
             notified.await;
         }
     }
@@ -400,9 +421,7 @@ impl Cache {
                     && let Some(victim) = cache.remove(&victim_hash)
                 {
                     for name in &victim.names {
-                        if let Some(list) = index.get_mut(name) {
-                            list.retain(|h| h != &victim_hash);
-                        }
+                        Self::remove_from_index(index, name, &victim_hash);
                     }
                 }
             }
@@ -422,8 +441,9 @@ impl Cache {
     #[must_use]
     pub fn get_all_matching_certs(&self, name: &str) -> Vec<Certificate> {
         let name = normalized_name(name);
-        let index = self.lock_index();
+        // Writers also acquire the certificate map before its SAN index.
         let cache = self.lock_cache();
+        let index = self.lock_index();
         index
             .get(&name)
             .map(|hashes| {
@@ -470,9 +490,7 @@ impl Cache {
             let mut index = self.lock_index();
             if cache.remove(&old.hash).is_some() {
                 for name in &old.names {
-                    if let Some(list) = index.get_mut(name) {
-                        list.retain(|h| h != &old.hash);
-                    }
+                    Self::remove_from_index(&mut index, name, &old.hash);
                 }
             }
             let mut new = new;
@@ -486,15 +504,34 @@ impl Cache {
         }
     }
 
+    /// Update only metadata on a certificate which is still cached. Background
+    /// OCSP/ARI work must never reinsert an old certificate after renewal/removal.
+    pub(crate) fn update_metadata(&self, hash: &str, update: impl FnOnce(&mut Certificate)) {
+        let notify = self.has_event_listener();
+        let event = {
+            let mut cache = self.lock_cache();
+            let Some(cert) = cache.get_mut(hash) else {
+                return;
+            };
+            let old = notify.then(|| cert.clone());
+            update(cert);
+            old.map(|old| CacheEvent::Replaced {
+                old: Box::new(old),
+                new: Box::new(cert.clone()),
+            })
+        };
+        if let Some(event) = event {
+            self.emit_event(event);
+        }
+    }
+
     /// Remove a certificate by its object (hash identity).
     pub fn remove_certificate(&self, cert: &Certificate) {
         let mut cache = self.lock_cache();
         let mut index = self.lock_index();
         if cache.remove(&cert.hash).is_some() {
             for name in &cert.names {
-                if let Some(list) = index.get_mut(name) {
-                    list.retain(|h| h != &cert.hash);
-                }
+                Self::remove_from_index(&mut index, name, &cert.hash);
             }
             drop(index);
             drop(cache);
@@ -513,9 +550,7 @@ impl Cache {
                     continue; // only unmanaged (manual) certs here
                 }
                 for name in &cert.names {
-                    if let Some(list) = index.get_mut(name) {
-                        list.retain(|h| h != hash);
-                    }
+                    Self::remove_from_index(&mut index, name, hash);
                 }
                 if let Some(cert) = cache.remove(hash) {
                     removed.push(cert);
@@ -550,9 +585,7 @@ impl Cache {
         for hash in victims {
             if let Some(cert) = cache.remove(&hash) {
                 for name in &cert.names {
-                    if let Some(list) = index.get_mut(name) {
-                        list.retain(|h| h != &hash);
-                    }
+                    Self::remove_from_index(&mut index, name, &hash);
                 }
                 removed.push(cert);
             }
@@ -568,8 +601,9 @@ impl Cache {
     /// contains exactly `name` — one index lookup, at most one clone.
     fn first_cert_for_exact_name(&self, name: &str) -> Option<Certificate> {
         let name = normalized_name(name);
-        let index = self.lock_index();
+        // Writers also acquire the certificate map before its SAN index.
         let cache = self.lock_cache();
+        let index = self.lock_index();
         let hash = index.get(&name)?.first()?;
         cache.get(hash).cloned()
     }
@@ -648,12 +682,26 @@ impl Cache {
         {
             return getter(cert).await;
         }
-        if let Some(owner) = self.owner.read().ok().and_then(|o| o.clone()) {
+        if let Some(owner) = self
+            .owner
+            .read()
+            .ok()
+            .and_then(|o| o.as_ref().and_then(crate::config::CachedConfig::upgrade))
+        {
             return Ok(owner);
         }
         Err(Error::Config(ConfigError::Missing(
             "no config available for cached certificate (provide CacheOptions.get_config_for_cert or register an owner)".into(),
         )))
+    }
+
+    fn remove_from_index(index: &mut HashMap<String, Vec<String>>, name: &str, hash: &str) {
+        if let Some(hashes) = index.get_mut(name) {
+            hashes.retain(|candidate| candidate != hash);
+            if hashes.is_empty() {
+                index.remove(name);
+            }
+        }
     }
 
     fn lock_cache(&self) -> std::sync::MutexGuard<'_, HashMap<String, Certificate>> {
@@ -722,6 +770,88 @@ mod tests {
         .unwrap();
         c.tags = tags.iter().map(|s| (*s).to_string()).collect();
         c
+    }
+
+    #[test]
+    fn review_concurrent_lookup_and_mutation_do_not_deadlock() {
+        let cache = Cache::new_without_maintenance(CacheOptions::default()).unwrap();
+        let cert = make_cert(&["concurrent.example.com"], &[]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut threads = Vec::new();
+        for worker in 0..4 {
+            let cache = Arc::clone(&cache);
+            let cert = cert.clone();
+            let sender = sender.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..1000 {
+                    if worker == 0 {
+                        cache.cache_certificate(cert.clone());
+                        cache.remove_certificate(&cert);
+                    } else {
+                        let _ = cache.get_all_matching_certs("concurrent.example.com");
+                        let _ = cache.first_matching_certificate("concurrent.example.com");
+                    }
+                }
+                sender.send(()).unwrap();
+            }));
+        }
+        for _ in 0..4 {
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cache locks must make progress");
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(
+            cache.lock_index().is_empty(),
+            "removed SANs must not accumulate"
+        );
+    }
+
+    #[test]
+    fn review_late_metadata_refresh_does_not_restore_renewed_certificate() {
+        let cache = Cache::new_without_maintenance(CacheOptions::default()).unwrap();
+        let old = make_cert(&["renewed.example.com"], &[]);
+        let new = make_cert(&["renewed.example.com"], &[]);
+        cache.cache_certificate(old.clone());
+        cache.replace_certificate(&old, new.clone());
+        cache.update_metadata(old.hash(), |cert| cert.ocsp_staple = Some(vec![1]));
+        assert!(cache.get_by_hash(old.hash()).is_none());
+        assert_eq!(
+            cache
+                .first_matching_certificate("renewed.example.com")
+                .unwrap()
+                .hash(),
+            new.hash()
+        );
+    }
+
+    #[cfg(feature = "file-storage")]
+    #[tokio::test]
+    async fn review_owner_and_observer_do_not_retain_cache() {
+        let cache = Cache::new_without_maintenance(CacheOptions::default()).unwrap();
+        let config = crate::config::Config::new(Arc::clone(&cache), Default::default()).unwrap();
+        let observer = crate::maintain::start_maintenance(&config);
+        tokio::task::yield_now().await;
+        drop(config);
+        let cert = make_cert(&["owner.example.com"], &[]);
+        assert!(
+            cache.config_for(&cert).await.is_ok(),
+            "cache retains the governing policy"
+        );
+        let weak = Arc::downgrade(&cache);
+        let stopped = cache.stop_token();
+        drop(cache);
+        tokio::time::timeout(Duration::from_secs(1), observer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(weak.upgrade().is_none());
+        assert!(stopped.is_cancelled());
     }
 
     #[tokio::test]

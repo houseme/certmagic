@@ -775,6 +775,39 @@ pub struct Config {
     pub(crate) obtain_flights: Arc<crate::singleflight::SingleFlight<Result<(), Arc<Error>>>>,
 }
 
+/// Cache-owned configuration snapshot without a strong reference back to the cache.
+/// Reconstructing a Config preserves maintenance even when only a resolver/cache
+/// remains alive, without forming Config -> Cache -> Config ownership cycles.
+pub(crate) struct CachedConfig {
+    options: Arc<ConfigOptions>,
+    cache: std::sync::Weak<Cache>,
+    cert_store: Arc<dyn crate::cert_store::CertStore>,
+    load_flights: Arc<crate::singleflight::SingleFlight<crate::handshake::FlightCert>>,
+    obtain_flights: Arc<crate::singleflight::SingleFlight<Result<(), Arc<Error>>>>,
+}
+
+impl CachedConfig {
+    fn new(config: &Config) -> Self {
+        Self {
+            options: Arc::clone(&config.options),
+            cache: Arc::downgrade(&config.cert_cache),
+            cert_store: Arc::clone(&config.cert_store),
+            load_flights: Arc::clone(&config.load_flights),
+            obtain_flights: Arc::clone(&config.obtain_flights),
+        }
+    }
+
+    pub(crate) fn upgrade(&self) -> Option<Arc<Config>> {
+        Some(Arc::new(Config {
+            options: Arc::clone(&self.options),
+            cert_cache: self.cache.upgrade()?,
+            cert_store: Arc::clone(&self.cert_store),
+            load_flights: Arc::clone(&self.load_flights),
+            obtain_flights: Arc::clone(&self.obtain_flights),
+        }))
+    }
+}
+
 impl Config {
     /// Start building a configuration with crate defaults.
     #[must_use]
@@ -787,9 +820,11 @@ impl Config {
     /// # Errors
     /// [`Error::Config`] when options are inconsistent.
     pub fn new(cert_cache: Arc<Cache>, mut options: ConfigOptions) -> Result<Arc<Self>> {
-        if options.renewal_window_ratio < 0.0 || options.renewal_window_ratio >= 1.0 {
+        if !options.renewal_window_ratio.is_finite()
+            || !(0.0..1.0).contains(&options.renewal_window_ratio)
+        {
             return Err(Error::Config(ConfigError::Invalid(
-                "renewal_window_ratio must be in (0, 1)".into(),
+                "renewal_window_ratio must be finite and in [0, 1) (0 selects the default)".into(),
             )));
         }
 
@@ -862,16 +897,11 @@ impl Config {
             load_flights: Arc::new(crate::singleflight::SingleFlight::default()),
             obtain_flights: Arc::new(crate::singleflight::SingleFlight::default()),
         });
-        // Register as the cache owner when the cache has no router.
-        if cfg
-            .cert_cache
-            .owner
-            .read()
-            .map(|o| o.is_none())
-            .unwrap_or(false)
-            && let Ok(mut owner) = cfg.cert_cache.owner.write()
+        // Install the first owner atomically, without retaining the cache itself.
+        if let Ok(mut owner) = cfg.cert_cache.owner.write()
+            && owner.is_none()
         {
-            *owner = Some(Arc::clone(&cfg));
+            *owner = Some(CachedConfig::new(&cfg));
         }
         Ok(cfg)
     }
@@ -1681,8 +1711,9 @@ impl Config {
         for issuer_key in prefixes {
             match self.cert_store.load(&issuer_key, &name).await? {
                 Some(resource) => {
-                    let cert =
+                    let mut cert =
                         make_certificate(&resource.certificate_pem, &resource.private_key_pem)?;
+                    cert.issuer_key = issuer_key.clone();
                     return Ok((issuer_key, resource, cert));
                 }
                 None => {
@@ -1717,12 +1748,21 @@ impl Config {
     /// Storage read/write self-check with 10 KB of random bytes
     ///.
     async fn check_storage(&self) -> Result<()> {
-        let probe: Vec<u8> = (0..10_240).map(|_| rand::rng().random::<u8>()).collect();
-        let key = format!("{}-probe-check", crate::storage::CERTS_PREFIX);
+        let mut probe = vec![0_u8; 10_240];
+        rand::RngExt::fill(&mut rand::rng(), probe.as_mut_slice());
+        // Concurrent issuance for different subjects must not overwrite or
+        // delete each other's health probe.
+        let key = format!(
+            "{}-probe-check-{:032x}",
+            crate::storage::CERTS_PREFIX,
+            rand::rng().random::<u128>()
+        );
         let storage = self.ground_truth_storage();
         storage.store(&key, &probe).await?;
-        let read_back = storage.load(&key).await?;
-        storage.delete(&key).await?;
+        let read_result = storage.load(&key).await;
+        let delete_result = storage.delete(&key).await;
+        let read_back = read_result?;
+        delete_result?;
         if read_back != probe {
             return Err(Error::Storage(StorageError::Other(
                 "storage self-check read mismatch".into(),
@@ -2010,6 +2050,79 @@ mod orchestration_tests {
         )
         .unwrap();
         (config, dir, issuer)
+    }
+
+    #[tokio::test]
+    async fn review_concurrent_storage_probes_are_independent() {
+        let (config, _dir, _) = test_config().await;
+        let probes = (0..16).map(|_| config.check_storage());
+        for result in futures::future::join_all(probes).await {
+            result.unwrap();
+        }
+        assert!(config.storage().list("", true).await.unwrap().is_empty());
+        config.cache().stop_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn review_loaded_certificates_preserve_issuer_identity() {
+        let (config, _dir, _) = test_config().await;
+        let ct = CancellationToken::new();
+        config
+            .obtain_cert(&ct, "issuer.example.com", true)
+            .await
+            .unwrap();
+        let cert = config
+            .cache_managed_certificate(&ct, "issuer.example.com")
+            .await
+            .unwrap();
+        assert_eq!(cert.issuer_key, "mock-v1");
+        config
+            .cache()
+            .remove_managed(&[crate::cache::SubjectIssuer {
+                subject: "issuer.example.com".into(),
+                issuer_key: Some("mock-v1".into()),
+            }]);
+        assert!(config.cache().get_by_hash(cert.hash()).is_none());
+        config.cache().stop_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn review_expired_managed_certificates_are_renewed() {
+        let (config, _dir, issuer) = test_config().await;
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["expired-review.example.com".into()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "expired-review.example.com");
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(90);
+        params.not_after = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        let signed = params.self_signed(&key).unwrap();
+        let resource = CertificateResource {
+            sans: vec!["expired-review.example.com".into()],
+            certificate_pem: signed.pem().into_bytes(),
+            private_key_pem: key.serialize_pem().into_bytes(),
+            issuer_data: None,
+        };
+        config
+            .cert_store
+            .save("mock-v1", "expired-review.example.com", &resource)
+            .await
+            .unwrap();
+        let ct = CancellationToken::new();
+        let old = config
+            .cache_managed_certificate(&ct, "expired-review.example.com")
+            .await
+            .unwrap();
+        config.cache().renew_managed_certificates().await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while config.cache().get_by_hash(old.hash()).is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("expired certificate should be replaced");
+        assert_eq!(issuer.issued.load(Ordering::SeqCst), 1);
+        config.cache().stop_and_wait().await;
     }
 
     #[tokio::test]
@@ -2440,6 +2553,24 @@ mod tests {
         let cfg = Config::new(cache, ConfigOptions::default()).unwrap();
         assert!(cfg.renewal_window_ratio() > 0.0 && cfg.renewal_window_ratio() <= 1.0);
         Arc::clone(&cfg.cert_cache).stop_now();
+    }
+
+    #[test]
+    fn review_rejects_nonfinite_renewal_ratio() {
+        for ratio in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let cache = Cache::new_without_maintenance(Default::default()).unwrap();
+            let result = Config::new(
+                cache,
+                ConfigOptions {
+                    renewal_window_ratio: ratio,
+                    ..Default::default()
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(Error::Config(ConfigError::Invalid(_)))
+            ));
+        }
     }
 
     #[tokio::test]

@@ -33,6 +33,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   in-flight checks, DNS lookups and polling intervals.
 - Retain cleanup ownership for successfully presented ACME challenges across
   cancellation, with best-effort cleanup while the Tokio runtime is alive.
+- Prevent certificate-cache lock inversion and reclaim empty SAN index entries.
+- Break configuration/cache ownership cycles and avoid retaining caches in
+  maintenance observers; continue renewing expired managed certificates.
+- Ignore late ARI/OCSP metadata updates for certificates already replaced or
+  removed from the cache.
+- Preserve loaded certificates' issuer identities, isolate concurrent storage
+  health probes, and reject non-finite renewal ratios.
 
 ### Security
 

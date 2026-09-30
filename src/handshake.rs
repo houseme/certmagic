@@ -450,9 +450,8 @@ impl Config {
         };
         for issuer in &self.options.issuers {
             if let Ok(ari) = issuer.get_renewal_info(ct, &cert).await {
-                let mut fresh = cert.clone();
-                fresh.ari = Some(ari);
-                self.cert_cache.replace_certificate(&cert, fresh);
+                self.cert_cache
+                    .update_metadata(cert.hash(), |cached| cached.ari = Some(ari));
                 break;
             }
         }

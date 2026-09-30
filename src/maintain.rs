@@ -220,9 +220,7 @@ where
     tokio::spawn(async move {
         match start_result {
             Ok(generation) => {
-                if let Some(cache) = weak_cache.upgrade() {
-                    cache.wait_for_maintenance(generation).await;
-                }
+                Cache::observe_maintenance(weak_cache, generation).await;
             }
             Err(error) => {
                 tracing::error!(error = %error, "unable to start certificate maintenance");
@@ -302,12 +300,8 @@ enum Tick {
 /// revoked status; ARI-window jitter follows `currentlyInRenewalWindow`.
 pub(crate) async fn renew_managed_certificates(cache: &Cache) {
     let certs = cache.all_certs();
-    let now = time::OffsetDateTime::now_utc();
     for cert in certs {
         if !cert.managed() {
-            continue;
-        }
-        if cert.expired_at(now) {
             continue;
         }
         let Ok(cfg) = cache.config_for(&cert).await else {
@@ -413,7 +407,10 @@ pub(crate) async fn update_ocsp_staples(cache: &Cache) {
         }
 
         for (old, new) in updates {
-            cache.replace_certificate(&old, new);
+            cache.update_metadata(old.hash(), |cached| {
+                cached.ocsp = new.ocsp;
+                cached.ocsp_staple = new.ocsp_staple;
+            });
         }
         for (cfg, names, replace_revoked) in revoked {
             let ct = tokio_util::sync::CancellationToken::new();

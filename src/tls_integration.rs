@@ -242,9 +242,13 @@ impl CertmagicResolver {
     }
 
     fn governing_config(&self) -> Option<Arc<Config>> {
-        self.config
-            .clone()
-            .or_else(|| self.cache.owner.read().ok().and_then(|owner| owner.clone()))
+        self.config.clone().or_else(|| {
+            self.cache.owner.read().ok().and_then(|owner| {
+                owner
+                    .as_ref()
+                    .and_then(crate::config::CachedConfig::upgrade)
+            })
+        })
     }
 
     fn policy_name(&self, explicit: Option<&String>, config_name: &str) -> Option<String> {
