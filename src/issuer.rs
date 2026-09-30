@@ -21,7 +21,7 @@ pub struct IssuedCertificate {
 
 /// A certificate resource as represented in storage
 ///.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct CertificateResource {
     /// All names covered by the certificate.
     #[serde(default)]
@@ -41,6 +41,15 @@ pub struct CertificateResource {
     /// Issuer-specific data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issuer_data: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for CertificateResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertificateResource")
+            .field("sans", &self.sans)
+            .field("certificate_bytes", &self.certificate_pem.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CertificateResource {
@@ -249,6 +258,18 @@ pub fn as_acme_issuer(issuer: &Arc<dyn Issuer>) -> Option<&crate::acme::AcmeIssu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_certificate_resource_debug_redacts_secrets() {
+        let resource = CertificateResource {
+            private_key_pem: vec![197, 198, 199],
+            issuer_data: Some(serde_json::json!({"secret": "issuer-secret"})),
+            ..Default::default()
+        };
+        let debug = format!("{resource:?}");
+        assert!(!debug.contains("197"));
+        assert!(!debug.contains("issuer-secret"));
+    }
 
     #[test]
     fn names_key_sorts_and_truncates() {

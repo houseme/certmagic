@@ -86,11 +86,20 @@ impl ZeroSslIssuer {
 }
 
 /// Builder for the ACME/EAB-based [`ZeroSslIssuer`].
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ZeroSslIssuerBuilder {
     api_key: Option<String>,
     email: Option<String>,
     storage: Option<Arc<dyn crate::storage::Storage>>,
+}
+
+impl std::fmt::Debug for ZeroSslIssuerBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZeroSslIssuerBuilder")
+            .field("email", &self.email)
+            .field("api_key_configured", &self.api_key.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ZeroSslIssuerBuilder {
@@ -542,6 +551,12 @@ impl Issuer for ZeroSslApiIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_zerossl_builder_debug_redacts_api_key() {
+        let builder = ZeroSslIssuerBuilder::new().api_key("private-api-secret");
+        assert!(!format!("{builder:?}").contains("private-api-secret"));
+    }
 
     #[test]
     fn zero_ssl_validation_matches_provider_path() {

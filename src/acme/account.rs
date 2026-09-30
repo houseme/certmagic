@@ -10,12 +10,20 @@ use crate::acme::protocol::AccountKey;
 use crate::error::{AcmeError, Error, Result};
 
 /// External account binding credentials issued by the CA.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EabCredentials {
     /// The CA-issued key identifier (`kid`).
     pub key_id: String,
     /// The HMAC-SHA256 key, base64url-encoded.
     pub hmac_key: String,
+}
+
+impl std::fmt::Debug for EabCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EabCredentials")
+            .field("key_id", &self.key_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An ACME account: the key *is* the account; the URL is its server-side
@@ -245,6 +253,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_eab_debug_redacts_hmac_secret() {
+        let credentials = EabCredentials {
+            key_id: "account".into(),
+            hmac_key: "private-hmac-secret".into(),
+        };
+        assert!(!format!("{credentials:?}").contains("private-hmac-secret"));
+    }
 
     #[test]
     fn eab_structure_and_signature() {

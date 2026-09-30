@@ -43,10 +43,18 @@ impl SignatureAlgorithm {
 }
 
 /// A DER-encoded PKCS#8 account key.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AccountKey {
     pkcs8: Arc<Vec<u8>>,
     alg: SignatureAlgorithm,
+}
+
+impl std::fmt::Debug for AccountKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountKey")
+            .field("algorithm", &self.alg)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AccountKey {
@@ -310,6 +318,15 @@ pub fn tls_alpn_01_digest(key_auth: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_account_key_debug_redacts_private_material() {
+        let key = AccountKey::generate_es256().unwrap();
+        let debug = format!("{key:?}");
+        assert!(!debug.contains(&format!("{:?}", key.pkcs8)));
+        assert!(!debug.contains("pkcs8"));
+        assert!(debug.contains("Es256"));
+    }
 
     #[test]
     fn key_authorization_digest_known_answer() {
