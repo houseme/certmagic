@@ -8,6 +8,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Update the transitive `yoke-derive` dependency to 0.8.4.
 - FileStorage's lock protocol requires all cooperating instances to upgrade
   together and a filesystem supporting OS file locks. Keep locks/*.guard
   sidecars while instances run; see the README for lease/fencing and
