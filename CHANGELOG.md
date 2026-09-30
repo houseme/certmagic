@@ -6,6 +6,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Expose `LockGuard::new` for external storage/locking backends, including builds
+  without file-storage; document token-safe release and network lease recovery.
+
 ### Changed
 
 - Update resolved Quinn dependencies to `quinn-proto 0.11.19` and

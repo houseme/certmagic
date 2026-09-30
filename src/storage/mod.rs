@@ -177,8 +177,15 @@ pub trait LockRelease: Send + Sync {
 }
 
 impl LockGuard {
-    #[cfg(feature = "file-storage")]
-    pub(crate) fn new(key: impl Into<String>, release: Box<dyn LockRelease>) -> Self {
+    /// Wrap a lock already acquired by a custom backend.
+    ///
+    /// `release` must retain that acquisition's ownership token and release only
+    /// that holder, never a subsequent holder of the same name. Its callback
+    /// runs synchronously from Drop and should not block an async executor.
+    /// Network backends can enqueue token-checked cleanup, but must also use a
+    /// lease/TTL to recover if the runtime stops before cleanup completes.
+    #[must_use]
+    pub fn new(key: impl Into<String>, release: Box<dyn LockRelease>) -> Self {
         Self {
             key: key.into(),
             release,
