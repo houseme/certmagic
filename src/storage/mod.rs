@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::crypto::hash_certificate_chain;
 use crate::error::{Error, Result, StorageError};
 
-#[cfg(any(feature = "file-storage", feature = "redis-storage"))]
+#[cfg(any(feature = "file-storage", feature = "redis-storage",))]
 mod key;
 
 mod locking;
@@ -80,11 +80,60 @@ pub trait Storage: Locker {
         Ok(std::borrow::Cow::Borrowed(key))
     }
 
+    /// Reject incompatible acquisition contexts before starting protected work.
+    /// Backends supporting fences must override this and both guarded methods.
+    fn validate_write_guard(&self, guard: &LockGuard) -> Result<()> {
+        guard.check_unfenced_write()
+    }
+
+    /// Write a group of keys under this acquisition. The default retains the
+    /// legacy compensated-write behavior for guards without a fence. Backends
+    /// accepting a fence must compare it in the same transaction as all writes.
+    async fn store_tx_with_lock(&self, items: &[KeyValue<'_>], guard: &LockGuard) -> Result<()> {
+        self.validate_write_guard(guard)?;
+        // Even an overridden validator must not accidentally enable this
+        // non-atomic fallback for a fenced guard.
+        guard.check_unfenced_write()?;
+        store_tx(self, items).await
+    }
+
+    /// Move one exact key under this acquisition. Fenced implementations must
+    /// compare ownership, copy the value and remove the source atomically.
+    async fn move_with_lock(
+        &self,
+        source: &str,
+        destination: &str,
+        guard: &LockGuard,
+    ) -> Result<()> {
+        self.validate_write_guard(guard)?;
+        guard.check_unfenced_write()?;
+        if source == destination {
+            return Ok(());
+        }
+        let value = self.load(source).await?;
+        self.store(destination, &value).await?;
+        self.delete(source).await
+    }
+
     /// Store `value` at `key`, creating or overwriting.
     async fn store(&self, key: &str, value: &[u8]) -> Result<()>;
 
     /// Load the value at `key`.
     async fn load(&self, key: &str) -> Result<Vec<u8>>;
+
+    /// Load a group of exact keys, preserving order and representing absence
+    /// as None. The default overlaps independent reads; transactional backends
+    /// can override it to return one coherent snapshot.
+    async fn load_many(&self, keys: &[&str]) -> Result<Vec<Option<Vec<u8>>>> {
+        futures::future::try_join_all(keys.iter().map(|key| async move {
+            match self.load(key).await {
+                Ok(value) => Ok(Some(value)),
+                Err(Error::Storage(StorageError::NotFound(_))) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }))
+        .await
+    }
 
     /// Delete `key`; deleting a prefix deletes everything under it.
     /// Deleting a nonexistent key succeeds.
@@ -92,6 +141,12 @@ pub trait Storage: Locker {
 
     /// Whether `key` exists (as a value or a prefix).
     async fn exists(&self, key: &str) -> Result<bool>;
+
+    /// Check a group of keys in order. The default overlaps independent
+    /// existence checks; transactional backends can provide a coherent view.
+    async fn exists_many(&self, keys: &[&str]) -> Result<Vec<bool>> {
+        futures::future::try_join_all(keys.iter().map(|key| self.exists(key))).await
+    }
 
     /// List keys under `path`; recurse into children when `recursive`.
     async fn list(&self, path: &str, recursive: bool) -> Result<Vec<String>>;
@@ -362,7 +417,7 @@ pub type KeyValue<'a> = (&'a str, Vec<u8>);
 /// transaction (or deleted when they did not exist). This preserves existing
 /// resources when a later write fails; a rollback failure is logged because
 /// the original write error is the actionable result for the caller.
-pub async fn store_tx(storage: &dyn Storage, items: &[KeyValue<'_>]) -> Result<()> {
+pub async fn store_tx(storage: &(impl Storage + ?Sized), items: &[KeyValue<'_>]) -> Result<()> {
     // Snapshot every destination before the first write. Deleting a key on
     // rollback is not sufficient when the transaction overwrites an existing
     // certificate resource: it would turn a transient write failure into data
@@ -434,9 +489,26 @@ pub async fn load_certificate(
     issuer_key: &str,
     domain: &str,
 ) -> Result<crate::issuer::CertificateResource> {
-    let private_key = storage.load(&site_private_key(issuer_key, domain)).await?;
-    let certificate = storage.load(&site_cert_key(issuer_key, domain)).await?;
-    let metadata = storage.load(&site_meta_key(issuer_key, domain)).await?;
+    let keys = [
+        site_private_key(issuer_key, domain),
+        site_cert_key(issuer_key, domain),
+        site_meta_key(issuer_key, domain),
+    ];
+    let values = storage
+        .load_many(&keys.each_ref().map(String::as_str))
+        .await?;
+    if values.len() != keys.len() {
+        return Err(Error::Internal(
+            "storage returned an invalid certificate snapshot".into(),
+        ));
+    }
+    let mut values = values
+        .into_iter()
+        .zip(keys)
+        .map(|(value, key)| value.ok_or(Error::Storage(StorageError::NotFound(key))));
+    let private_key = values.next().expect("validated snapshot length")?;
+    let certificate = values.next().expect("validated snapshot length")?;
+    let metadata = values.next().expect("validated snapshot length")?;
     let mut resource: crate::issuer::CertificateResource = serde_json::from_slice(&metadata)
         .map_err(|error| Error::Storage(StorageError::Other(format!("meta decode: {error}"))))?;
     resource.private_key_pem = private_key;

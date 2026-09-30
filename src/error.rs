@@ -107,6 +107,10 @@ pub enum StorageError {
     #[error("stale lock or lost lease: {0}")]
     StaleLock(String),
 
+    /// The destination cannot atomically validate this acquisition's proof.
+    #[error("destination does not support this lock's write fence")]
+    UnsupportedFencing,
+
     /// Underlying I/O failure (message preserved; kind lost across clone).
     #[error("io: {0}")]
     Io(String),

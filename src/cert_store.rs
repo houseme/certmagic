@@ -11,11 +11,47 @@ use async_trait::async_trait;
 
 use crate::error::{Error, Result, StorageError};
 use crate::issuer::CertificateResource;
-use crate::storage::{STORAGE_KEYS, Storage, store_tx};
+use crate::storage::{LockGuard, STORAGE_KEYS, Storage, store_tx};
 
 /// Persistence for complete certificate resources.
 #[async_trait]
 pub trait CertStore: Send + Sync + std::fmt::Debug {
+    /// Check whether this destination can honor an acquisition's write fence.
+    /// Config calls this before CA work. Custom stores default to refusing
+    /// fenced guards; accepting one requires atomic guarded implementations.
+    fn validate_write_guard(&self, guard: &LockGuard) -> Result<()> {
+        guard.check_unfenced_write()
+    }
+
+    /// Publish a complete resource while atomically validating ownership when
+    /// the guard requires it. The default only supports unfenced guards.
+    async fn save_with_lock(
+        &self,
+        issuer_key: &str,
+        domain: &str,
+        resource: &CertificateResource,
+        guard: &LockGuard,
+    ) -> Result<()> {
+        self.validate_write_guard(guard)?;
+        guard.check_unfenced_write()?;
+        self.save(issuer_key, domain, resource).await
+    }
+
+    /// Archive/remove a compromised private key under the same ownership
+    /// contract as publication. The default only supports unfenced guards.
+    async fn move_private_key_with_lock(
+        &self,
+        issuer_key: &str,
+        domain: &str,
+        destination_key: &str,
+        guard: &LockGuard,
+    ) -> Result<()> {
+        self.validate_write_guard(guard)?;
+        guard.check_unfenced_write()?;
+        self.move_private_key(issuer_key, domain, destination_key)
+            .await
+    }
+
     /// Load a resource, returning `Ok(None)` when the complete resource is absent.
     async fn load(&self, issuer_key: &str, domain: &str) -> Result<Option<CertificateResource>>;
 
@@ -77,27 +113,62 @@ impl KeyValueCertStore {
             STORAGE_KEYS.site_meta(issuer_key, domain),
         )
     }
-
-    async fn optional_load(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        match self.storage.load(key).await {
-            Ok(value) => Ok(Some(value)),
-            Err(Error::Storage(StorageError::NotFound(_))) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
 }
 
 #[async_trait]
 impl CertStore for KeyValueCertStore {
+    fn validate_write_guard(&self, guard: &LockGuard) -> Result<()> {
+        self.storage.validate_write_guard(guard)
+    }
+
+    async fn save_with_lock(
+        &self,
+        issuer_key: &str,
+        domain: &str,
+        resource: &CertificateResource,
+        guard: &LockGuard,
+    ) -> Result<()> {
+        self.validate_write_guard(guard)?;
+        let (certificate, private_key, metadata) = self.paths(issuer_key, domain);
+        let metadata_value = serde_json::to_vec(resource).map_err(|_| {
+            Error::Storage(StorageError::Other(
+                "certificate metadata encoding failed".into(),
+            ))
+        })?;
+        self.storage
+            .store_tx_with_lock(
+                &[
+                    (&certificate, resource.certificate_pem.clone()),
+                    (&private_key, resource.private_key_pem.clone()),
+                    (&metadata, metadata_value),
+                ],
+                guard,
+            )
+            .await
+    }
+
+    async fn move_private_key_with_lock(
+        &self,
+        issuer_key: &str,
+        domain: &str,
+        destination_key: &str,
+        guard: &LockGuard,
+    ) -> Result<()> {
+        let (_, key, _) = self.paths(issuer_key, domain);
+        self.storage
+            .move_with_lock(&key, destination_key, guard)
+            .await
+    }
+
     async fn load(&self, issuer_key: &str, domain: &str) -> Result<Option<CertificateResource>> {
         let (certificate_key, private_key_key, metadata_key) = self.paths(issuer_key, domain);
-        // The three independent reads can share a network round-trip window.
-        // This remains a logical resource read, not a backend snapshot transaction.
-        let (certificate, private_key, metadata) = tokio::try_join!(
-            self.optional_load(&certificate_key),
-            self.optional_load(&private_key_key),
-            self.optional_load(&metadata_key),
-        )?;
+        let values = self
+            .storage
+            .load_many(&[&certificate_key, &private_key_key, &metadata_key])
+            .await?;
+        let [certificate, private_key, metadata]: [Option<Vec<u8>>; 3] = values
+            .try_into()
+            .map_err(|_| Error::Internal("storage returned an invalid resource snapshot".into()))?;
         match (certificate, private_key, metadata) {
             (None, None, None) => Ok(None),
             (Some(certificate_pem), Some(private_key_pem), Some(metadata)) => {
@@ -138,12 +209,16 @@ impl CertStore for KeyValueCertStore {
 
     async fn has(&self, issuer_key: &str, domain: &str) -> Result<bool> {
         let (certificate_key, private_key_key, metadata_key) = self.paths(issuer_key, domain);
-        let (certificate, private_key, metadata) = tokio::try_join!(
-            self.storage.exists(&certificate_key),
-            self.storage.exists(&private_key_key),
-            self.storage.exists(&metadata_key),
-        )?;
-        let count = usize::from(certificate) + usize::from(private_key) + usize::from(metadata);
+        let values = self
+            .storage
+            .exists_many(&[&certificate_key, &private_key_key, &metadata_key])
+            .await?;
+        if values.len() != 3 {
+            return Err(Error::Internal(
+                "storage returned an invalid existence snapshot".into(),
+            ));
+        }
+        let count = values.iter().filter(|value| **value).count();
         match count {
             0 => Ok(false),
             3 => Ok(true),

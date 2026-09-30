@@ -6,7 +6,8 @@
 //! always hit the underlying storage (cluster coordination must not be
 //! cached). Cached hits never wait for backend I/O; misses and writes serialize
 //! per canonical key, while prefix deletion excludes all fills/writes.
-//! Changes through other handles/processes are visible only after eviction.
+//! Single-key hits see external changes only after eviction. Grouped resource
+//! reads bypass per-key entries to preserve the backend snapshot boundary.
 //! Cancellation cannot retract a write already dispatched to a backend; use
 //! an authoritative read when a cancelled write has an ambiguous outcome.
 //! Torn-write detection happens at the certificate layer
@@ -214,6 +215,46 @@ impl Storage for LocalCache {
         self.inner.canonical_key(key)
     }
 
+    fn validate_write_guard(&self, guard: &LockGuard) -> Result<()> {
+        self.inner.validate_write_guard(guard)
+    }
+
+    async fn store_tx_with_lock(
+        &self,
+        items: &[crate::storage::KeyValue<'_>],
+        guard: &LockGuard,
+    ) -> Result<()> {
+        self.validate_write_guard(guard)?;
+        let keys: Vec<_> = items
+            .iter()
+            .map(|(key, _)| self.canonical_key(key))
+            .collect::<Result<_>>()?;
+        let _prefix = self.prefixes.write().await;
+        for key in keys {
+            self.forget(&key, false);
+        }
+        // Delegate the entire transaction; individual store calls would lose
+        // the ownership comparison and atomic publication guarantee.
+        self.inner.store_tx_with_lock(items, guard).await
+    }
+
+    async fn move_with_lock(
+        &self,
+        source: &str,
+        destination: &str,
+        guard: &LockGuard,
+    ) -> Result<()> {
+        self.validate_write_guard(guard)?;
+        let source = self.canonical_key(source)?;
+        let destination = self.canonical_key(destination)?;
+        let _prefix = self.prefixes.write().await;
+        self.forget(&source, false);
+        self.forget(&destination, false);
+        self.inner
+            .move_with_lock(&source, &destination, guard)
+            .await
+    }
+
     async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
         let key = self.canonical_key(key)?;
         let key = key.as_ref();
@@ -248,6 +289,13 @@ impl Storage for LocalCache {
         Ok(value)
     }
 
+    async fn load_many(&self, keys: &[&str]) -> Result<Vec<Option<Vec<u8>>>> {
+        // Mixing cached generations would destroy an inner backend's snapshot
+        // guarantee. Bundle reads go to the authoritative backend together.
+        let _prefix = self.prefixes.read().await;
+        self.inner.load_many(keys).await
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         let key = self.canonical_key(key)?;
         let key = key.as_ref();
@@ -258,6 +306,10 @@ impl Storage for LocalCache {
 
     async fn exists(&self, key: &str) -> Result<bool> {
         self.inner.exists(key).await
+    }
+
+    async fn exists_many(&self, keys: &[&str]) -> Result<Vec<bool>> {
+        self.inner.exists_many(keys).await
     }
 
     async fn list(&self, prefix: &str, recursive: bool) -> Result<Vec<String>> {

@@ -8,6 +8,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Add backend-owned write-fence contexts, guarded storage transactions and
+  private-key moves, and guarded CertStore publication with fail-closed defaults.
 - Add default-preserving `Storage::canonical_key` so decorators can share cache
   identity and coordination across backend aliases without rewriting opaque keys.
 - Extend architecture-refactor benchmarks with cached reads, untracked guard
@@ -26,6 +28,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Route Config issuance, renewal and compromised-key archival through guarded
+  operations, checking destination compatibility before contacting an issuer.
+- Read complete certificate resources through bulk storage hooks that preserve
+  backend snapshot boundaries; generic backends retain concurrent reads/existence
+  checks and LocalCache delegates complete-resource reads together.
 - Consolidate certificate entries and their SAN index under one read/write state
   lock; sample managed eviction candidates without cloning every cached hash.
 - Isolate lock lifecycle code and unify its shutdown registry. Untracked guards

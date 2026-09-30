@@ -1264,6 +1264,7 @@ impl Config {
         // Distributed lock serializes issuance across the cluster.
         let lock_key = format!("issue_cert_{name}");
         let guard = acquire_lock(ct, &self.storage(), &lock_key).await?;
+        self.cert_store.validate_write_guard(&guard)?;
 
         // Re-check inside the lock: another instance may have obtained it
         // while we waited.
@@ -1319,6 +1320,7 @@ impl Config {
                         name,
                         &issued.issued,
                         &issued.private_key_pem,
+                        guard,
                     )
                     .await?;
                 emit(
@@ -1506,6 +1508,7 @@ impl Config {
         let name = self.transform_subject(ct, name).await;
         let lock_key = format!("issue_cert_{name}");
         let guard = acquire_lock(ct, &self.storage(), &lock_key).await?;
+        self.cert_store.validate_write_guard(&guard)?;
 
         // Re-check under the lock.
         let (issuer_key, old_resource, old_cert) =
@@ -1539,7 +1542,7 @@ impl Config {
         let replaces = old_cert.ari_replaces_id();
         if compromised {
             require_live_lock(&guard)?;
-            self.move_compromised_private_key_locked(&issuer_key, &name)
+            self.move_compromised_private_key_locked(&issuer_key, &name, &guard)
                 .await?;
         }
 
@@ -1582,6 +1585,7 @@ impl Config {
         &self,
         issuer_key: &str,
         domain: &str,
+        guard: &LockGuard,
     ) -> Result<String> {
         let key = format!(
             "compromised/{}/{}/{}.key",
@@ -1590,7 +1594,7 @@ impl Config {
             crate::storage::STORAGE_KEYS.safe(domain)
         );
         self.cert_store
-            .move_private_key(issuer_key, domain, &key)
+            .move_private_key_with_lock(issuer_key, domain, &key, guard)
             .await?;
         Ok(key)
     }
@@ -1626,6 +1630,7 @@ impl Config {
             ctx.name,
             &issued.issued,
             &issued.private_key_pem,
+            ctx.guard,
         )
         .await?;
 
@@ -1688,6 +1693,7 @@ impl Config {
         domain: &str,
         issued: &IssuedCertificate,
         private_key_pem: &[u8],
+        guard: &LockGuard,
     ) -> Result<CertificateResource> {
         let names = make_certificate(&issued.certificate, private_key_pem)?.names;
         let resource = CertificateResource {
@@ -1696,7 +1702,9 @@ impl Config {
             private_key_pem: private_key_pem.to_vec(),
             issuer_data: issued.metadata.clone(),
         };
-        self.cert_store.save(issuer_key, domain, &resource).await?;
+        self.cert_store
+            .save_with_lock(issuer_key, domain, &resource, guard)
+            .await?;
         Ok(resource)
     }
 

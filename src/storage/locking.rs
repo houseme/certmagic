@@ -107,6 +107,14 @@ pub type LockHandle = LockGuard;
 
 /// Object-safe release callback owned by a [`LockGuard`].
 pub trait LockRelease: Send + Sync {
+    /// Backend-private ownership proof for atomic, guarded writes. Returning
+    /// Some requires compatible storage/CertStore implementations; defaults
+    /// fail closed instead of silently discarding the proof. Never log secrets
+    /// contained in this context. A proof alone is not a write-side fence.
+    fn write_fence(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
+
     /// Request release of this acquisition without blocking the caller.
     /// Implementations must be idempotent and ownership-checked: cancellation
     /// of an awaited release can cause a subsequent Drop fallback.
@@ -195,6 +203,30 @@ impl LockGuard {
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.release.phase.load(Ordering::Acquire) == ACTIVE && self.release.callback.is_valid()
+    }
+
+    /// Backend-private context to compare atomically with protected writes.
+    pub fn write_fence(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.release.callback.write_fence()
+    }
+
+    /// Check local health. The backend must still check ownership atomically.
+    pub fn ensure_valid(&self) -> Result<()> {
+        if self.is_valid() {
+            Ok(())
+        } else {
+            Err(Error::Storage(StorageError::StaleLock(self.key.clone())).no_retry())
+        }
+    }
+
+    /// Compatibility check for a backend without atomic ownership validation.
+    /// Refuses a guard requiring fencing; otherwise only checks local health.
+    pub fn check_unfenced_write(&self) -> Result<()> {
+        self.ensure_valid()?;
+        if self.write_fence().is_some() {
+            return Err(Error::Storage(StorageError::UnsupportedFencing).no_retry());
+        }
+        Ok(())
     }
 
     /// The lock key this guard holds.

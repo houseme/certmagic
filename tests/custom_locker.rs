@@ -181,3 +181,97 @@ fn default_canonical_identity_preserves_opaque_custom_backend_keys() {
         "opaque:../key\\tail"
     );
 }
+
+struct WriteProof(bool);
+impl LockRelease for WriteProof {
+    fn release(&self) {}
+    fn write_fence(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.0.then_some(self)
+    }
+}
+#[derive(Debug, Default)]
+struct LegacyCertStore(AtomicUsize);
+#[async_trait]
+impl certmagic::cert_store::CertStore for LegacyCertStore {
+    // Overriding only preflight must not accidentally disable the default
+    // guarded methods' refusal to discard an unknown ownership proof.
+    fn validate_write_guard(&self, _: &LockGuard) -> Result<()> {
+        Ok(())
+    }
+    async fn load(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<certmagic::issuer::CertificateResource>> {
+        Ok(None)
+    }
+    async fn has(&self, _: &str, _: &str) -> Result<bool> {
+        Ok(false)
+    }
+    async fn save(
+        &self,
+        _: &str,
+        _: &str,
+        _: &certmagic::issuer::CertificateResource,
+    ) -> Result<()> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn remove(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn move_private_key(&self, _: &str, _: &str, _: &str) -> Result<()> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+#[tokio::test]
+async fn guarded_defaults_reject_unknown_proofs_without_calling_legacy_mutations() {
+    use certmagic::Storage;
+    use certmagic::cert_store::CertStore;
+    let guarded = LockGuard::new("protected", Box::new(WriteProof(true)));
+    let backend = CustomLocker {
+        semaphore: Arc::new(Semaphore::new(1)),
+        releases: Arc::new(AtomicUsize::new(0)),
+    };
+    assert!(
+        backend
+            .store_tx_with_lock(&[("key", b"value".to_vec())], &guarded)
+            .await
+            .unwrap_err()
+            .has_no_retry()
+    );
+    assert!(
+        backend
+            .move_with_lock("source", "destination", &guarded)
+            .await
+            .unwrap_err()
+            .has_no_retry()
+    );
+    let store = LegacyCertStore::default();
+    assert!(
+        store
+            .save_with_lock("issuer", "domain", &Default::default(), &guarded)
+            .await
+            .unwrap_err()
+            .has_no_retry()
+    );
+    assert!(
+        store
+            .move_private_key_with_lock("issuer", "domain", "destination", &guarded)
+            .await
+            .unwrap_err()
+            .has_no_retry()
+    );
+    assert_eq!(store.0.load(Ordering::SeqCst), 0);
+    let legacy = LockGuard::new("legacy", Box::new(WriteProof(false)));
+    store
+        .save_with_lock("issuer", "domain", &Default::default(), &legacy)
+        .await
+        .unwrap();
+    store
+        .move_private_key_with_lock("issuer", "domain", "destination", &legacy)
+        .await
+        .unwrap();
+    assert_eq!(store.0.load(Ordering::SeqCst), 2);
+}
