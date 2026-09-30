@@ -29,6 +29,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Enforce LocalCache capacity and FIFO eviction, invalidate deleted prefixes,
   and coordinate cache fills with writes/deletes so stale reads cannot replace
   newer cached values.
+- Bound ACME order polling and DNS propagation by their total timeout, including
+  in-flight checks, DNS lookups and polling intervals.
+- Retain cleanup ownership for successfully presented ACME challenges across
+  cancellation, with best-effort cleanup while the Tokio runtime is alive.
 
 ### Security
 

@@ -194,6 +194,10 @@ impl Solver for Dns01Solver {
             tokio::select! {
                 () = ct.cancelled() =>
                     return Err(Error::Issuer(IssuerError::Challenge("canceled".into()))),
+                () = tokio::time::sleep_until(deadline) =>
+                    return Err(Error::Issuer(IssuerError::Challenge(format!(
+                        "DNS propagation not observed for {name} within timeout"
+                    )))),
                 () = tokio::time::sleep(self.options.propagation_interval) => {}
             }
             if tokio::time::Instant::now() >= deadline {
@@ -218,6 +222,10 @@ impl Solver for Dns01Solver {
             let propagated = tokio::select! {
                 () = ct.cancelled() =>
                     return Err(Error::Issuer(IssuerError::Challenge("canceled".into()))),
+                () = tokio::time::sleep_until(deadline) =>
+                    return Err(Error::Issuer(IssuerError::Challenge(format!(
+                        "DNS propagation not observed for {name} within timeout"
+                    )))),
                 result = lookup => result.unwrap_or(false),
             };
             if propagated {
@@ -359,6 +367,33 @@ mod tests {
             url: "https://ca/chal".into(),
             identifier: "*.example.com".into(),
             key_authorization: "tok.thumb".into(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_dns_deadline_bounds_slow_resolver_and_poll_interval() {
+        for interval in [Duration::from_millis(1), Duration::from_secs(60)] {
+            let resolver = Arc::new(FakeResolver {
+                block_queries: true,
+                ..Default::default()
+            });
+            let solver = Dns01Solver::with_resolver(
+                Arc::new(MemoryDns::default()),
+                DnsOptions {
+                    propagation_timeout: Some(Duration::from_secs(2)),
+                    propagation_interval: interval,
+                    ..Default::default()
+                },
+                resolver,
+            );
+            let start = tokio::time::Instant::now();
+            assert!(
+                solver
+                    .wait(&CancellationToken::new(), &sample())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(start.elapsed(), Duration::from_secs(2));
         }
     }
 

@@ -337,7 +337,8 @@ impl From<SuggestedWindow> for crate::certificate::RenewalWindow {
 /// server-provided interval.
 ///
 /// # Errors
-/// Returns the last error from `check` on timeout.
+/// Returns a timeout error when the total budget expires, including time
+/// spent inside `check`. Check errors are returned immediately.
 pub async fn poll_until<T, F, Fut>(
     mut check: F,
     timeout: Duration,
@@ -347,26 +348,23 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<(T, bool)>>,
 {
-    let start = std::time::Instant::now();
-    let mut interval = FIRST_POLL_INTERVAL;
-    loop {
-        let (value, done) = check().await?;
-        if done {
-            return Ok(value);
-        }
-        if start.elapsed() >= timeout {
-            return Err(Error::Acme(AcmeError::Order(format!(
-                "not ready within {}s",
-                timeout.as_secs()
-            ))));
-        }
-        tokio::select! {
-            () = ct.cancelled() => {
-                return Err(Error::Acme(AcmeError::Order("canceled".into())))
+    let polling = async {
+        let mut interval = FIRST_POLL_INTERVAL;
+        loop {
+            let (value, done) = check().await?;
+            if done {
+                return Ok(value);
             }
-            () = tokio::time::sleep(interval) => {}
+            tokio::time::sleep(interval).await;
+            interval = (interval * 2).min(MAX_POLL_INTERVAL);
         }
-        interval = (interval * 2).min(MAX_POLL_INTERVAL);
+    };
+    tokio::select! {
+        biased;
+        () = ct.cancelled() => Err(Error::Acme(AcmeError::Order("canceled".into()))),
+        result = tokio::time::timeout(timeout, polling) => result.unwrap_or_else(|_| {
+            Err(Error::Acme(AcmeError::Order(format!("not ready within {}s", timeout.as_secs()))))
+        }),
     }
 }
 
@@ -378,6 +376,35 @@ fn rfc3339(t: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn review_poll_timeout_includes_inflight_check() {
+        let result: Result<()> = poll_until(
+            std::future::pending,
+            Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not ready within 2s")
+        );
+    }
+
+    #[tokio::test]
+    async fn review_cancelled_poll_does_not_start_check() {
+        let ct = tokio_util::sync::CancellationToken::new();
+        ct.cancel();
+        let result: Result<()> = poll_until(
+            || async { panic!("cancelled poll must not execute") },
+            Duration::from_secs(1),
+            &ct,
+        )
+        .await;
+        assert!(result.is_err());
+    }
 
     #[test]
     fn ari_cert_id_is_dot_separated() {

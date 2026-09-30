@@ -780,6 +780,40 @@ impl Issuer for AcmeIssuer {
     }
 }
 
+/// Challenge resources outlive individual requests. Retain cleanup ownership
+/// across every await, including cancellation during the normal cleanup path.
+#[derive(Default)]
+struct ChallengeCleanup {
+    entries: Vec<(Arc<dyn Solver>, SolvableChallenge)>,
+}
+
+impl ChallengeCleanup {
+    async fn run(&mut self) {
+        while let Some((solver, challenge)) = self.entries.last() {
+            solver.cleanup(challenge).await;
+            self.entries.pop();
+        }
+    }
+}
+
+impl Drop for ChallengeCleanup {
+    fn drop(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let entries = std::mem::take(&mut self.entries);
+            runtime.spawn(async move {
+                for (solver, challenge) in entries.into_iter().rev() {
+                    solver.cleanup(&challenge).await;
+                }
+            });
+        } else {
+            tracing::warn!("challenge cleanup could not run without a Tokio runtime");
+        }
+    }
+}
+
 impl AcmeIssuer {
     async fn issue_once(
         &self,
@@ -817,7 +851,7 @@ impl AcmeIssuer {
             .await?;
 
         // Solve every authorization, cleaning up no matter what.
-        let mut solved: Vec<(Arc<dyn Solver>, SolvableChallenge)> = Vec::new();
+        let mut solved = ChallengeCleanup::default();
         let outcome: Result<Order> = async {
             for authz_url in &order.authorizations {
                 let authz = client.authorization(authz_url, ct).await?;
@@ -835,7 +869,9 @@ impl AcmeIssuer {
                     &client.account()?.key,
                 )?;
                 solver.present(ct, &solvable).await?;
-                solved.push((Arc::clone(&solver), solvable.clone()));
+                // There is no await between successful presentation and
+                // transferring cleanup ownership to the guard.
+                solved.entries.push((Arc::clone(&solver), solvable.clone()));
 
                 client.trigger_challenge(&chal.url, ct).await?;
                 solver.wait(ct, &solvable).await?;
@@ -847,9 +883,7 @@ impl AcmeIssuer {
         .await;
 
         // Always clean up.
-        for (solver, chal) in &solved {
-            solver.cleanup(chal).await;
-        }
+        solved.run().await;
 
         let order = outcome?;
         if order.status == "invalid" {
@@ -990,4 +1024,59 @@ fn aki_and_serial(cert: &crate::certificate::Certificate) -> Result<(Vec<u8>, Ve
         })?;
 
     Ok((aki, parsed.serial.to_bytes_be()))
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct CleanupProbe {
+        calls: AtomicUsize,
+        block_first: bool,
+    }
+    #[async_trait]
+    impl Solver for CleanupProbe {
+        async fn present(&self, _: &CancellationToken, _: &SolvableChallenge) -> Result<()> {
+            Ok(())
+        }
+        async fn cleanup(&self, _: &SolvableChallenge) {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 && self.block_first {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn review_challenge_cleanup_survives_cancellation_during_cleanup() {
+        let solver = Arc::new(CleanupProbe {
+            calls: AtomicUsize::new(0),
+            block_first: true,
+        });
+        let mut cleanup = ChallengeCleanup {
+            entries: vec![(
+                solver.clone(),
+                SolvableChallenge {
+                    kind: "dns-01".into(),
+                    token: "token".into(),
+                    url: "https://ca.invalid".into(),
+                    identifier: "cleanup.example.com".into(),
+                    key_authorization: "token.thumbprint".into(),
+                },
+            )],
+        };
+        {
+            let mut running = Box::pin(cleanup.run());
+            assert!(futures::poll!(&mut running).is_pending());
+        }
+        drop(cleanup);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while solver.calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 }
