@@ -23,6 +23,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Reduce repeated name normalization, wildcard allocations, lock acquisitions
   and certificate clones in cache lookup and duplicate insertion.
+- Make LocalCache exact-key invalidation constant-time with amortized FIFO
+  cleanup, preserving bounded bookkeeping and existing eviction behavior.
 
 ### Fixed
 

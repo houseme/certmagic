@@ -27,18 +27,41 @@ pub struct LocalCache {
 
 #[derive(Default)]
 struct CacheState {
-    values: HashMap<String, Vec<u8>>,
-    order: VecDeque<String>,
+    values: HashMap<String, CacheEntry>,
+    order: VecDeque<(String, u64)>,
+    generation: u64,
+}
+
+struct CacheEntry {
+    value: Vec<u8>,
+    generation: u64,
 }
 
 impl CacheState {
     fn evict_to(&mut self, maximum: usize) {
         while maximum > 0 && self.values.len() > maximum {
-            if let Some(key) = self.order.pop_front() {
-                self.values.remove(&key);
+            if let Some((key, generation)) = self.order.pop_front() {
+                if self
+                    .values
+                    .get(&key)
+                    .is_some_and(|entry| entry.generation == generation)
+                {
+                    self.values.remove(&key);
+                }
             } else {
                 break;
             }
+        }
+    }
+    fn compact_order(&mut self) {
+        // Exact-key writes leave cheap tombstones in the FIFO queue. Compact
+        // periodically so repeated updates cannot grow bookkeeping unboundedly.
+        if self.order.len() > self.values.len().saturating_mul(2).max(64) {
+            self.order.retain(|(key, generation)| {
+                self.values
+                    .get(key)
+                    .is_some_and(|entry| entry.generation == *generation)
+            });
         }
     }
 }
@@ -80,28 +103,42 @@ impl LocalCache {
         local.max_entries = max_entries;
         if let Ok(cache) = local.cache.get_mut() {
             cache.evict_to(max_entries);
+            cache.compact_order();
         }
         Arc::new(local)
     }
 
     fn remember(&self, key: &str, value: &[u8]) {
         if let Ok(mut cache) = self.cache.lock() {
-            if !cache.values.contains_key(key) {
-                cache.order.push_back(key.to_owned());
+            if let Some(entry) = cache.values.get_mut(key) {
+                entry.value = value.to_vec();
+            } else {
+                cache.generation = cache.generation.wrapping_add(1);
+                let generation = cache.generation;
+                cache.order.push_back((key.to_owned(), generation));
+                cache.values.insert(
+                    key.to_owned(),
+                    CacheEntry {
+                        value: value.to_vec(),
+                        generation,
+                    },
+                );
             }
-            cache.values.insert(key.to_owned(), value.to_vec());
             cache.evict_to(self.max_entries);
+            cache.compact_order();
         }
     }
 
     fn forget(&self, key: &str, recursive: bool) {
         if let Ok(mut cache) = self.cache.lock() {
-            let prefix = format!("{}/", key.trim_end_matches('/'));
-            let keep = |candidate: &str| {
-                candidate != key && !(recursive && candidate.starts_with(&prefix))
-            };
-            cache.values.retain(|candidate, _| keep(candidate));
-            cache.order.retain(|candidate| keep(candidate));
+            cache.values.remove(key);
+            if recursive {
+                let prefix = format!("{}/", key.trim_end_matches('/'));
+                cache
+                    .values
+                    .retain(|candidate, _| !candidate.starts_with(&prefix));
+            }
+            cache.compact_order();
         }
     }
 }
@@ -123,7 +160,7 @@ impl Storage for LocalCache {
         if let Ok(cache) = self.cache.lock()
             && let Some(hit) = cache.values.get(key)
         {
-            return Ok(hit.clone());
+            return Ok(hit.value.clone());
         }
         let value = self.inner.load(key).await?;
         self.remember(key, &value);
@@ -180,6 +217,28 @@ impl Locker for LocalCache {
 mod tests {
     use super::*;
     use crate::storage::file::FileStorage;
+
+    #[test]
+    fn repeated_updates_bound_fifo_bookkeeping_and_preserve_write_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let local = LocalCache::new(FileStorage::new(directory.path())).with_max_entries(2);
+        local.remember("a", b"old");
+        local.remember("b", b"second");
+        for _ in 0..10_000 {
+            local.forget("a", false);
+            local.remember("a", b"updated");
+        }
+        {
+            let cache = local.cache.lock().unwrap();
+            assert_eq!(cache.values.len(), 2);
+            assert!(cache.order.len() <= 64);
+        }
+        local.remember("c", b"third");
+        let cache = local.cache.lock().unwrap();
+        assert!(cache.values.contains_key("a"));
+        assert!(!cache.values.contains_key("b"));
+        assert!(cache.values.contains_key("c"));
+    }
 
     #[derive(Debug)]
     struct PausedReadStorage {
