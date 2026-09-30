@@ -306,7 +306,9 @@ where
     F: Fn(HttpsRequest) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = HttpsResponse> + Send + 'static,
 {
-    let (https_listener, acceptor) = crate::listen_on(https_addr, domain_names).await?;
+    let (https_listener, mut acceptor) = crate::listen_on(https_addr, domain_names).await?;
+    // This wrapper parses HTTP/1.1 only; never negotiate h2 with a browser.
+    acceptor.use_http1();
     let http_listener = TcpListener::bind(http_addr).await.map_err(Error::from)?;
     // The HTTP side must not reflect an arbitrary Host header into a
     // Location response.  Reuse the certificate names as the default host
@@ -319,17 +321,12 @@ where
         }
     }
     let service = Arc::new(service);
-    let tls_task = tokio::spawn(serve_tls(
-        https_listener,
-        Arc::new(acceptor),
-        Arc::clone(&service),
-    ));
-    let http_task = tokio::spawn(serve_http(http_listener, redirect));
-    let result = tokio::select! {
-        result = tls_task => result.map_err(|e| Error::Internal(format!("HTTPS task: {e}")))?,
-        result = http_task => result.map_err(|e| Error::Internal(format!("HTTP task: {e}")))?,
-    };
-    result?;
+    // Keep ownership of both listeners in this future. Failure/cancellation
+    // drops its sibling instead of detaching a still-running serving task.
+    tokio::try_join!(
+        serve_tls(https_listener, Arc::new(acceptor), Arc::clone(&service)),
+        serve_http(http_listener, redirect),
+    )?;
     Ok(())
 }
 
@@ -415,6 +412,18 @@ async fn read_request<IO>(stream: &mut IO) -> Result<HttpsRequest>
 where
     IO: AsyncRead + Unpin,
 {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        read_request_inner(stream),
+    )
+    .await
+    .map_err(|_| Error::Internal("HTTP request timed out".into()))?
+}
+
+async fn read_request_inner<IO>(stream: &mut IO) -> Result<HttpsRequest>
+where
+    IO: AsyncRead + Unpin,
+{
     const MAX_HEADERS: usize = 64 * 1024;
     const MAX_BODY: usize = 1024 * 1024;
     let mut bytes = Vec::with_capacity(2048);
@@ -426,6 +435,9 @@ where
         }
         bytes.extend_from_slice(&chunk[..read]);
         if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            if end + 4 > MAX_HEADERS {
+                return Err(Error::Internal("HTTP headers exceed 64 KiB".into()));
+            }
             break end + 4;
         }
         if bytes.len() > MAX_HEADERS {
@@ -440,18 +452,47 @@ where
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_owned();
     let target = parts.next().unwrap_or_default().to_owned();
-    if method.is_empty() || target.is_empty() {
+    let version = parts.next().unwrap_or_default();
+    if !valid_header_name(&method)
+        || target.is_empty()
+        || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+        || parts.next().is_some()
+    {
         return Err(Error::Internal("HTTP request line malformed".into()));
     }
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
-        .collect();
-    let content_length = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.parse::<usize>().ok())
-        .unwrap_or(0);
+    let mut headers = Vec::new();
+    let mut content_length = None;
+    for line in lines.take_while(|line| !line.is_empty()) {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| Error::Internal("HTTP header malformed".into()))?;
+        if !valid_header_name(name) {
+            return Err(Error::Internal("HTTP header name malformed".into()));
+        }
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(Error::Internal(
+                "HTTP transfer encoding is not supported".into(),
+            ));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some()
+                || value.is_empty()
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(Error::Internal(
+                    "HTTP Content-Length malformed or duplicated".into(),
+                ));
+            }
+            content_length = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|_| Error::Internal("HTTP Content-Length overflow".into()))?,
+            );
+        }
+        headers.push((name.to_owned(), value.to_owned()));
+    }
+    let content_length = content_length.unwrap_or(0);
     if content_length > MAX_BODY {
         return Err(Error::Internal("HTTP body exceeds 1 MiB".into()));
     }
@@ -470,13 +511,29 @@ where
     })
 }
 
+fn valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+}
+
 async fn write_response<IO>(stream: &mut IO, mut response: HttpsResponse) -> Result<()>
 where
     IO: AsyncWrite + Unpin,
 {
-    response
+    response.headers.retain(|(name, _)| {
+        !["content-length", "transfer-encoding", "connection"]
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    });
+    if response
         .headers
-        .retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
+        .iter()
+        .any(|(name, value)| !valid_header_name(name) || value.contains(['\r', '\n']))
+    {
+        return Err(Error::Internal("HTTP response header malformed".into()));
+    }
     let reason = match response.status {
         200 => "OK",
         301 => "Moved Permanently",
@@ -511,6 +568,57 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn review_http_rejects_ambiguous_body_framing() {
+        for headers in [
+            "Content-Length: invalid\r\n",
+            "Content-Length: +2\r\n",
+            "Content-Length: 1\r\nContent-Length: 2\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "Content-Length : 2\r\n",
+            "malformed-header\r\n",
+        ] {
+            let request = format!("POST / HTTP/1.1\r\nHost: example.com\r\n{headers}\r\nab");
+            assert!(
+                read_request(&mut request.as_bytes()).await.is_err(),
+                "{headers:?}"
+            );
+        }
+        let mut request = b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nab".as_slice();
+        assert_eq!(read_request(&mut request).await.unwrap().body, b"ab");
+    }
+
+    #[tokio::test]
+    async fn review_http_header_limit_applies_when_terminator_arrives() {
+        let request = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(65536));
+        assert!(read_request(&mut request.as_bytes()).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn review_http_incomplete_request_has_a_deadline() {
+        let (_peer, mut stream) = tokio::io::duplex(64);
+        let start = tokio::time::Instant::now();
+        assert!(
+            read_request(&mut stream)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("timed out")
+        );
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn review_http_response_rejects_header_injection() {
+        let mut response = HttpsResponse::new(200, "text/plain", Vec::new());
+        response
+            .headers
+            .push(("x-test".into(), "value\r\ninjected: header".into()));
+        let mut output = Vec::new();
+        assert!(write_response(&mut output, response).await.is_err());
+        assert!(output.is_empty());
+    }
 
     #[test]
     fn redirect_policy_enforces_allowed_hosts() {

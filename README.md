@@ -152,7 +152,9 @@ For a one-shot setup, `certmagic::manage(&domains).await` returns a ready
 `ConfigBuilder::new().policy(Policy::default()).storage(storage).build()`.
 
 For a framework-neutral HTTP/1.1 wrapper with HTTP-01 handling and HTTPS
-redirects, use `certmagic::https` or `certmagic::https_on`.
+redirects, use `certmagic::https` or `certmagic::https_on`. These helpers advertise
+HTTP/1.1 only, accept Content-Length bodies up to 1 MiB, reject transfer
+encodings such as chunked, and apply a 30-second request-read deadline.
 
 More in [`examples/`](examples/): [`basic_https`](examples/basic_https.rs),
 [`on_demand`](examples/on_demand.rs) (handshake-time issuance),

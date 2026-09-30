@@ -520,6 +520,10 @@ impl std::fmt::Debug for CertmagicAcceptor {
 }
 
 impl CertmagicAcceptor {
+    pub(crate) fn use_http1(&mut self) {
+        Arc::make_mut(&mut self.base).alpn_protocols = vec![b"http/1.1".to_vec()];
+    }
+
     /// Resolve the certificate for `hello` through the async path and return
     /// a per-connection [`rustls::ServerConfig`].
     async fn config_for(
@@ -677,7 +681,9 @@ mod review_tests {
         use crate::solvers::Solver;
         let cache = crate::Cache::new_without_maintenance(Default::default()).unwrap();
         let config = crate::Config::new(cache, Default::default()).unwrap();
-        let acceptor = config.certmagic_acceptor().unwrap();
+        let mut acceptor = config.certmagic_acceptor().unwrap();
+        acceptor.use_http1();
+        assert_eq!(acceptor.base.alpn_protocols, vec![b"http/1.1".to_vec()]);
         let solver = crate::solvers::tls_alpn::TlsAlpnSolver::default();
         let challenge = crate::solvers::SolvableChallenge {
             kind: "tls-alpn-01".into(),

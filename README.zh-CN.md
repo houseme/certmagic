@@ -152,6 +152,9 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 | `aws-lc-rs`         | ✔   | AWS-LC 加密后端与 `x509-parser/verify-aws`（含 P-521 CSR 签名） |
 | `integration-tests` |      | Pebble 端到端测试                         |
 
+`https` / `https_on` 包装器仅协商 HTTP/1.1，接收不超过 1 MiB 的 Content-Length
+请求体，拒绝 chunked 等传输编码，并对请求读取设置 30 秒总超时。
+
 ## 文件存储协调
 
 FileStorage 使用永久保留的 `locks/*.guard` 文件和唯一持有者标识，串行化锁创建、

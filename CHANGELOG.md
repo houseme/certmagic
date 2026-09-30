@@ -12,6 +12,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   together and a filesystem supporting OS file locks. Keep locks/*.guard
   sidecars while instances run; see the README for lease/fencing and
   cross-file crash-atomicity limitations.
+- The HTTP/1.1 convenience wrapper accepts Content-Length bodies up to 1 MiB
+  with a 30-second request-read deadline; transfer encodings such as chunked
+  are explicitly rejected.
 
 ### Fixed
 
@@ -47,6 +50,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Propagate OCSP staples into rustls, including updates/removal, verify persisted
   responses, and retain their original freshness timestamps.
 - Encode the Must-Staple CSR extension as the required DER sequence.
+- Reject ambiguous HTTP body framing, oversized headers and response-header
+  injection; bound request reads and reject unsupported transfer encodings.
+- Advertise only HTTP/1.1 in the convenience wrapper and drop both listeners
+  when its serving future fails or is cancelled.
 
 ### Security
 
