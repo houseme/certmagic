@@ -8,6 +8,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Update resolved Quinn dependencies to `quinn-proto 0.11.19` and
+  `quinn-udp 0.5.16` after refreshing the dependency lockfile.
 - Update the transitive `yoke-derive` dependency to 0.8.4.
 - FileStorage's lock protocol requires all cooperating instances to upgrade
   together and a filesystem supporting OS file locks. Keep locks/*.guard
