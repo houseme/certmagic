@@ -169,6 +169,9 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 `is_valid()` 仅反映本地租约健康，不是 fencing。自动清理按获取实例追踪，同名或不同后端的
 锁不会因旧句柄释放而被取消追踪。
 
+手动调用 `track_lock(storage, name)` 后，所有权结束时必须配对调用 `untrack_lock(name)`。
+句柄只移除自己的自动登记，不再按名称移除手动登记；新适配器优先使用自动追踪的获取函数。
+
 证书与私钥还可通过 `ConfigBuilder::cert_store` 单独接入 `CertStore`；账号、挑战记录、
 锁和 OCSP 仍走 `Storage`。数据库事务或带版本的完整证书资源对象，可以提供比通用三键
 适配器更强的原子性。通用适配器现已并发读取三项内容及存在性，但这不是后端事务快照。

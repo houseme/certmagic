@@ -23,6 +23,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Consolidate certificate entries and their SAN index under one read/write state
   lock; sample managed eviction candidates without cloning every cached hash.
+- Isolate lock lifecycle code and unify its shutdown registry. Untracked guards
+  no longer allocate registry IDs or acquire the process-wide registry on Drop.
+- Require manual `track_lock` registrations to be explicitly paired with
+  `untrack_lock`; unrelated guard drops no longer remove them by name.
 - Update resolved Quinn dependencies to `quinn-proto 0.11.19` and
   `quinn-udp 0.5.16` after refreshing the dependency lockfile.
 - Update the transitive `yoke-derive` dependency to 0.8.4.
@@ -47,6 +51,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Use stored SANs when removing or replacing certificates, preventing stale
   caller snapshots from leaving index entries that hide later certificates.
+- Serialize acknowledged release waiters while retaining cancellation fallback
+  and allowing another waiter to retry a cancelled acknowledgement.
 - Distinguish queued background release requests from acknowledged completion,
   so explicit release waiters cannot report success before the backend confirms.
 - Track automatic lock ownership by acquisition identity and callback, preventing

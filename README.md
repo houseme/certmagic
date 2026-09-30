@@ -202,6 +202,11 @@ best-effort fallback. `guard.is_valid()` reports advisory local lease health,
 not write-side fencing. Automatic cleanup tracks acquisitions independently,
 including identical names on separate backends.
 
+Manual `track_lock(storage, name)` registrations must be paired with
+`untrack_lock(name)` when ownership ends. A guard only unregisters its own
+automatic registration; dropping an unrelated same-name guard no longer removes
+manual ownership. Prefer the automatic acquisition helpers for new adapters.
+
 Certificate/private-key resources can use an independent `CertStore` through
 `ConfigBuilder::cert_store`; accounts, challenge publications, locks and OCSP
 remain on `Storage`. A transactional database or a versioned object bundle can

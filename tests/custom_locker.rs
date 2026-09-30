@@ -152,4 +152,19 @@ async fn manual_untracking_does_not_release_a_scoped_acquisition() {
     assert_eq!(backend.releases.load(Ordering::SeqCst), 0);
     guard.release_and_wait().await.unwrap();
     assert_eq!(backend.releases.load(Ordering::SeqCst), 1);
+    let storage: Arc<dyn certmagic::Storage> = backend.clone();
+    certmagic::track_lock(&storage, "manual-owner");
+    let other = LockGuard::new(
+        "manual-owner",
+        Box::new(AsyncReleaseProbe {
+            sync_calls: Arc::new(AtomicUsize::new(0)),
+            async_calls: Arc::new(AtomicUsize::new(0)),
+            acknowledgement: Arc::new(Semaphore::new(0)),
+        }),
+    );
+    drop(other);
+    assert!(
+        certmagic::untrack_lock("manual-owner"),
+        "foreign guard must not untrack a manual owner"
+    );
 }
