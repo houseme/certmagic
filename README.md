@@ -69,8 +69,8 @@ certmagic = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
-The default build uses the AWS-LC-RS crypto provider and also enables RSA key
-generation plus the ZeroSSL issuers. For a smaller, portable build using the
+The default build uses the AWS-LC-RS crypto provider and enables the ZeroSSL
+issuers. RSA key generation requires the optional `rsa` feature. For a smaller, portable build using the
 Ring provider, disable default features and select the required capabilities
 explicitly:
 
@@ -203,7 +203,7 @@ Certificate resources still use separate certificate/key/metadata writes;
 
 ```sh
 cargo test                          # unit tests (offline)
-cargo test --lib --all-features     # everything, all feature combinations
+cargo test --lib --all-features     # all features enabled together
 
 # Real ACME end-to-end against Pebble (Let's Encrypt's reference server):
 ./tests/run-pebble.sh               # DNS-01 by default

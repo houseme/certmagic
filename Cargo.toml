@@ -57,8 +57,8 @@ tokio = { version = "1.53.1", features = ["test-util"] }
 
 [features]
 # Production-oriented default: AWS-LC-RS is the rustls/reqwest/rcgen
-# provider, with RSA key generation and ZeroSSL support
-# available without additional feature flags. The `ring` feature below remains
+# provider, with ZeroSSL support. RSA key generation is opt-in.
+# The `ring` feature below remains
 # available for portable builds (use it with `--no-default-features`).
 default = [
     "aws-lc-rs",

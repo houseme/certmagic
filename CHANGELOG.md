@@ -15,6 +15,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - The HTTP/1.1 convenience wrapper accepts Content-Length bodies up to 1 MiB
   with a 30-second request-read deadline; transfer encodings such as chunked
   are explicitly rejected.
+- Clarify that RSA generation is opt-in and all-features tests enable all
+  features together rather than covering every feature combination.
 
 ### Fixed
 
