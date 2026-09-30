@@ -91,9 +91,13 @@ impl KeyValueCertStore {
 impl CertStore for KeyValueCertStore {
     async fn load(&self, issuer_key: &str, domain: &str) -> Result<Option<CertificateResource>> {
         let (certificate_key, private_key_key, metadata_key) = self.paths(issuer_key, domain);
-        let certificate = self.optional_load(&certificate_key).await?;
-        let private_key = self.optional_load(&private_key_key).await?;
-        let metadata = self.optional_load(&metadata_key).await?;
+        // The three independent reads can share a network round-trip window.
+        // This remains a logical resource read, not a backend snapshot transaction.
+        let (certificate, private_key, metadata) = tokio::try_join!(
+            self.optional_load(&certificate_key),
+            self.optional_load(&private_key_key),
+            self.optional_load(&metadata_key),
+        )?;
         match (certificate, private_key, metadata) {
             (None, None, None) => Ok(None),
             (Some(certificate_pem), Some(private_key_pem), Some(metadata)) => {
@@ -134,14 +138,12 @@ impl CertStore for KeyValueCertStore {
 
     async fn has(&self, issuer_key: &str, domain: &str) -> Result<bool> {
         let (certificate_key, private_key_key, metadata_key) = self.paths(issuer_key, domain);
-        let keys = [certificate_key, private_key_key, metadata_key];
-        let present = keys.iter().map(|key| self.storage.exists(key));
-        let mut count = 0;
-        for result in present {
-            if result.await? {
-                count += 1;
-            }
-        }
+        let (certificate, private_key, metadata) = tokio::try_join!(
+            self.storage.exists(&certificate_key),
+            self.storage.exists(&private_key_key),
+            self.storage.exists(&metadata_key),
+        )?;
+        let count = usize::from(certificate) + usize::from(private_key) + usize::from(metadata);
         match count {
             0 => Ok(false),
             3 => Ok(true),
@@ -211,5 +213,123 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod parallel_read_tests {
+    use super::*;
+    use crate::storage::{KeyInfo, LockGuard, Locker};
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    #[derive(Debug)]
+    struct DelayedStorage(HashMap<String, Vec<u8>>);
+
+    #[async_trait]
+    impl Locker for DelayedStorage {
+        async fn lock(&self, _: &CancellationToken, _: &str) -> Result<LockGuard> {
+            Err(Error::Internal("unused test lock".into()))
+        }
+        async fn unlock(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Storage for DelayedStorage {
+        async fn load(&self, key: &str) -> Result<Vec<u8>> {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            self.0
+                .get(key)
+                .cloned()
+                .ok_or_else(|| Error::Storage(StorageError::NotFound(key.into())))
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(self.0.contains_key(key))
+        }
+        async fn store(&self, _: &str, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn list(&self, _: &str, _: bool) -> Result<Vec<String>> {
+            unreachable!()
+        }
+        async fn stat(&self, _: &str) -> Result<KeyInfo> {
+            unreachable!()
+        }
+    }
+
+    fn backend(present: usize) -> KeyValueCertStore {
+        let resource = CertificateResource {
+            sans: vec!["example.com".into()],
+            ..Default::default()
+        };
+        let values = [
+            (
+                STORAGE_KEYS.site_cert("issuer", "example.com"),
+                b"certificate".to_vec(),
+            ),
+            (
+                STORAGE_KEYS.site_private_key("issuer", "example.com"),
+                b"private-key".to_vec(),
+            ),
+            (
+                STORAGE_KEYS.site_meta("issuer", "example.com"),
+                serde_json::to_vec(&resource).unwrap(),
+            ),
+        ]
+        .into_iter()
+        .take(present)
+        .collect();
+        KeyValueCertStore::new(Arc::new(DelayedStorage(values)))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn independent_reads_share_one_latency_window() {
+        let store = backend(3);
+        let start = tokio::time::Instant::now();
+        let resource = store.load("issuer", "example.com").await.unwrap().unwrap();
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert_eq!(resource.private_key_pem, b"private-key");
+        let start = tokio::time::Instant::now();
+        assert!(store.has("issuer", "example.com").await.unwrap());
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parallel_reads_preserve_missing_and_incomplete_resource_errors() {
+        let missing = backend(0);
+        assert!(
+            missing
+                .load("issuer", "example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!missing.has("issuer", "example.com").await.unwrap());
+        for present in [1, 2] {
+            let incomplete = backend(present);
+            assert!(
+                incomplete
+                    .load("issuer", "example.com")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("incomplete")
+            );
+            assert!(
+                incomplete
+                    .has("issuer", "example.com")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("incomplete")
+            );
+        }
     }
 }
