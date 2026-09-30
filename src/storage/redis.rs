@@ -8,10 +8,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::sync::{
-    Arc, Mutex, Weak,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use ::redis::aio::{ConnectionManager, ConnectionManagerConfig};
@@ -340,68 +337,90 @@ impl Storage for RedisStorage {
     }
 }
 
+/// Ownership has one source of truth. Pending/uncertain commands require
+/// token-checked cleanup; only Held can be renewed, and Released is terminal.
+#[derive(Clone, Copy)]
+enum LeaseState {
+    Pending,
+    Held { deadline: Instant },
+    Uncertain,
+    Released,
+}
+
 struct Lease {
-    inner: Weak<Inner>,
-    connection: ConnectionManager,
+    // Inner only holds Weak<Lease>, so sharing connection/options has no cycle.
+    inner: Arc<Inner>,
     name: String,
     key: String,
     token: String,
-    options: RedisStorageOptions,
     stop: CancellationToken,
-    valid: AtomicBool,
-    cleanup_needed: AtomicBool,
-    deadline: Mutex<Instant>,
+    state: Mutex<LeaseState>,
+    operation: tokio::sync::Mutex<()>,
 }
 
 impl Lease {
-    fn valid(&self) -> bool {
-        self.valid.load(Ordering::Acquire)
-            && !self.stop.is_cancelled()
-            && self
-                .deadline
-                .lock()
-                .is_ok_and(|deadline| Instant::now() < *deadline)
+    fn state(&self) -> std::sync::MutexGuard<'_, LeaseState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn forget(self: &Arc<Self>) {
-        if let Some(inner) = self.inner.upgrade()
-            && let Ok(mut leases) = inner.leases.lock()
-            && leases
-                .get(&self.name)
-                .is_some_and(|old| Weak::ptr_eq(old, &Arc::downgrade(self)))
+    fn valid(&self) -> bool {
+        matches!(*self.state(), LeaseState::Held { deadline } if Instant::now() < deadline)
+    }
+
+    fn forget(&self) {
+        let mut leases = self
+            .inner
+            .leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if leases
+            .get(&self.name)
+            .is_some_and(|old| std::ptr::eq(old.as_ptr(), self))
         {
             leases.remove(&self.name);
         }
     }
 
-    async fn release(self: &Arc<Self>) -> Result<()> {
+    fn stop_ownership(&self) {
+        let mut state = self.state();
+        if !matches!(*state, LeaseState::Released) {
+            *state = LeaseState::Uncertain;
+        }
+        drop(state);
         self.stop.cancel();
-        self.valid.store(false, Ordering::Release);
-        if !self.cleanup_needed.load(Ordering::Acquire) {
-            self.forget();
+    }
+
+    async fn release(&self) -> Result<()> {
+        self.stop_ownership();
+        // Serializes unlock(), explicit guard release and Drop cleanup, as
+        // well as renewals. A cancelled operation never marks acknowledgement.
+        let _operation = self.operation.lock().await;
+        if matches!(*self.state(), LeaseState::Released) {
             return Ok(());
         }
         let mut command = script(RELEASE, &self.key);
         command.arg(&self.token);
         let result = query::<i64>(
-            &self.connection,
-            self.options.operation_timeout,
+            &self.inner.connection,
+            self.inner.options.operation_timeout,
             command,
             "release lock",
         )
         .await;
         if result.is_ok() {
-            self.cleanup_needed.store(false, Ordering::Release);
+            *self.state() = LeaseState::Released;
+            self.forget();
         }
-        self.forget();
+        // On error retain local registration so unlock() can retry while the
+        // guard remains alive. Expiry still recovers a lost runtime/process.
         result.map(|_| ())
     }
 
     fn request_release(self: &Arc<Self>) {
-        self.stop.cancel();
-        self.valid.store(false, Ordering::Release);
-        self.forget();
-        if !self.cleanup_needed.load(Ordering::Acquire) {
+        self.stop_ownership();
+        if matches!(*self.state(), LeaseState::Released) {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -414,15 +433,17 @@ impl Lease {
         }
     }
 
-    async fn renew(self: &Arc<Self>, duration: Duration) -> Result<()> {
+    async fn renew(&self, duration: Duration) -> Result<()> {
+        let _operation = self.operation.lock().await;
         if !self.valid() {
             return Err(Error::Storage(StorageError::StaleLock(self.name.clone())));
         }
         let ttl = millis(duration)
             .filter(|_| {
-                self.options
+                self.inner
+                    .options
                     .heartbeat_interval
-                    .checked_add(self.options.operation_timeout)
+                    .checked_add(self.inner.options.operation_timeout)
                     .is_some_and(|budget| budget < duration)
             })
             .ok_or_else(|| {
@@ -435,36 +456,49 @@ impl Lease {
         let mut command = script(RENEW, &self.key);
         command.arg(&self.token).arg(ttl);
         let result = query::<u64>(
-            &self.connection,
-            self.options.operation_timeout,
+            &self.inner.connection,
+            self.inner.options.operation_timeout,
             command,
             "renew lock",
         )
         .await;
         match result {
             Ok(remaining) if remaining > 0 => {
-                let deadline = start
-                    .checked_add(Duration::from_millis(remaining))
-                    .ok_or_else(|| storage_error("Redis lease deadline overflow"))?;
-                *self
-                    .deadline
-                    .lock()
-                    .map_err(|_| storage_error("Redis lease state poisoned"))? = deadline;
-                Ok(())
+                let mut state = self.state();
+                let renewed = start.checked_add(Duration::from_millis(remaining));
+                if let LeaseState::Held { deadline } = &mut *state
+                    && Instant::now() < *deadline
+                    && let Some(renewed) = renewed
+                {
+                    *deadline = (*deadline).max(renewed);
+                    return Ok(());
+                }
+                // A late reply cannot resurrect an expired/released holder.
+                drop(state);
+                self.stop_ownership();
+                Err(Error::Storage(StorageError::StaleLock(self.name.clone())))
             }
             outcome => {
-                self.valid.store(false, Ordering::Release);
-                self.stop.cancel();
                 if matches!(outcome, Ok(0)) {
-                    self.cleanup_needed.store(false, Ordering::Release);
+                    *self.state() = LeaseState::Released;
+                    self.stop.cancel();
+                    self.forget();
+                } else {
+                    self.stop_ownership();
                 }
-                self.forget();
                 match outcome {
                     Err(error) => Err(error),
                     _ => Err(Error::Storage(StorageError::StaleLock(self.name.clone()))),
                 }
             }
         }
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        self.forget();
     }
 }
 
@@ -484,7 +518,7 @@ impl LockRelease for RedisRelease {
 fn heartbeat(lease: &Arc<Lease>) {
     let weak = Arc::downgrade(lease);
     let stop = lease.stop.clone();
-    let interval = lease.options.heartbeat_interval;
+    let interval = lease.inner.options.heartbeat_interval;
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -493,7 +527,7 @@ fn heartbeat(lease: &Arc<Lease>) {
                 () = tokio::time::sleep(interval) => {},
             }
             let Some(lease) = weak.upgrade() else { return };
-            if let Err(error) = lease.renew(lease.options.lease_duration).await {
+            if let Err(error) = lease.renew(lease.inner.options.lease_duration).await {
                 tracing::warn!(%error, "Redis lock lease renewal failed");
                 return;
             }
@@ -525,16 +559,13 @@ impl Locker for RedisStorage {
         }
         let start = Instant::now();
         let lease = Arc::new(Lease {
-            inner: Arc::downgrade(&self.inner),
-            connection: self.inner.connection.clone(),
+            inner: Arc::clone(&self.inner),
             name: name.into(),
             key: format!("{}{}", self.inner.lock_prefix, hex::encode(name.as_bytes())),
             token: format!("{:032x}", rand::rng().random::<u128>()),
-            options: self.inner.options.clone(),
             stop: CancellationToken::new(),
-            valid: AtomicBool::new(false),
-            cleanup_needed: AtomicBool::new(true),
-            deadline: Mutex::new(start + self.inner.options.lease_duration),
+            state: Mutex::new(LeaseState::Pending),
+            operation: tokio::sync::Mutex::new(()),
         });
         // Own cleanup before awaiting SET: cancellation or a lost reply can
         // leave a server-side acquisition. No heartbeat starts until confirmed.
@@ -545,25 +576,21 @@ impl Locker for RedisStorage {
             .arg(&lease.token)
             .arg("NX")
             .arg("PX")
-            .arg(millis(lease.options.lease_duration).expect("validated lease"));
+            .arg(millis(lease.inner.options.lease_duration).expect("validated lease"));
         let result: Option<String> = tokio::select! {
             biased;
             () = ct.cancelled() => return Err(storage_error("Redis lock acquisition cancelled")),
             result = self.query(command, "acquire lock") => result?,
         };
         if result.is_none() {
-            lease.cleanup_needed.store(false, Ordering::Release);
+            *lease.state() = LeaseState::Released;
             return Ok(None);
         }
-        if Instant::now()
-            >= *lease
-                .deadline
-                .lock()
-                .map_err(|_| storage_error("Redis lease state poisoned"))?
-        {
+        let deadline = start + self.inner.options.lease_duration;
+        if Instant::now() >= deadline {
             return Err(Error::Storage(StorageError::StaleLock(name.into())));
         }
-        lease.valid.store(true, Ordering::Release);
+        *lease.state() = LeaseState::Held { deadline };
         self.inner
             .leases
             .lock()

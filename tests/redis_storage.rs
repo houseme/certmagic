@@ -671,6 +671,45 @@ async fn issuance_and_renewal_do_not_publish_after_detected_lease_loss() {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires local redis-server; starts an isolated instance"]
+async fn pending_renewal_cannot_restore_ownership_after_release_starts() {
+    let server = Server::start().await;
+    let mut config = options("release-renew");
+    config.lease_duration = Duration::from_secs(3);
+    config.heartbeat_interval = Duration::from_millis(800);
+    config.operation_timeout = Duration::from_secs(1);
+    let storage = RedisStorage::connect(&server.url(), config).await.unwrap();
+    let ct = CancellationToken::new();
+    let guard = storage.lock(&ct, "name").await.unwrap();
+    let mut raw = server.raw().await;
+    redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(200)
+        .arg("ALL")
+        .query_async::<()>(&mut raw)
+        .await
+        .unwrap();
+    let mut renewal = Box::pin(storage.renew_lock_lease("name", Duration::from_secs(4)));
+    assert!(futures::poll!(&mut renewal).is_pending());
+    let mut release = Box::pin(storage.unlock("name"));
+    assert!(futures::poll!(&mut release).is_pending());
+    assert!(!guard.is_valid());
+    let (renewed, released) = tokio::join!(renewal, release);
+    assert!(matches!(
+        renewed,
+        Err(certmagic::Error::Storage(
+            certmagic::error::StorageError::StaleLock(_)
+        ))
+    ));
+    released.unwrap();
+    let next = storage.try_lock(&ct, "name").await.unwrap().unwrap();
+    guard.release_and_wait().await.unwrap();
+    assert!(next.is_valid());
+    assert!(storage.try_lock(&ct, "name").await.unwrap().is_none());
+    next.release_and_wait().await.unwrap();
+}
+
 #[cfg(feature = "local-cache")]
 #[tokio::test]
 #[ignore = "requires local redis-server; starts an isolated instance"]
@@ -682,4 +721,58 @@ async fn redis_cache_uses_the_same_identity_for_path_aliases() {
     assert_eq!(local.load("/dir/key").await.unwrap(), b"new");
     local.delete("dir/./").await.unwrap();
     assert!(local.load("dir/key").await.is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires local redis-server; starts an isolated instance"]
+async fn failed_release_keeps_ownership_available_for_explicit_retry() {
+    let server = Server::start().await;
+    let mut config = options("retry-release");
+    config.lease_duration = Duration::from_secs(5);
+    config.heartbeat_interval = Duration::from_secs(2);
+    let storage = RedisStorage::connect(&server.url(), config).await.unwrap();
+    let ct = CancellationToken::new();
+    let guard = storage.lock(&ct, "name").await.unwrap();
+    let mut raw = server.raw().await;
+    let key = lock_key("retry-release", "name");
+    let token: String = redis::cmd("GET")
+        .arg(&key)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    // A malformed lock record makes Lua GET fail without deleting ownership.
+    redis::cmd("DEL")
+        .arg(&key)
+        .query_async::<()>(&mut raw)
+        .await
+        .unwrap();
+    redis::cmd("HSET")
+        .arg(&key)
+        .arg("fault")
+        .arg("injected")
+        .query_async::<()>(&mut raw)
+        .await
+        .unwrap();
+    assert!(storage.unlock("name").await.is_err());
+    assert!(!guard.is_valid());
+    // Repair the owned test record, then retry through the public name API.
+    redis::cmd("SET")
+        .arg(&key)
+        .arg(token)
+        .arg("PX")
+        .arg(5000)
+        .query_async::<()>(&mut raw)
+        .await
+        .unwrap();
+    storage.unlock("name").await.unwrap();
+    let remaining: bool = redis::cmd("EXISTS")
+        .arg(&key)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        !remaining,
+        "failed release must not discard its retry registration"
+    );
+    guard.release_and_wait().await.unwrap();
 }

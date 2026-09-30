@@ -31,6 +31,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `untrack_lock`; unrelated guard drops no longer remove them by name.
 - Replace LocalCache's global I/O serialization with reusable per-key gates,
   coalesced cache fills and a prefix-delete barrier; cache hits bypass slow I/O.
+- Share Redis backend configuration/connection ownership across leases and model
+  pending, held, uncertain and released ownership as mutually exclusive states.
 - Update resolved Quinn dependencies to `quinn-proto 0.11.19` and
   `quinn-udp 0.5.16` after refreshing the dependency lockfile.
 - Update the transitive `yoke-derive` dependency to 0.8.4.
@@ -59,6 +61,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   and allowing another waiter to retry a cancelled acknowledgement.
 - Keep FileStorage/Redis path aliases coherent through LocalCache updates and
   prefix deletion, using one shared path validation and normalization policy.
+- Serialize Redis renewal and release operations; late renewal responses cannot
+  restore expired or releasing ownership. Retain failed releases for explicit
+  retry while their acquisition remains alive.
 - Distinguish queued background release requests from acknowledged completion,
   so explicit release waiters cannot report success before the backend confirms.
 - Track automatic lock ownership by acquisition identity and callback, preventing
