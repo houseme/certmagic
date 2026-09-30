@@ -10,6 +10,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Expose `LockGuard::new` for external storage/locking backends, including builds
   without file-storage; document token-safe release and network lease recovery.
+- Add a dependency-free release benchmark for certificate lookup, local-cache
+  updates and simulated remote certificate-resource reads.
 
 ### Changed
 

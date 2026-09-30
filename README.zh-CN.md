@@ -155,6 +155,32 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 `https` / `https_on` 包装器仅协商 HTTP/1.1，接收不超过 1 MiB 的 Content-Length
 请求体，拒绝 chunked 等传输编码，并对请求读取设置 30 秒总超时。
 
+## 存储后端选择
+
+当前内置持久化后端为 FileStorage；LocalCache 是节点本地读缓存，不是分布式权威存储。
+Redis、SQL、etcd 和对象存储客户端目前均未内置。
+
+自定义后端实现 `Storage` 和 `Locker`，通过 `ConfigBuilder::storage` 注入。
+`LockGuard::new` 已开放，未启用 `file-storage` 时也能创建后端自有的锁句柄。
+释放回调必须保留本次获取的所有者 token，并避免阻塞异步执行器；网络后端可排队执行
+校验 token 后的释放，并通过带过期时间的租约处理运行时退出后的恢复。
+
+证书与私钥还可通过 `ConfigBuilder::cert_store` 单独接入 `CertStore`；账号、挑战记录、
+锁和 OCSP 仍走 `Storage`。数据库事务或带版本的完整证书资源对象，可以提供比通用三键
+适配器更强的原子性。通用适配器现已并发读取三项内容及存在性，但这不是后端事务快照。
+
+**建议保留默认文件后端，将 Redis 作为可选适配器。** 单机握手缓存命中不需要 Redis；
+多实例且已有 Redis 基础设施时，再实现命名空间、所有者校验、续租、持久化和故障恢复契约。
+Redis 异步复制后的故障切换不能自动保证锁互斥，持久化策略也需要明确，参见
+[Redis 锁文档](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
+与[持久化文档](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)。
+对事务或一致性有更高要求时，可评估
+[PostgreSQL 锁/事务](https://www.postgresql.org/docs/current/explicit-locking.html)
+或 [etcd 事务/租约](https://etcd.io/docs/v3.6/learning/api/)；仍需后端适配和写入侧的
+所有权检查，不能仅更换服务就宣称具备 fencing。
+
+性能基准、原始样本及适用范围见 [benches/README.md](benches/README.md)。
+
 ## 文件存储协调
 
 FileStorage 使用永久保留的 `locks/*.guard` 文件和唯一持有者标识，串行化锁创建、

@@ -185,6 +185,38 @@ Three paths, pick per deployment:
 | `aws-lc-rs`         | ✔      | AWS-LC crypto provider and `x509-parser/verify-aws` (including P-521 CSR signing) |
 | `integration-tests` |         | Pebble end-to-end tests                                  |
 
+## Choosing a storage backend
+
+FileStorage remains the built-in durable backend. LocalCache is a node-local
+read-through decorator, not a distributed source of truth. Redis, SQL, etcd and
+object-store clients are not bundled with this crate.
+
+Custom backends implement `Storage` and `Locker`, then are supplied through
+`ConfigBuilder::storage`. `LockGuard::new` accepts a backend-owned release
+callback even without the `file-storage` feature. The callback must retain the
+acquisition token and must not release another holder's lease. Network adapters
+should enqueue nonblocking cleanup and use expiring leases for runtime failure.
+
+Certificate/private-key resources can use an independent `CertStore` through
+`ConfigBuilder::cert_store`; accounts, challenge publications, locks and OCSP
+remain on `Storage`. A transactional database or a versioned object bundle can
+therefore provide stronger resource atomicity than the generic three-key adapter.
+The generic adapter overlaps its three independent reads/existence checks; this
+does not turn them into an atomic backend snapshot.
+
+Redis is an optional choice for deployments already operating Redis, not a
+prerequisite for faster TLS cache hits. An adapter needs namespace isolation,
+owner-checked lease renewal/release, durable account/key handling and explicit
+failover assumptions. See [Redis locking](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
+and [persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
+For transactional storage, [PostgreSQL locks](https://www.postgresql.org/docs/current/explicit-locking.html)
+or [etcd transactions and leases](https://etcd.io/docs/v3.6/learning/api/)
+are other building blocks. These capabilities still need a backend adapter;
+selecting a service alone does not provide fencing for this library's writes.
+
+Reproducible local performance measurements and their limits are documented in
+[benches/README.md](benches/README.md).
+
 ## File storage coordination
 
 FileStorage serializes lock creation, heartbeats, release, and stale takeover

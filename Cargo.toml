@@ -114,3 +114,8 @@ missing_debug_implementations = "warn"
 [lints.clippy]
 all = "warn"
 dbg_macro = "warn"
+
+[[bench]]
+name = "cache_paths"
+harness = false
+required-features = ["local-cache"]
