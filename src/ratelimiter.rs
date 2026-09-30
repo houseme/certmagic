@@ -72,6 +72,12 @@ impl RingBufferRateLimiter {
     /// Wait until an event can be recorded, or `ct` is cancelled.
     pub async fn wait(&self, ct: &CancellationToken) -> Result<()> {
         loop {
+            let stopped = self.stop_notify.notified();
+            tokio::pin!(stopped);
+            stopped.as_mut().enable();
+            if ct.is_cancelled() {
+                return Err(Error::Internal("context canceled".into()));
+            }
             if self.stopped.load(Ordering::Acquire) {
                 return Err(Error::Internal("rate limiter stopped".into()));
             }
@@ -98,7 +104,7 @@ impl RingBufferRateLimiter {
             };
             tokio::select! {
                 () = ct.cancelled() => return Err(Error::Internal("context canceled".into())),
-                () = self.stop_notify.notified() => return Err(Error::Internal("rate limiter stopped".into())),
+                () = stopped => return Err(Error::Internal("rate limiter stopped".into())),
                 () = tokio::time::sleep(sleep) => {}
             }
         }
@@ -159,6 +165,15 @@ mod tests {
 
     // The limiter measures real `std::time::Instant`s, so these tests use real
     // sleeps with short windows rather than tokio's paused virtual time.
+
+    #[tokio::test]
+    async fn review_cancelled_wait_does_not_consume_capacity() {
+        let limiter = RingBufferRateLimiter::new(1, Duration::from_secs(60));
+        let ct = CancellationToken::new();
+        ct.cancel();
+        assert!(limiter.wait(&ct).await.is_err());
+        assert!(limiter.allow());
+    }
 
     #[tokio::test]
     async fn allows_up_to_max_then_blocks() {

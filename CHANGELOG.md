@@ -6,6 +6,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Fixed
+
+- Release single-flight waiters when leaders are cancelled or panic, and allow
+  waiting callers to retry without leaking registry entries.
+- Respect cancellation before rate-limit admission and prevent missed shutdown
+  notifications.
+
 ### Security
 
 - Redact ACME private keys, EAB HMAC secrets, certificate private keys, issuer
