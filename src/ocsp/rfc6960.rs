@@ -485,6 +485,95 @@ mod tests {
         (der, key.serialize_der().to_vec())
     }
 
+    #[cfg(feature = "file-storage")]
+    #[tokio::test]
+    async fn review_stored_staples_require_valid_signature_and_original_freshness() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Debug)]
+        struct UnavailableTransport(AtomicUsize);
+        #[async_trait::async_trait]
+        impl crate::acme::transport::Transport for UnavailableTransport {
+            async fn execute(
+                &self,
+                _: crate::acme::transport::HttpRequest,
+            ) -> Result<crate::acme::transport::HttpResponse> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(Error::Ocsp(OcspError::Fetch("offline test".into())))
+            }
+        }
+        let (issuer, key) = issuer_fixture();
+        let pem = crate::pem::encode("CERTIFICATE", &issuer);
+        let key_pem = crate::pem::encode("PRIVATE KEY", &key);
+        let mut certificate = crate::certificate::make_certificate(&pem, &key_pem).unwrap();
+        certificate.info.as_mut().unwrap().ocsp_servers = vec!["https://ocsp.invalid".into()];
+        let (_, parsed) = x509_parser::parse_x509_certificate(&issuer).unwrap();
+        let serial = parsed.serial.to_bytes_be();
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn crate::storage::Storage> =
+            crate::storage::FileStorage::new(directory.path());
+        let storage_key = crate::storage::STORAGE_KEYS
+            .ocsp_staple(certificate.names.first().map(String::as_str), &pem);
+        let transport = UnavailableTransport(AtomicUsize::new(0));
+        let ct = tokio_util::sync::CancellationToken::new();
+        let cfg = crate::config::OcspConfig::default();
+        let fresh = build_response(
+            &issuer,
+            &serial,
+            &key,
+            SingleStatus::Good,
+            now - time::Duration::minutes(10),
+            now + time::Duration::hours(1),
+            None,
+        );
+        storage.store(&storage_key, &fresh).await.unwrap();
+        let mut cached = certificate.clone();
+        super::super::staple_ocsp(&ct, &storage, &cfg, &mut cached, &transport)
+            .await
+            .unwrap();
+        assert_eq!(transport.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cached.ocsp.unwrap().this_update,
+            now - time::Duration::minutes(10)
+        );
+        assert_eq!(cached.ocsp_staple, Some(fresh.clone()));
+
+        let mut forged = fresh;
+        *forged.last_mut().unwrap() ^= 1;
+        let past_midpoint = build_response(
+            &issuer,
+            &serial,
+            &key,
+            SingleStatus::Good,
+            now - time::Duration::hours(2),
+            now + time::Duration::minutes(10),
+            None,
+        );
+        let wrong_certificate = build_response(
+            &issuer,
+            &serial,
+            &key,
+            SingleStatus::Good,
+            now - time::Duration::minutes(10),
+            now + time::Duration::hours(1),
+            Some(&[42]),
+        );
+        for invalid in [forged, past_midpoint, wrong_certificate] {
+            storage.store(&storage_key, &invalid).await.unwrap();
+            let mut cached = certificate.clone();
+            assert!(
+                super::super::staple_ocsp(&ct, &storage, &cfg, &mut cached, &transport)
+                    .await
+                    .is_err()
+            );
+            assert!(cached.ocsp_staple.is_none());
+        }
+        assert_eq!(transport.0.load(Ordering::SeqCst), 3);
+    }
+
     #[test]
     fn request_roundtrip_hashes() {
         let (issuer_der, _key) = issuer_fixture();

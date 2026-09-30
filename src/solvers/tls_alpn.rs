@@ -218,8 +218,8 @@ impl Solver for TlsAlpnSolver {
         _ct: &CancellationToken,
         chal: &crate::solvers::SolvableChallenge,
     ) -> Result<()> {
-        self.ensure_listener().await?;
         let cert = Self::generate_challenge_cert(&chal.identifier, &chal.key_authorization)?;
+        self.ensure_listener().await?;
         Self::register(&chal.identifier, cert);
         Ok(())
     }

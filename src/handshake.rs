@@ -259,7 +259,13 @@ impl Config {
             }
         };
 
-        let cert = self.get_certificate_from_cache_by_name(&name);
+        let cert = if let Some(selector) = &self.options.cert_selection {
+            selector
+                .select_certificate(hello, &self.cert_cache.all_matching_certificates(&name))
+                .ok()
+        } else {
+            self.get_certificate_from_cache_by_name(&name)
+        };
         let defaulted = cert.is_none()
             && !self.options.fallback_server_name.is_empty()
             && self
@@ -468,7 +474,7 @@ impl Config {
     ) -> Result<Option<Certificate>> {
         // 1) In-process registry (this process initiated the challenge).
         if let Some(cc) = crate::solvers::tls_alpn::TlsAlpnSolver::get(sni) {
-            return Ok(Some(make_certificate_from_chain_only(cc.der.clone())?));
+            return Ok(Some(make_certificate_from_challenge(&cc)?));
         }
         // 2) Distributed: another instance published the challenge to shared
         //    storage; regenerate the challenge certificate locally.
@@ -482,7 +488,7 @@ impl Config {
                     sni,
                     &published.key_authorization,
                 )?;
-                return Ok(Some(make_certificate_from_chain_only(cc.der.clone())?));
+                return Ok(Some(make_certificate_from_challenge(&cc)?));
             }
         }
         Ok(None)
@@ -501,12 +507,13 @@ impl Config {
     }
 }
 
-fn make_certificate_from_chain_only(
-    der: rustls::pki_types::CertificateDer<'static>,
+fn make_certificate_from_challenge(
+    challenge: &crate::solvers::tls_alpn::ChallengeCert,
 ) -> Result<Certificate> {
     let mut cert = Certificate {
-        chain: vec![der],
+        chain: vec![challenge.der.clone()],
         private_key: None,
+        signing_key: Some(Arc::clone(&challenge.certified_key.key)),
         ocsp_staple: None,
         names: Vec::new(),
         tags: Vec::new(),
@@ -583,6 +590,64 @@ mod logic_tests {
     use rcgen::{CertificateParams, KeyPair};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[tokio::test]
+    async fn review_cache_resolution_honors_custom_selector() {
+        #[derive(Debug)]
+        struct ChooseLast;
+        impl crate::config::CertificateSelector for ChooseLast {
+            fn select_certificate(
+                &self,
+                _: &ClientHelloInfo,
+                choices: &[Certificate],
+            ) -> Result<Certificate> {
+                choices
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| Error::Internal("no candidates".into()))
+            }
+        }
+        let cache = Cache::new_without_maintenance(Default::default()).unwrap();
+        let config = Config::new(
+            Arc::clone(&cache),
+            ConfigOptions {
+                cert_selection: Some(Arc::new(ChooseLast)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let make = || {
+            let key = KeyPair::generate().unwrap();
+            let signed = CertificateParams::new(vec!["selection.example.com".into()])
+                .unwrap()
+                .self_signed(&key)
+                .unwrap();
+            crate::certificate::make_certificate(
+                signed.pem().as_bytes(),
+                key.serialize_pem().as_bytes(),
+            )
+            .unwrap()
+        };
+        cache.cache_certificate(make());
+        let last = make();
+        cache.cache_certificate(last.clone());
+        let hello = ClientHelloInfo {
+            server_name: Some("selection.example.com".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.get_cached_cert_sync(&hello).unwrap().hash(),
+            last.hash()
+        );
+        assert_eq!(
+            config
+                .get_certificate(&CancellationToken::new(), &hello)
+                .await
+                .unwrap()
+                .hash(),
+            last.hash()
+        );
+    }
+
     #[derive(Debug, Default)]
     struct MockIssuer {
         issued: AtomicUsize,
@@ -597,11 +662,8 @@ mod logic_tests {
             _attempt: u32,
         ) -> Result<IssuedCertificate> {
             self.issued.fetch_add(1, Ordering::SeqCst);
-            let key = KeyPair::generate().unwrap();
-            let params = CertificateParams::new(csr.dns_names.clone()).unwrap();
-            let cert = params.self_signed(&key).unwrap();
             Ok(IssuedCertificate {
-                certificate: cert.pem().into_bytes(),
+                certificate: crate::test_csr::issue(&csr.der, &csr.dns_names),
                 metadata: None,
             })
         }
@@ -727,11 +789,8 @@ mod logic_tests {
             csr: &crate::issuer::Csr,
             _attempt: u32,
         ) -> Result<IssuedCertificate> {
-            let key = KeyPair::generate().unwrap();
-            let params = CertificateParams::new(csr.dns_names.clone()).unwrap();
-            let cert = params.self_signed(&key).unwrap();
             Ok(IssuedCertificate {
-                certificate: cert.pem().into_bytes(),
+                certificate: crate::test_csr::issue(&csr.der, &csr.dns_names),
                 metadata: None,
             })
         }
@@ -980,7 +1039,6 @@ mod acceptor_tests {
     use crate::cache::{Cache, CacheOptions};
     use crate::config::{Config, ConfigOptions, OnDemandConfig};
     use crate::issuer::{IssuedCertificate, Issuer};
-    use rcgen::{CertificateParams, KeyPair};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -998,14 +1056,8 @@ mod acceptor_tests {
             _attempt: u32,
         ) -> Result<IssuedCertificate> {
             self.issued.fetch_add(1, Ordering::SeqCst);
-            let key = KeyPair::generate().unwrap();
-            let mut params = CertificateParams::new(csr.dns_names.clone()).unwrap();
-            params
-                .distinguished_name
-                .push(rcgen::DnType::CommonName, csr.dns_names[0].clone());
-            let cert = params.self_signed(&key).unwrap();
             Ok(IssuedCertificate {
-                certificate: cert.pem().into_bytes(),
+                certificate: crate::test_csr::issue(&csr.der, &csr.dns_names),
                 metadata: None,
             })
         }

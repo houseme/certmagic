@@ -59,9 +59,11 @@ pub struct CertInfo {
 pub struct Certificate {
     /// The full certificate chain (leaf first).
     pub chain: Vec<CertificateDer<'static>>,
-    /// The private key, when available (TLS-ALPN challenge certs have one;
-    /// certificates handed out by external managers may not).
+    /// The encoded private key, when available. Challenge certificates may
+    /// retain a provider signing key instead; external managers may omit it.
     pub private_key: Option<Arc<PrivateKeyDer<'static>>>,
+    /// Retain challenge signing keys without requiring an exportable DER key.
+    pub(crate) signing_key: Option<Arc<dyn rustls::sign::SigningKey>>,
     /// The most recent OCSP staple served with the certificate.
     pub ocsp_staple: Option<Vec<u8>>,
     /// All names the certificate covers, normalized (lowercased, trimmed).
@@ -100,6 +102,7 @@ impl Certificate {
         Self {
             chain: Vec::new(),
             private_key: None,
+            signing_key: None,
             ocsp_staple: None,
             names: Vec::new(),
             tags: Vec::new(),
@@ -335,6 +338,7 @@ pub fn make_certificate(cert_pem: &[u8], key_pem: &[u8]) -> Result<Certificate> 
     let mut cert = Certificate {
         chain,
         private_key,
+        signing_key: None,
         ocsp_staple: None,
         names: Vec::new(),
         tags: Vec::new(),
@@ -345,6 +349,22 @@ pub fn make_certificate(cert_pem: &[u8], key_pem: &[u8]) -> Result<Certificate> 
         ari: None,
         info: None,
     };
+    let key = crate::tls_integration::signing_key_from_der(
+        cert.private_key.as_deref().expect("parsed key"),
+    )
+    .ok_or_else(|| Error::Certificate(CertificateError::Parse("unsupported private key".into())))?;
+    if let Some(public_key) = key.public_key() {
+        let (_, leaf) =
+            x509_parser::parse_x509_certificate(cert.chain[0].as_ref()).map_err(|error| {
+                Error::Certificate(CertificateError::Parse(format!("leaf: {error}")))
+            })?;
+        if public_key.as_ref() != leaf.public_key().raw {
+            return Err(Error::Certificate(CertificateError::Parse(
+                "certificate and private key do not match".into(),
+            )));
+        }
+    }
+    cert.signing_key = Some(key);
     cert.fill_from_leaf()?;
     Ok(cert)
 }
@@ -758,6 +778,25 @@ mod tests {
         let cert_pem = cert.pem();
         let key_pem = key.serialize_pem();
         make_certificate(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn review_certificate_loading_rejects_a_mismatched_private_key() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let wrong = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["mismatch.example.com".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        assert!(
+            make_certificate(certificate.pem().as_bytes(), key.serialize_pem().as_bytes()).is_ok()
+        );
+        let error = make_certificate(
+            certificate.pem().as_bytes(),
+            wrong.serialize_pem().as_bytes(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("do not match"));
     }
 
     #[test]

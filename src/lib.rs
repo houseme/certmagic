@@ -655,3 +655,7 @@ pub async fn listen_with_addr(
 ) -> Result<tokio_rustls::TlsAcceptor> {
     listen_acceptor(domain_names, addr).await
 }
+
+#[cfg(all(test, feature = "file-storage"))]
+#[path = "../tests/support/csr.rs"]
+pub(crate) mod test_csr;

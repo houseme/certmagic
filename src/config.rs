@@ -1988,7 +1988,7 @@ mod orchestration_tests {
     use rcgen::{CertificateParams, KeyPair};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A fake CA: signs a real self-signed cert for the requested names.
+    /// A fake CA: issues certificates for the requested CSR public key and names.
     #[derive(Debug, Default)]
     struct MockIssuer {
         issued: AtomicUsize,
@@ -2004,12 +2004,8 @@ mod orchestration_tests {
             _attempt: u32,
         ) -> Result<IssuedCertificate> {
             self.issued.fetch_add(1, Ordering::SeqCst);
-            let key = KeyPair::generate().unwrap();
-            let params = CertificateParams::new(csr.dns_names.clone()).unwrap();
-            let cert = params.self_signed(&key).unwrap();
-            let _ = &key;
             Ok(IssuedCertificate {
-                certificate: cert.pem().into_bytes(),
+                certificate: crate::test_csr::issue(&csr.der, &csr.dns_names),
                 metadata: Some(serde_json::json!({"issuer": "mock"})),
             })
         }

@@ -13,7 +13,8 @@ use certmagic::{
     Cache, CacheOptions, CertStore, CertificateResource, Config, ConfigOptions, Error,
     IssuedCertificate, Issuer, Result,
 };
-use rcgen::{CertificateParams, KeyPair};
+#[path = "support/csr.rs"]
+mod test_csr;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Default)]
@@ -30,11 +31,8 @@ impl Issuer for MockIssuer {
         _attempt: u32,
     ) -> Result<IssuedCertificate> {
         self.issued.fetch_add(1, Ordering::SeqCst);
-        let key = KeyPair::generate().unwrap();
-        let params = CertificateParams::new(csr.dns_names.clone()).unwrap();
-        let cert = params.self_signed(&key).unwrap();
         Ok(IssuedCertificate {
-            certificate: cert.pem().into_bytes(),
+            certificate: test_csr::issue(&csr.der, &csr.dns_names),
             metadata: Some(serde_json::json!({"issuer": "separate-store-test"})),
         })
     }

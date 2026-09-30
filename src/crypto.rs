@@ -280,10 +280,10 @@ pub fn generate_csr(key_pair: &KeyPair, opts: &CsrOptions) -> Result<Vec<u8>> {
 
     if opts.must_staple {
         // TLS Feature extension (RFC 7633 status_request):
-        // SEQUENCE of the extension value — DER: OCTET STRING { BOOLEAN TRUE }.
+        // RFC 7633: extnValue contains SEQUENCE OF INTEGER { 5 }.
         let mut ext = CustomExtension::from_oid_content(
             &[1, 3, 6, 1, 5, 5, 7, 1, 24],
-            vec![0x04, 0x03, 0x02, 0x01, 0x05],
+            vec![0x30, 0x03, 0x02, 0x01, 0x05],
         );
         ext.set_criticality(false);
         params.custom_extensions.push(ext);
@@ -423,5 +423,37 @@ mod tests {
         .unwrap();
         assert!(csr_der.len() > 100);
         assert_eq!(csr_der[0], 0x30, "CSR must be a DER SEQUENCE");
+    }
+    #[test]
+    fn review_must_staple_csr_contains_sequence_of_integers() {
+        use x509_parser::prelude::FromDer;
+        let key = KeyPair::generate().unwrap();
+        let der = generate_csr(
+            &key,
+            &CsrOptions {
+                dns_names: vec!["must-staple.example.com".into()],
+                must_staple: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_, csr) =
+            x509_parser::certification_request::X509CertificationRequest::from_der(&der).unwrap();
+        let extensions = csr
+            .certification_request_info
+            .iter_attributes()
+            .find_map(|attribute| match attribute.parsed_attribute() {
+                x509_parser::cri_attributes::ParsedCriAttribute::ExtensionRequest(request) => {
+                    Some(&request.extensions)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let feature = extensions
+            .iter()
+            .find(|extension| extension.oid.to_id_string() == "1.3.6.1.5.5.7.1.24")
+            .unwrap();
+        assert_eq!(feature.value, &[0x30, 0x03, 0x02, 0x01, 0x05]);
+        assert!(!feature.critical);
     }
 }

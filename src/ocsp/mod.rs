@@ -245,31 +245,26 @@ pub async fn staple_ocsp(
 
     let key = STORAGE_KEYS.ocsp_staple(cert.names.first().map(String::as_str), &cert.pem_bundle());
 
-    // 1) Stored staple, when fresh.
-    let stored = match storage.load(&key).await {
-        Ok(der) => {
-            let next = next_update_from_response(&der);
-            let status = status_from_response(&der);
-            if status == Some(OcspCertStatus::Good)
-                && next.is_some_and(|nu| is_fresh(now(), nu, now(), None))
-            {
-                cert.ocsp_staple = Some(der.clone());
-                cert.ocsp = Some(OcspResponse {
-                    status: OcspCertStatus::Good,
-                    this_update: now(),
-                    next_update: next,
-                    revoked_at: None,
-                    revocation_reason: None,
-                    responder_not_after: None,
-                    raw: der.clone(),
-                });
-                return Ok(());
-            }
-            Some(der)
+    // Storage is a cache of signed responses, not a source of trusted status.
+    // Verify identity/signature and preserve the responder's actual timestamps
+    // so repeated reads cannot move the freshness midpoint into the future.
+    if let Ok(der) = storage.load(&key).await {
+        let issuer = cert.chain.get(1).or_else(|| cert.chain.first());
+        if let (Some(issuer), Some(leaf)) = (issuer, cert.chain.first())
+            && let Ok((_, leaf)) = x509_parser::parse_x509_certificate(leaf.as_ref())
+            && let Ok(cert_id) =
+                rfc6960::CertId::from_issuer_sha1(issuer.as_ref(), &leaf.serial.to_bytes_be())
+            && let Ok(parsed) = rfc6960::parse_response(&der, &cert_id, Some(issuer.as_ref()))
+            && parsed.status == OcspCertStatus::Good
+            && parsed.next_update.is_some_and(|next| {
+                is_fresh(parsed.this_update, next, now(), parsed.responder_not_after)
+            })
+        {
+            cert.ocsp_staple = Some(parsed.raw.clone());
+            cert.ocsp = Some(parsed);
+            return Ok(());
         }
-        Err(_) => None,
-    };
-    let _ = stored;
+    }
 
     // 2) Network refresh from the responder.
     let result = fetch_and_attach(&info.ocsp_servers, cfg, storage, &key, cert, transport).await;

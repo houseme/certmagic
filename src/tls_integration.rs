@@ -81,12 +81,27 @@ pub(crate) fn to_certified_key(
     cert: &crate::certificate::Certificate,
     cache: &Mutex<HashMap<String, Arc<CertifiedKey>>>,
 ) -> Option<Arc<CertifiedKey>> {
-    if let Some(hit) = cache.lock().ok()?.get(cert.hash()).cloned() {
-        return Some(hit);
+    {
+        let mut keys = cache.lock().ok()?;
+        if let Some(hit) = keys.get_mut(cert.hash()) {
+            if hit.ocsp != cert.ocsp_staple {
+                // Preserve signing-key reuse while publishing the new staple.
+                // Existing handshakes retain their immutable Arc snapshot.
+                Arc::make_mut(hit).ocsp = cert.ocsp_staple.clone();
+            }
+            return Some(Arc::clone(hit));
+        }
     }
-    let key_der: &PrivateKeyDer<'_> = cert.private_key.as_deref()?;
-    let signing_key = signing_key_from_der(key_der)?;
-    let ck = Arc::new(CertifiedKey::new(cert.chain.clone(), signing_key));
+    let signing_key = match &cert.signing_key {
+        Some(key) => Arc::clone(key),
+        None => {
+            let key_der: &PrivateKeyDer<'_> = cert.private_key.as_deref()?;
+            signing_key_from_der(key_der)?
+        }
+    };
+    let mut ck = CertifiedKey::new(cert.chain.clone(), signing_key);
+    ck.ocsp = cert.ocsp_staple.clone();
+    let ck = Arc::new(ck);
     if let Ok(mut map) = cache.lock() {
         map.insert(cert.hash().to_owned(), Arc::clone(&ck));
     }
@@ -307,6 +322,13 @@ impl ResolvesServerCert for CertmagicResolver {
             .as_ref()
             .and_then(|config| config.get_cached_cert_sync(&hello))
             .or_else(|| {
+                if self
+                    .config
+                    .as_ref()
+                    .is_some_and(|config| config.options.cert_selection.is_some())
+                {
+                    return None;
+                }
                 name.as_deref()
                     .and_then(|name| self.cache.first_matching_certificate(name))
             });
@@ -515,6 +537,9 @@ impl CertmagicAcceptor {
             .ok_or_else(|| std::io::Error::other("private key unavailable for serving"))?;
 
         let mut config = (*self.base).clone();
+        if hello.is_acme_tls_alpn() {
+            config.alpn_protocols = vec![crate::handshake::ACMETLS1_PROTOCOL.as_bytes().to_vec()];
+        }
         config.cert_resolver = Arc::new(StaticResolver(key));
         Ok(config)
     }
@@ -639,5 +664,74 @@ mod convenience_api_tests {
         let _ = config.server_config().unwrap();
 
         cache.stop_now();
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[cfg(feature = "file-storage")]
+    #[tokio::test]
+    async fn review_async_acceptor_retains_tls_alpn_signing_key_and_protocol() {
+        use crate::solvers::Solver;
+        let cache = crate::Cache::new_without_maintenance(Default::default()).unwrap();
+        let config = crate::Config::new(cache, Default::default()).unwrap();
+        let acceptor = config.certmagic_acceptor().unwrap();
+        let solver = crate::solvers::tls_alpn::TlsAlpnSolver::default();
+        let challenge = crate::solvers::SolvableChallenge {
+            kind: "tls-alpn-01".into(),
+            identifier: "acceptor-challenge.example.com".into(),
+            token: "token".into(),
+            url: "https://ca.invalid/challenge".into(),
+            key_authorization: "token.thumbprint".into(),
+        };
+        let ct = CancellationToken::new();
+        solver.present(&ct, &challenge).await.unwrap();
+        let hello = ClientHelloInfo {
+            server_name: Some(challenge.identifier.clone()),
+            alpn: vec![b"acme-tls/1".to_vec()],
+            ..Default::default()
+        };
+        let certificate = config.get_certificate(&ct, &hello).await.unwrap();
+        let key = to_certified_key(&certificate, &Mutex::new(HashMap::new())).unwrap();
+        let (_, parsed) =
+            x509_parser::parse_x509_certificate(certificate.chain[0].as_ref()).unwrap();
+        assert_eq!(
+            key.key.public_key().unwrap().as_ref(),
+            parsed.public_key().raw
+        );
+        let tls = acceptor.config_for(&hello, &ct).await.unwrap();
+        assert_eq!(tls.alpn_protocols, vec![b"acme-tls/1".to_vec()]);
+        solver.cleanup(&challenge).await;
+    }
+
+    #[test]
+    fn review_certified_key_tracks_ocsp_updates() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let signed = rcgen::CertificateParams::new(vec!["ocsp.example.com".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let mut cert = crate::certificate::make_certificate(
+            signed.pem().as_bytes(),
+            key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        let cache = Mutex::new(HashMap::new());
+        cert.ocsp_staple = Some(vec![1, 2, 3]);
+        let first = to_certified_key(&cert, &cache).unwrap();
+        assert_eq!(first.ocsp, cert.ocsp_staple);
+        assert!(Arc::ptr_eq(
+            &first,
+            &to_certified_key(&cert, &cache).unwrap()
+        ));
+        cert.ocsp_staple = Some(vec![4, 5]);
+        let refreshed = to_certified_key(&cert, &cache).unwrap();
+        assert_eq!(refreshed.ocsp, cert.ocsp_staple);
+        assert!(Arc::ptr_eq(&first.key, &refreshed.key));
+        assert_eq!(first.ocsp, Some(vec![1, 2, 3]));
+        cert.ocsp_staple = None;
+        assert!(to_certified_key(&cert, &cache).unwrap().ocsp.is_none());
     }
 }

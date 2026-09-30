@@ -40,6 +40,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   removed from the cache.
 - Preserve loaded certificates' issuer identities, isolate concurrent storage
   health probes, and reject non-finite renewal ratios.
+- Reject mismatched certificate/private-key pairs at load time and reuse parsed
+  signing keys; make test issuers sign the actual CSR public key.
+- Honor custom certificate selectors, retain TLS-ALPN challenge signing keys
+  through async acceptance, and negotiate the challenge protocol.
+- Propagate OCSP staples into rustls, including updates/removal, verify persisted
+  responses, and retain their original freshness timestamps.
+- Encode the Must-Staple CSR extension as the required DER sequence.
 
 ### Security
 
