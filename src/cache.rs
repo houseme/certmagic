@@ -1,6 +1,6 @@
 //! In-memory certificate cache.
 //!
-//! Two maps under short critical sections (never await while holding a lock):
+//! One state lock keeps the two maps coherent (never await while holding it):
 //! `hash → Certificate` and `SAN → hashes`. Capacity eviction is random and
 //! only ever evicts *managed* certificates. Each cache runs one maintenance
 //! task (renewals + OCSP refresh); `stop` cancels it.
@@ -82,8 +82,7 @@ impl std::fmt::Debug for CacheOptions {
 ///.
 pub struct Cache {
     options: RwLock<CacheOptions>,
-    cache: Mutex<HashMap<String, Certificate>>,
-    index: Mutex<HashMap<String, Vec<String>>>,
+    entries: RwLock<CacheEntries>,
     /// Cancels the maintenance task.
     stop: CancellationToken,
     maintainer: Mutex<Option<JoinHandle<()>>>,
@@ -102,6 +101,73 @@ pub struct Cache {
     pub(crate) owner: RwLock<Option<crate::config::CachedConfig>>,
 }
 
+/// The SAN index belongs to the certificate table; all mutations use the
+/// stored certificate's names, never a potentially stale caller snapshot.
+#[derive(Default)]
+struct CacheEntries {
+    certificates: HashMap<String, Certificate>,
+    index: HashMap<String, Vec<String>>,
+}
+
+impl CacheEntries {
+    fn remove(&mut self, hash: &str) -> Option<Certificate> {
+        let cert = self.certificates.remove(hash)?;
+        for name in &cert.names {
+            Cache::remove_from_index(&mut self.index, name, hash);
+        }
+        Some(cert)
+    }
+
+    fn insert(&mut self, capacity: usize, cert: &mut Certificate) {
+        let Self {
+            certificates: cache,
+            index,
+        } = self;
+        if cert.hash.is_empty() {
+            return;
+        }
+        if let Some(stored) = cache.get_mut(&cert.hash) {
+            // Merge tags without cloning the chain, OCSP response and metadata.
+            let missing: Vec<String> = cert
+                .tags
+                .iter()
+                .filter(|tag| !stored.tags.contains(tag))
+                .cloned()
+                .collect();
+            stored.tags.extend(missing);
+            cert.tags = stored.tags.clone();
+            return;
+        }
+
+        // Evict a random managed certificate when at capacity (no LRU).
+        if capacity > 0 && cache.len() >= capacity {
+            // Reservoir sampling avoids cloning every cached hash just to
+            // choose one managed victim.
+            use rand::seq::IteratorRandom;
+            let pick = cache
+                .values()
+                .filter(|cert| cert.managed)
+                .choose(&mut rand::rng())
+                .map(|cert| cert.hash.clone());
+            if let Some(victim_hash) = pick
+                && let Some(victim) = cache.remove(&victim_hash)
+            {
+                for name in &victim.names {
+                    Cache::remove_from_index(index, name, &victim_hash);
+                }
+            }
+        }
+
+        for name in &cert.names {
+            index
+                .entry(name.clone())
+                .or_default()
+                .push(cert.hash.clone());
+        }
+        cache.insert(cert.hash.clone(), cert.clone());
+    }
+}
+
 impl std::fmt::Debug for Cache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Cache")
@@ -109,7 +175,14 @@ impl std::fmt::Debug for Cache {
                 "capacity",
                 &self.options.read().map(|o| o.capacity).unwrap_or(0),
             )
-            .field("size", &self.cache.lock().map(|c| c.len()).unwrap_or(0))
+            .field(
+                "size",
+                &self
+                    .entries
+                    .read()
+                    .map(|c| c.certificates.len())
+                    .unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -149,8 +222,7 @@ impl Cache {
     pub fn new_without_maintenance(options: CacheOptions) -> Result<Arc<Self>> {
         let cache = Arc::new(Self {
             options: RwLock::new(options),
-            cache: Mutex::new(HashMap::new()),
-            index: Mutex::new(HashMap::new()),
+            entries: RwLock::new(CacheEntries::default()),
             stop: CancellationToken::new(),
             maintainer: Mutex::new(None),
             maintenance_finished: AtomicBool::new(true),
@@ -296,7 +368,10 @@ impl Cache {
     /// Number of cached certificates.
     #[must_use]
     pub fn size(&self) -> usize {
-        self.cache.lock().map(|c| c.len()).unwrap_or(0)
+        self.entries
+            .read()
+            .map(|c| c.certificates.len())
+            .unwrap_or(0)
     }
 
     /// Stop the maintenance task and consume the cache.
@@ -345,94 +420,32 @@ impl Cache {
     /// merging missing tags into the existing entry
     ///.
     pub fn cache_certificate(&self, mut cert: Certificate) -> String {
-        // Fast path: without a listener there is nobody to notify, so the
-        // certificate is inserted without the extra clone the event payload
-        // would need.
-        let event = if self.has_event_listener() {
-            let mut cache = self.lock_cache();
-            let existed = cache.contains_key(&cert.hash);
-            let old_tags = cache.get(&cert.hash).map(|old| old.tags.clone());
-            Self::unsynced_cache_certificate(
-                &mut cache,
-                &mut self.lock_index(),
-                self.capacity(),
-                &mut cert,
-            );
-            if !existed {
-                Some(CacheEvent::Added(cert.clone()))
-            } else if old_tags.as_ref() != Some(&cert.tags) {
-                Some(CacheEvent::Updated(cert.clone()))
+        let notify = self.has_event_listener();
+        let capacity = self.capacity();
+        let event = {
+            let mut entries = self.lock_entries();
+            let old_tags = if notify {
+                entries.certificates.get(&cert.hash).map(|c| c.tags.clone())
+            } else {
+                None
+            };
+            entries.insert(capacity, &mut cert);
+            if notify && !cert.hash.is_empty() {
+                if old_tags.is_none() {
+                    Some(CacheEvent::Added(cert.clone()))
+                } else if old_tags.as_ref() != Some(&cert.tags) {
+                    Some(CacheEvent::Updated(cert.clone()))
+                } else {
+                    None
+                }
             } else {
                 None
             }
-        } else {
-            let mut cache = self.lock_cache();
-            Self::unsynced_cache_certificate(
-                &mut cache,
-                &mut self.lock_index(),
-                self.capacity(),
-                &mut cert,
-            );
-            None
         };
         if let Some(event) = event {
             self.emit_event(event);
         }
-        cert.hash.clone()
-    }
-
-    /// Requires the caller to hold the cache lock.
-    fn unsynced_cache_certificate(
-        cache: &mut HashMap<String, Certificate>,
-        index: &mut HashMap<String, Vec<String>>,
-        capacity: usize,
-        cert: &mut Certificate,
-    ) {
-        if cert.hash.is_empty() {
-            return;
-        }
-        if let Some(stored) = cache.get_mut(&cert.hash) {
-            // Merge tags without cloning the chain, OCSP response and metadata.
-            let missing: Vec<String> = cert
-                .tags
-                .iter()
-                .filter(|tag| !stored.tags.contains(tag))
-                .cloned()
-                .collect();
-            stored.tags.extend(missing);
-            cert.tags = stored.tags.clone();
-            return;
-        }
-
-        // Evict a random managed certificate when at capacity (no LRU).
-        if capacity > 0 && cache.len() >= capacity {
-            let hash_keys: Vec<String> = cache.keys().cloned().collect();
-            // Only managed entries are evictable.
-            let evictable: Vec<&String> = hash_keys
-                .iter()
-                .filter(|h| cache.get(*h).is_some_and(|c| c.managed))
-                .collect();
-            if !evictable.is_empty() {
-                let pick = rand::seq::IndexedRandom::choose(&evictable[..], &mut rand::rng())
-                    .copied()
-                    .cloned();
-                if let Some(victim_hash) = pick
-                    && let Some(victim) = cache.remove(&victim_hash)
-                {
-                    for name in &victim.names {
-                        Self::remove_from_index(index, name, &victim_hash);
-                    }
-                }
-            }
-        }
-
-        for name in &cert.names {
-            index
-                .entry(name.clone())
-                .or_default()
-                .push(cert.hash.clone());
-        }
-        cache.insert(cert.hash.clone(), cert.clone());
+        cert.hash
     }
 
     /// Exact-match lookup candidates: hashes whose certificate lists `name`
@@ -440,9 +453,11 @@ impl Cache {
     #[must_use]
     pub fn get_all_matching_certs(&self, name: &str) -> Vec<Certificate> {
         let name = normalized_cache_name(name);
-        // Writers also acquire the certificate map before its SAN index.
-        let cache = self.lock_cache();
-        let index = self.lock_index();
+        let entries = self.read_entries();
+        let CacheEntries {
+            certificates: cache,
+            index,
+        } = &*entries;
         index
             .get(name.as_ref())
             .map(|hashes| {
@@ -459,8 +474,11 @@ impl Cache {
     #[must_use]
     pub fn all_matching_certificates(&self, name: &str) -> Vec<Certificate> {
         let name = normalized_cache_name(name);
-        let cache = self.lock_cache();
-        let index = self.lock_index();
+        let entries = self.read_entries();
+        let CacheEntries {
+            certificates: cache,
+            index,
+        } = &*entries;
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut collect = |candidate: &str| {
@@ -495,23 +513,19 @@ impl Cache {
     ///.
     pub fn replace_certificate(&self, old: &Certificate, new: Certificate) {
         let notify = self.has_event_listener();
-        let new_snapshot = notify.then(|| new.clone());
-        {
-            let mut cache = self.lock_cache();
-            let mut index = self.lock_index();
-            if cache.remove(&old.hash).is_some() {
-                for name in &old.names {
-                    Self::remove_from_index(&mut index, name, &old.hash);
-                }
-            }
+        let capacity = self.capacity();
+        let event = {
+            let mut entries = self.lock_entries();
+            let removed = entries.remove(&old.hash);
             let mut new = new;
-            Self::unsynced_cache_certificate(&mut cache, &mut index, self.capacity(), &mut new);
-        }
-        if let Some(new_snapshot) = new_snapshot {
-            self.emit_event(CacheEvent::Replaced {
-                old: Box::new(old.clone()),
-                new: Box::new(new_snapshot),
-            });
+            entries.insert(capacity, &mut new);
+            notify.then(|| CacheEvent::Replaced {
+                old: Box::new(removed.unwrap_or_else(|| old.clone())),
+                new: Box::new(new),
+            })
+        };
+        if let Some(event) = event {
+            self.emit_event(event);
         }
     }
 
@@ -520,8 +534,8 @@ impl Cache {
     pub(crate) fn update_metadata(&self, hash: &str, update: impl FnOnce(&mut Certificate)) {
         let notify = self.has_event_listener();
         let event = {
-            let mut cache = self.lock_cache();
-            let Some(cert) = cache.get_mut(hash) else {
+            let mut entries = self.lock_entries();
+            let Some(cert) = entries.certificates.get_mut(hash) else {
                 return;
             };
             let old = notify.then(|| cert.clone());
@@ -538,38 +552,27 @@ impl Cache {
 
     /// Remove a certificate by its object (hash identity).
     pub fn remove_certificate(&self, cert: &Certificate) {
-        let mut cache = self.lock_cache();
-        let mut index = self.lock_index();
-        if cache.remove(&cert.hash).is_some() {
-            for name in &cert.names {
-                Self::remove_from_index(&mut index, name, &cert.hash);
-            }
-            drop(index);
-            drop(cache);
-            self.emit_event(CacheEvent::Removed(cert.clone()));
+        let removed = self.lock_entries().remove(&cert.hash);
+        if let Some(cert) = removed {
+            self.emit_event(CacheEvent::Removed(cert));
         }
     }
 
     /// Remove manually-loaded certificates by chain hashes.
     pub fn remove(&self, hashes: &[String]) {
-        let mut cache = self.lock_cache();
-        let mut index = self.lock_index();
+        let mut entries = self.lock_entries();
         let mut removed = Vec::new();
         for hash in hashes {
-            if let Some(cert) = cache.get(hash) {
-                if cert.managed {
-                    continue; // only unmanaged (manual) certs here
-                }
-                for name in &cert.names {
-                    Self::remove_from_index(&mut index, name, hash);
-                }
-                if let Some(cert) = cache.remove(hash) {
-                    removed.push(cert);
-                }
+            if entries
+                .certificates
+                .get(hash)
+                .is_some_and(|cert| !cert.managed)
+                && let Some(cert) = entries.remove(hash)
+            {
+                removed.push(cert);
             }
         }
-        drop(index);
-        drop(cache);
+        drop(entries);
         for cert in removed {
             self.emit_event(CacheEvent::Removed(cert));
         }
@@ -578,10 +581,10 @@ impl Cache {
     /// Remove managed certificates matching subject (+optional issuer key)
     ///.
     pub fn remove_managed(&self, subjects: &[SubjectIssuer]) {
-        let mut cache = self.lock_cache();
-        let mut index = self.lock_index();
+        let mut entries = self.lock_entries();
         let mut removed = Vec::new();
-        let victims: Vec<String> = cache
+        let victims: Vec<String> = entries
+            .certificates
             .values()
             .filter(|c| {
                 c.managed
@@ -594,15 +597,11 @@ impl Cache {
             .map(|c| c.hash.clone())
             .collect();
         for hash in victims {
-            if let Some(cert) = cache.remove(&hash) {
-                for name in &cert.names {
-                    Self::remove_from_index(&mut index, name, &hash);
-                }
+            if let Some(cert) = entries.remove(&hash) {
                 removed.push(cert);
             }
         }
-        drop(index);
-        drop(cache);
+        drop(entries);
         for cert in removed {
             self.emit_event(CacheEvent::Removed(cert));
         }
@@ -617,10 +616,11 @@ impl Cache {
     #[must_use]
     pub fn first_matching_certificate(&self, name: &str) -> Option<Certificate> {
         let name = normalized_cache_name(name);
-        // One coherent lookup under the same lock order as writers. A wildcard
-        // miss no longer reacquires both locks or renormalizes every suffix.
-        let cache = self.lock_cache();
-        let index = self.lock_index();
+        let entries = self.read_entries();
+        let CacheEntries {
+            certificates: cache,
+            index,
+        } = &*entries;
         let lookup = |candidate: &str| cache.get(index.get(candidate)?.first()?);
         if let Some(cert) = lookup(&name) {
             return Some(cert.clone());
@@ -653,15 +653,15 @@ impl Cache {
     /// Look up a certificate by its chain hash.
     #[must_use]
     pub fn get_by_hash(&self, hash: &str) -> Option<Certificate> {
-        self.cache.lock().ok()?.get(hash).cloned()
+        self.entries.read().ok()?.certificates.get(hash).cloned()
     }
 
     /// Snapshot of all cached certificates (for maintenance sweeps).
     #[must_use]
     pub fn all_certs(&self) -> Vec<Certificate> {
-        self.cache
-            .lock()
-            .map(|c| c.values().cloned().collect())
+        self.entries
+            .read()
+            .map(|c| c.certificates.values().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -707,18 +707,16 @@ impl Cache {
         }
     }
 
-    fn lock_cache(&self) -> std::sync::MutexGuard<'_, HashMap<String, Certificate>> {
-        match self.cache.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        }
+    fn lock_entries(&self) -> std::sync::RwLockWriteGuard<'_, CacheEntries> {
+        self.entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn lock_index(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<String>>> {
-        match self.index.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        }
+    fn read_entries(&self) -> std::sync::RwLockReadGuard<'_, CacheEntries> {
+        self.entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn has_event_listener(&self) -> bool {
@@ -787,6 +785,26 @@ mod tests {
         .unwrap();
         c.tags = tags.iter().map(|s| (*s).to_string()).collect();
         c
+    }
+
+    #[test]
+    fn removal_and_replacement_use_stored_sans_instead_of_caller_snapshots() {
+        let cache = Cache::new_without_maintenance(Default::default()).unwrap();
+        let mut old = make_cert(&["old.example.com"], &[]);
+        cache.cache_certificate(old.clone());
+        old.names.clear();
+        cache.remove_certificate(&old);
+        assert!(cache.lock_entries().index.is_empty());
+
+        let original = make_cert(&["original.example.com"], &[]);
+        cache.cache_certificate(original.clone());
+        let mut snapshot = original;
+        snapshot.names = vec!["wrong.example.com".into()];
+        let replacement = make_cert(&["new.example.com"], &[]);
+        cache.replace_certificate(&snapshot, replacement.clone());
+        let entries = cache.lock_entries();
+        assert_eq!(entries.index.len(), 1);
+        assert_eq!(entries.index["new.example.com"], vec![replacement.hash]);
     }
 
     #[test]
@@ -876,7 +894,7 @@ mod tests {
             thread.join().unwrap();
         }
         assert!(
-            cache.lock_index().is_empty(),
+            cache.lock_entries().index.is_empty(),
             "removed SANs must not accumulate"
         );
     }

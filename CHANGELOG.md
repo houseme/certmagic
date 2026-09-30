@@ -21,6 +21,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Consolidate certificate entries and their SAN index under one read/write state
+  lock; sample managed eviction candidates without cloning every cached hash.
 - Update resolved Quinn dependencies to `quinn-proto 0.11.19` and
   `quinn-udp 0.5.16` after refreshing the dependency lockfile.
 - Update the transitive `yoke-derive` dependency to 0.8.4.
@@ -43,6 +45,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Use stored SANs when removing or replacing certificates, preventing stale
+  caller snapshots from leaving index entries that hide later certificates.
 - Distinguish queued background release requests from acknowledged completion,
   so explicit release waiters cannot report success before the backend confirms.
 - Track automatic lock ownership by acquisition identity and callback, preventing
