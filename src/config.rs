@@ -1057,7 +1057,7 @@ use crate::events::{
 };
 use crate::issuer::{CertificateResource, IssuedCertificate};
 use crate::runtime::do_with_retry;
-use crate::storage::acquire_lock;
+use crate::storage::{LockGuard, acquire_lock};
 
 impl Config {
     /// Manage `domain_names`: obtain missing certificates now, renew existing
@@ -1263,7 +1263,7 @@ impl Config {
 
         // Distributed lock serializes issuance across the cluster.
         let lock_key = format!("issue_cert_{name}");
-        let _guard = acquire_lock(ct, &self.storage(), &lock_key).await?;
+        let guard = acquire_lock(ct, &self.storage(), &lock_key).await?;
 
         // Re-check inside the lock: another instance may have obtained it
         // while we waited.
@@ -1273,10 +1273,10 @@ impl Config {
         }
 
         if interactive {
-            self.obtain_cert_inner(ct, &name, 0, true, None).await
+            self.obtain_cert_inner(ct, &name, 0, true, &guard).await
         } else {
             do_with_retry(ct, |attempt| {
-                self.obtain_cert_inner(ct, &name, attempt, false, None)
+                self.obtain_cert_inner(ct, &name, attempt, false, &guard)
             })
             .await
         }
@@ -1288,8 +1288,9 @@ impl Config {
         name: &str,
         attempt: u32,
         interactive: bool,
-        replaces: Option<&str>,
+        guard: &LockGuard,
     ) -> Result<String> {
+        require_live_lock(guard)?;
         // Abortable pre-issuance event.
         emit(
             self.options.on_event.as_ref(),
@@ -1305,10 +1306,12 @@ impl Config {
         )
         .await?;
 
-        match self
-            .issue_for_name(ct, name, attempt, interactive, replaces)
-            .await
-        {
+        require_live_lock(guard)?;
+        let issuance = self
+            .issue_for_name(ct, name, attempt, interactive, None)
+            .await;
+        require_live_lock(guard)?;
+        match issuance {
             Ok(issued) => {
                 let resource = self
                     .save_cert_resource(
@@ -1502,7 +1505,7 @@ impl Config {
         let requested_name = name.to_owned();
         let name = self.transform_subject(ct, name).await;
         let lock_key = format!("issue_cert_{name}");
-        let _guard = acquire_lock(ct, &self.storage(), &lock_key).await?;
+        let guard = acquire_lock(ct, &self.storage(), &lock_key).await?;
 
         // Re-check under the lock.
         let (issuer_key, old_resource, old_cert) =
@@ -1511,7 +1514,7 @@ impl Config {
                 Err(Error::Storage(StorageError::NotFound(_))) => {
                     // Nothing stored: obtain instead (the same fallback
                     // applies to missing resources at renewal time).
-                    drop(_guard);
+                    drop(guard);
                     self.obtain_cert(ct, &requested_name, interactive).await?;
                     return Ok(());
                 }
@@ -1535,6 +1538,7 @@ impl Config {
         // (draft-ietf-acme-ari-03 §4.1), not the certificate URL.
         let replaces = old_cert.ari_replaces_id();
         if compromised {
+            require_live_lock(&guard)?;
             self.move_compromised_private_key_locked(&issuer_key, &name)
                 .await?;
         }
@@ -1543,6 +1547,7 @@ impl Config {
             self.renew_cert_locked(
                 ct,
                 RenewalContext {
+                    guard: &guard,
                     name: &name,
                     force,
                     issuer_key: &issuer_key,
@@ -1558,6 +1563,7 @@ impl Config {
                 self.renew_cert_locked(
                     ct,
                     RenewalContext {
+                        guard: &guard,
                         name: &name,
                         force,
                         issuer_key: &issuer_key,
@@ -1594,6 +1600,7 @@ impl Config {
         ct: &CancellationToken,
         ctx: RenewalContext<'_>,
     ) -> Result<()> {
+        require_live_lock(ctx.guard)?;
         emit(
             self.options.on_event.as_ref(),
             self.options.should_emit.as_ref(),
@@ -1608,9 +1615,12 @@ impl Config {
         )
         .await?;
 
-        let issued = self
+        require_live_lock(ctx.guard)?;
+        let issuance = self
             .issue_for_name(ct, ctx.name, ctx.attempt, ctx.interactive, ctx.replaces)
-            .await?;
+            .await;
+        require_live_lock(ctx.guard)?;
+        let issued = issuance?;
         self.save_cert_resource(
             &issued.issuer_key,
             ctx.name,
@@ -1638,6 +1648,7 @@ impl Config {
 }
 
 struct RenewalContext<'a> {
+    guard: &'a LockGuard,
     name: &'a str,
     force: bool,
     issuer_key: &'a str,
@@ -1645,6 +1656,17 @@ struct RenewalContext<'a> {
     attempt: u32,
     interactive: bool,
     replaces: Option<&'a str>,
+}
+
+// Stop retries/publication after a lease-aware backend reports ownership loss.
+// This is a checkpoint, not an atomic write fence: the backend must enforce
+// stronger write guarantees if ownership can change during a storage operation.
+fn require_live_lock(guard: &LockGuard) -> Result<()> {
+    if guard.is_valid() {
+        Ok(())
+    } else {
+        Err(Error::Storage(StorageError::StaleLock(guard.key().into())).no_retry())
+    }
 }
 
 /// Internal: issuer output plus the private key used (for persistence).

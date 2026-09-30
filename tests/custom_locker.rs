@@ -70,3 +70,86 @@ async fn external_backend_can_return_raii_guards_without_file_storage() {
     assert_eq!(backend.releases.load(Ordering::SeqCst), 2);
     assert_eq!(backend.semaphore.available_permits(), 1);
 }
+
+struct AsyncReleaseProbe {
+    sync_calls: Arc<AtomicUsize>,
+    async_calls: Arc<AtomicUsize>,
+    acknowledgement: Arc<Semaphore>,
+}
+impl LockRelease for AsyncReleaseProbe {
+    fn release(&self) {
+        self.sync_calls.fetch_add(1, Ordering::SeqCst);
+    }
+    fn release_async(&self) -> futures::future::BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.async_calls.fetch_add(1, Ordering::SeqCst);
+            self.acknowledgement.acquire().await.unwrap().forget();
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn awaited_release_waits_for_acknowledgement_and_cancellation_has_a_fallback() {
+    let sync_calls = Arc::new(AtomicUsize::new(0));
+    let async_calls = Arc::new(AtomicUsize::new(0));
+    let acknowledgement = Arc::new(Semaphore::new(0));
+    let make_guard = || {
+        LockGuard::new(
+            "async-release",
+            Box::new(AsyncReleaseProbe {
+                sync_calls: sync_calls.clone(),
+                async_calls: async_calls.clone(),
+                acknowledgement: acknowledgement.clone(),
+            }),
+        )
+    };
+    let mut release = Box::pin(make_guard().release_and_wait());
+    assert!(futures::poll!(&mut release).is_pending());
+    assert_eq!(async_calls.load(Ordering::SeqCst), 1);
+    acknowledgement.add_permits(1);
+    release.await.unwrap();
+    assert_eq!(sync_calls.load(Ordering::SeqCst), 0);
+    let mut cancelled = Box::pin(make_guard().release_and_wait());
+    assert!(futures::poll!(&mut cancelled).is_pending());
+    drop(cancelled);
+    assert_eq!(sync_calls.load(Ordering::SeqCst), 1);
+}
+
+#[async_trait]
+impl certmagic::Storage for CustomLocker {
+    async fn store(&self, _: &str, _: &[u8]) -> Result<()> {
+        unreachable!()
+    }
+    async fn load(&self, _: &str) -> Result<Vec<u8>> {
+        unreachable!()
+    }
+    async fn exists(&self, _: &str) -> Result<bool> {
+        unreachable!()
+    }
+    async fn list(&self, _: &str, _: bool) -> Result<Vec<String>> {
+        unreachable!()
+    }
+    async fn delete(&self, _: &str) -> Result<()> {
+        unreachable!()
+    }
+    async fn stat(&self, _: &str) -> Result<certmagic::KeyInfo> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn manual_untracking_does_not_release_a_scoped_acquisition() {
+    let backend = Arc::new(CustomLocker {
+        semaphore: Arc::new(Semaphore::new(1)),
+        releases: Arc::new(AtomicUsize::new(0)),
+    });
+    let guard = certmagic::acquire(backend.clone(), "explicit-untracking")
+        .await
+        .unwrap();
+    assert!(certmagic::untrack_lock("explicit-untracking"));
+    certmagic::clean_up_own_locks().await;
+    assert_eq!(backend.releases.load(Ordering::SeqCst), 0);
+    guard.release_and_wait().await.unwrap();
+    assert_eq!(backend.releases.load(Ordering::SeqCst), 1);
+}

@@ -103,8 +103,8 @@ pub enum StorageError {
     #[error("lock unavailable: {0}")]
     LockUnavailable(String),
 
-    /// A stale lockfile existed but could not be deleted.
-    #[error("unable to delete stale lockfile; deadlocked: {0}")]
+    /// A lock is stale, its lease was lost, or stale-lock recovery failed.
+    #[error("stale lock or lost lease: {0}")]
     StaleLock(String),
 
     /// Underlying I/O failure (message preserved; kind lost across clone).

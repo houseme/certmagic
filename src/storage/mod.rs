@@ -158,12 +158,13 @@ pub trait Locker: Send + Sync + Debug {
     }
 }
 
-/// A held lock; releases the underlying lock when dropped
-/// (Rust RAII for the deferred release).
+/// A held acquisition that requests backend release when dropped.
+/// Network cleanup is best-effort; use [`LockGuard::release_and_wait`] when
+/// backend acknowledgement is required.
 pub struct LockGuard {
     key: String,
-    release: Box<dyn LockRelease>,
-    released: std::sync::atomic::AtomicBool,
+    release: Arc<ReleaseState>,
+    id: u64,
 }
 
 /// Compatibility name for [`LockGuard`] used by timeout-oriented storage APIs.
@@ -171,9 +172,50 @@ pub type LockHandle = LockGuard;
 
 /// Object-safe release callback owned by a [`LockGuard`].
 pub trait LockRelease: Send + Sync {
-    /// Release the lock. Called exactly once, either on explicit
-    /// [`LockGuard::release`] or on drop.
+    /// Request release of this acquisition without blocking the caller.
+    /// Implementations must be idempotent and ownership-checked: cancellation
+    /// of an awaited release can cause a subsequent Drop fallback.
     fn release(&self);
+
+    /// Local lease health. Backends without lease tracking return true.
+    /// This is advisory and does not fence resource writes.
+    fn is_valid(&self) -> bool {
+        true
+    }
+
+    /// Await backend acknowledgement. Existing synchronous backends retain
+    /// their behavior through this default implementation.
+    fn release_async(&self) -> futures::future::BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.release();
+            Ok(())
+        })
+    }
+}
+
+struct ReleaseState {
+    callback: Box<dyn LockRelease>,
+    released: std::sync::atomic::AtomicBool,
+}
+
+impl ReleaseState {
+    fn request(&self) {
+        if !self
+            .released
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.callback.release();
+        }
+    }
+
+    async fn wait(&self) -> Result<()> {
+        if !self.released.load(std::sync::atomic::Ordering::Acquire) {
+            self.callback.release_async().await?;
+            self.released
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
 }
 
 impl LockGuard {
@@ -188,9 +230,23 @@ impl LockGuard {
     pub fn new(key: impl Into<String>, release: Box<dyn LockRelease>) -> Self {
         Self {
             key: key.into(),
-            release,
-            released: std::sync::atomic::AtomicBool::new(false),
+            release: Arc::new(ReleaseState {
+                callback: release,
+                released: std::sync::atomic::AtomicBool::new(false),
+            }),
+            id: NEXT_LOCK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// Whether the backend still considers this acquisition locally valid.
+    /// This check cannot replace write-side fencing or an atomic transaction.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self
+            .release
+            .released
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.release.callback.is_valid()
     }
 
     /// The lock key this guard holds.
@@ -208,21 +264,26 @@ impl LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        if !self
-            .released
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            self.release.release();
+        self.release.request();
+        if let Ok(mut locks) = owned_guard_locks().lock() {
+            locks.remove(&self.id);
         }
-        // `acquire_lock` registers guards for graceful-shutdown cleanup. A
-        // normal RAII drop completed the release as well, so leave no stale
-        // entry that could later unlock a newly reacquired lock with the same
-        // name.
-        untrack_lock(&self.key);
+        // Keep legacy manual tracking behavior without touching another
+        // scoped acquisition of the same name/backend.
+        untrack_legacy_lock(&self.key);
     }
 }
 
 impl LockGuard {
+    /// Release this acquisition and await backend acknowledgement.
+    ///
+    /// If this future is cancelled or returns an error, Drop requests a
+    /// best-effort release of the same acquisition. Network backends still
+    /// need expiring leases for runtime/process failure recovery.
+    pub async fn release_and_wait(self) -> Result<()> {
+        self.release.wait().await
+    }
+
     /// Explicitly release the lock now (equivalent to dropping).
     pub fn release(self) {
         // Consuming self runs Drop, which performs the release exactly once.
@@ -583,6 +644,39 @@ pub async fn load_certificate(
 // Process-wide lock ownership registry.
 // ---------------------------------------------------------------------------
 
+static NEXT_LOCK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+struct OwnedGuard {
+    key: String,
+    release: Arc<ReleaseState>,
+    release_on_drop: bool,
+}
+
+impl Drop for OwnedGuard {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.release.request();
+        }
+    }
+}
+static OWNED_GUARDS: OnceLock<Mutex<HashMap<u64, OwnedGuard>>> = OnceLock::new();
+
+fn owned_guard_locks() -> &'static Mutex<HashMap<u64, OwnedGuard>> {
+    OWNED_GUARDS.get_or_init(Mutex::default)
+}
+
+fn track_guard(guard: &LockGuard) {
+    if let Ok(mut locks) = owned_guard_locks().lock() {
+        locks.insert(
+            guard.id,
+            OwnedGuard {
+                key: guard.key.clone(),
+                release: Arc::clone(&guard.release),
+                release_on_drop: true,
+            },
+        );
+    }
+}
+
 static OWNED_LOCKS: OnceLock<Mutex<HashMap<String, Arc<dyn Storage>>>> = OnceLock::new();
 
 /// The lazily-initialized default storage instance
@@ -611,6 +705,24 @@ pub fn track_lock(storage: &Arc<dyn Storage>, key: &str) {
 /// process-local registry and leaves backend ownership unchanged. It is useful
 /// when a backend has already released a lock itself.
 pub fn untrack_lock(key: &str) -> bool {
+    let mut removed = untrack_legacy_lock(key);
+    if let Ok(mut locks) = owned_guard_locks().lock() {
+        locks.retain(|_, guard| {
+            if guard.key == key {
+                // Explicit untracking is not a request to release. The live
+                // LockGuard still owns its eventual release obligation.
+                guard.release_on_drop = false;
+                removed = true;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    removed
+}
+
+fn untrack_legacy_lock(key: &str) -> bool {
     owned_locks()
         .lock()
         .ok()
@@ -626,7 +738,7 @@ pub async fn acquire_lock(
     key: &str,
 ) -> Result<LockGuard> {
     let guard = storage.lock(ct, key).await?;
-    track_lock(storage, key);
+    track_guard(&guard);
     Ok(guard)
 }
 
@@ -637,7 +749,7 @@ pub async fn try_acquire_lock(
     key: &str,
 ) -> Result<Option<LockGuard>> {
     if let Some(guard) = storage.try_lock(ct, key).await? {
-        track_lock(storage, key);
+        track_guard(&guard);
         return Ok(Some(guard));
     }
     Ok(None)
@@ -665,7 +777,7 @@ pub async fn try_acquire(
 ) -> Result<Option<LockGuard>> {
     let result = storage.try_lock_with_timeout(key, timeout).await?;
     if let Some(guard) = result {
-        track_lock(&storage, key);
+        track_guard(&guard);
         Ok(Some(guard))
     } else {
         Ok(None)
@@ -683,23 +795,27 @@ pub async fn acquire_with_timeout(
     timeout: Duration,
 ) -> Result<LockGuard> {
     let guard = storage.lock_with_timeout(key, timeout).await?;
-    track_lock(&storage, key);
+    track_guard(&guard);
     Ok(guard)
 }
 
 /// Release a previously acquired lock.
 ///
-/// The guard is released even if this future is itself cancelled: the
-/// underlying release is synchronous.
+/// Requests release even if this future is cancelled. Network cleanup may
+/// continue in the background; use [`LockGuard::release_and_wait`] to await
+/// acknowledgement and receive a backend error.
 pub async fn release_lock(guard: LockGuard) {
-    let key = guard.key().to_owned();
     guard.release();
-    untrack_lock(&key);
 }
 
 /// Release every lock this process still holds.
 /// Call during graceful shutdown.
 pub async fn clean_up_own_locks() {
+    let guards: Vec<OwnedGuard> = match owned_guard_locks().lock() {
+        Ok(mut locks) => locks.drain().map(|(_, guard)| guard).collect(),
+        Err(_) => Vec::new(),
+    };
+    release_owned_guards(guards).await;
     let entries: Vec<(String, Arc<dyn Storage>)> = match owned_locks().lock() {
         Ok(mut locks) => locks.drain().collect(),
         Err(_) => return,
@@ -707,6 +823,15 @@ pub async fn clean_up_own_locks() {
     for (key, storage) in entries {
         if let Err(err) = storage.unlock(&key).await {
             tracing::warn!(key = %key, error = %err, "failed to clean up lock");
+        }
+    }
+}
+
+async fn release_owned_guards(guards: Vec<OwnedGuard>) {
+    for guard in guards {
+        if let Err(error) = guard.release.wait().await {
+            tracing::warn!(key = %guard.key, %error, "failed to clean up owned acquisition");
+            guard.release.request();
         }
     }
 }
@@ -1140,12 +1265,24 @@ mod tests {
         let first = acquire(Arc::clone(&storage), key).await.unwrap();
         drop(first);
 
-        assert!(!owned_locks().lock().unwrap().contains_key(key));
+        assert!(
+            !owned_guard_locks()
+                .lock()
+                .unwrap()
+                .values()
+                .any(|guard| guard.key == key)
+        );
 
         // A newly acquired guard is tracked independently and remains visible
         // to shutdown cleanup until it is dropped.
         let second = acquire(Arc::clone(&storage), key).await.unwrap();
-        assert!(owned_locks().lock().unwrap().contains_key(key));
+        assert!(
+            owned_guard_locks()
+                .lock()
+                .unwrap()
+                .values()
+                .any(|guard| guard.key == key)
+        );
         drop(second);
     }
 
@@ -1205,5 +1342,67 @@ mod tests {
             error,
             Error::Storage(StorageError::LockUnavailable(ref name)) if name == key
         ));
+    }
+}
+
+#[cfg(test)]
+mod guard_release_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PendingRelease(Arc<AtomicUsize>);
+    impl LockRelease for PendingRelease {
+        fn release(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn release_async(&self) -> futures::future::BoxFuture<'_, Result<()>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_shutdown_cleanup_requests_release_for_every_drained_guard() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first = LockGuard::new("first", Box::new(PendingRelease(calls.clone())));
+        let second = LockGuard::new("second", Box::new(PendingRelease(calls.clone())));
+        let entries = [&first, &second]
+            .into_iter()
+            .map(|guard| OwnedGuard {
+                key: guard.key.clone(),
+                release: guard.release.clone(),
+                release_on_drop: true,
+            })
+            .collect();
+        let mut cleanup = Box::pin(release_owned_guards(entries));
+        assert!(futures::poll!(&mut cleanup).is_pending());
+        drop(cleanup);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!first.is_valid());
+        assert!(!second.is_valid());
+        drop(first);
+        drop(second);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    struct FailingRelease(Arc<AtomicUsize>);
+    impl LockRelease for FailingRelease {
+        fn release(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn release_async(&self) -> futures::future::BoxFuture<'_, Result<()>> {
+            Box::pin(async {
+                Err(Error::Storage(StorageError::Other(
+                    "test release failure".into(),
+                )))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_awaited_release_reports_error_and_requests_drop_fallback() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let guard = LockGuard::new("failed", Box::new(FailingRelease(calls.clone())));
+        assert!(guard.release_and_wait().await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
