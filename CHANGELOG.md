@@ -21,6 +21,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Clarify that RSA generation is opt-in and all-features tests enable all
   features together rather than covering every feature combination.
 
+- Reduce repeated name normalization, wildcard allocations, lock acquisitions
+  and certificate clones in cache lookup and duplicate insertion.
+
 ### Fixed
 
 - Release single-flight waiters when leaders are cancelled or panic, and allow

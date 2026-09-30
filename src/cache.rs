@@ -5,6 +5,7 @@
 //! only ever evicts *managed* certificates. Each cache runs one maintenance
 //! task (renewals + OCSP refresh); `stop` cancels it.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -14,7 +15,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::certificate::{Certificate, normalized_name};
+use crate::certificate::Certificate;
 use crate::error::{ConfigError, Error, Result};
 
 /// Default interval between renewal checks.
@@ -390,18 +391,16 @@ impl Cache {
         if cert.hash.is_empty() {
             return;
         }
-        if let Some(existing) = cache.get(&cert.hash).cloned() {
-            // Keep the stored copy; absorb tags it lacks (issue #211).
+        if let Some(stored) = cache.get_mut(&cert.hash) {
+            // Merge tags without cloning the chain, OCSP response and metadata.
             let missing: Vec<String> = cert
                 .tags
                 .iter()
-                .filter(|t| !existing.tags.contains(t))
+                .filter(|tag| !stored.tags.contains(tag))
                 .cloned()
                 .collect();
-            if let Some(stored) = cache.get_mut(&cert.hash) {
-                stored.tags.extend(missing);
-                cert.tags = stored.tags.clone();
-            }
+            stored.tags.extend(missing);
+            cert.tags = stored.tags.clone();
             return;
         }
 
@@ -440,12 +439,12 @@ impl Cache {
     /// as a SAN.
     #[must_use]
     pub fn get_all_matching_certs(&self, name: &str) -> Vec<Certificate> {
-        let name = normalized_name(name);
+        let name = normalized_cache_name(name);
         // Writers also acquire the certificate map before its SAN index.
         let cache = self.lock_cache();
         let index = self.lock_index();
         index
-            .get(&name)
+            .get(name.as_ref())
             .map(|hashes| {
                 hashes
                     .iter()
@@ -459,24 +458,36 @@ impl Cache {
     /// via progressive label replacement.
     #[must_use]
     pub fn all_matching_certificates(&self, name: &str) -> Vec<Certificate> {
-        let name = normalized_name(name);
-        let mut out = self.get_all_matching_certs(&name);
-        // Progressively replace the leftmost labels with "*": a.b.com → *.b.com → *.com → *
-        let mut candidate = name.as_str();
-        while let Some(pos) = candidate.find('.') {
-            candidate = &candidate[pos + 1..];
-            if candidate.is_empty() {
-                out.extend(self.get_all_matching_certs("*"));
+        let name = normalized_cache_name(name);
+        let cache = self.lock_cache();
+        let index = self.lock_index();
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut collect = |candidate: &str| {
+            if let Some(hashes) = index.get(candidate) {
+                for hash in hashes {
+                    if seen.insert(hash)
+                        && let Some(cert) = cache.get(hash)
+                    {
+                        out.push(cert.clone());
+                    }
+                }
+            }
+        };
+        collect(&name);
+        let mut candidate = name.as_ref();
+        let mut wildcard = String::with_capacity(name.len() + 2);
+        while let Some((_, rest)) = candidate.split_once('.') {
+            if rest.is_empty() {
                 break;
             }
-            out.extend(self.get_all_matching_certs(&format!("*.{candidate}")));
+            wildcard.clear();
+            wildcard.push_str("*.");
+            wildcard.push_str(rest);
+            collect(&wildcard);
+            candidate = rest;
         }
-        // A certificate for the global wildcard is the final fallback for
-        // names with no trailing dot as well (progressive wildcard walk).
-        out.extend(self.get_all_matching_certs("*"));
-        // Deduplicate by hash.
-        let mut seen = std::collections::HashSet::new();
-        out.retain(|c| seen.insert(c.hash.clone()));
+        collect("*");
         out
     }
 
@@ -597,17 +608,6 @@ impl Cache {
         }
     }
 
-    /// The single most specific cached certificate whose subject list
-    /// contains exactly `name` — one index lookup, at most one clone.
-    fn first_cert_for_exact_name(&self, name: &str) -> Option<Certificate> {
-        let name = normalized_name(name);
-        // Writers also acquire the certificate map before its SAN index.
-        let cache = self.lock_cache();
-        let index = self.lock_index();
-        let hash = index.get(&name)?.first()?;
-        cache.get(hash).cloned()
-    }
-
     /// The most specific cached certificate matching `name`: exact subject
     /// first, then progressively wildcarded candidates ("a.b.com" → "*.b.com"
     /// → "*.com" → "*", tried in that order). Early-exits on the first hit,
@@ -616,27 +616,30 @@ impl Cache {
     /// primitive for the per-handshake lookup.
     #[must_use]
     pub fn first_matching_certificate(&self, name: &str) -> Option<Certificate> {
-        let name = normalized_name(name);
-        if let Some(cert) = self.first_cert_for_exact_name(&name) {
-            return Some(cert);
+        let name = normalized_cache_name(name);
+        // One coherent lookup under the same lock order as writers. A wildcard
+        // miss no longer reacquires both locks or renormalizes every suffix.
+        let cache = self.lock_cache();
+        let index = self.lock_index();
+        let lookup = |candidate: &str| cache.get(index.get(candidate)?.first()?);
+        if let Some(cert) = lookup(&name) {
+            return Some(cert.clone());
         }
-        // Progressively replace the leftmost labels with "*".
-        let mut candidate = name.as_str();
-        loop {
-            let Some(pos) = candidate.find('.') else {
-                // No further label. Only a trailing dot reduces the candidate
-                // to the bare "*", which can still match.
-                return self.first_cert_for_exact_name("*");
-            };
-            candidate = &candidate[pos + 1..];
-            if candidate.is_empty() {
-                // Trailing dot: the only remaining candidate is "*".
-                return self.first_cert_for_exact_name("*");
+        let mut candidate = name.as_ref();
+        let mut wildcard = String::with_capacity(name.len() + 2);
+        while let Some((_, rest)) = candidate.split_once('.') {
+            if rest.is_empty() {
+                break;
             }
-            if let Some(cert) = self.first_cert_for_exact_name(&format!("*.{candidate}")) {
-                return Some(cert);
+            wildcard.clear();
+            wildcard.push_str("*.");
+            wildcard.push_str(rest);
+            if let Some(cert) = lookup(&wildcard) {
+                return Some(cert.clone());
             }
+            candidate = rest;
         }
+        lookup("*").cloned()
     }
 
     /// Look up a certificate by name via the cache-matching walk and the
@@ -738,6 +741,20 @@ impl Cache {
     }
 }
 
+/// Normalized ASCII hostnames already dominate TLS/cache calls. Borrow those
+/// names, retaining the public normalizer's Unicode and whitespace semantics.
+fn normalized_cache_name(name: &str) -> Cow<'_, str> {
+    let trimmed = name.trim();
+    if trimmed
+        .bytes()
+        .all(|byte| byte.is_ascii() && !byte.is_ascii_uppercase())
+    {
+        Cow::Borrowed(trimmed)
+    } else {
+        Cow::Owned(trimmed.to_lowercase())
+    }
+}
+
 /// Subject + optional issuer key pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubjectIssuer {
@@ -770,6 +787,58 @@ mod tests {
         .unwrap();
         c.tags = tags.iter().map(|s| (*s).to_string()).collect();
         c
+    }
+
+    #[test]
+    fn normalized_cache_names_preserve_unicode_and_whitespace_behavior() {
+        for name in [
+            "example.com",
+            "  API.Example.COM  ",
+            "BÜCHER.example",
+            "ΟΣ.example",
+            "",
+            "a..b.",
+        ] {
+            assert_eq!(
+                normalized_cache_name(name),
+                crate::certificate::normalized_name(name)
+            );
+        }
+        assert!(matches!(
+            normalized_cache_name("  example.com  "),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn wildcard_lookup_preserves_order_and_deduplicates_sans() {
+        let cache = Cache::new_without_maintenance(Default::default()).unwrap();
+        let exact = make_cert(&["example.com", "*.example.com"], &[]);
+        let broad = make_cert(&["*.com"], &[]);
+        let global = make_cert(&["*"], &[]);
+        for cert in [&exact, &broad, &global] {
+            cache.cache_certificate(cert.clone());
+        }
+        for name in ["EXAMPLE.COM", "a.deep.example.com"] {
+            let hashes: Vec<_> = cache
+                .all_matching_certificates(name)
+                .iter()
+                .map(|cert| cert.hash().to_owned())
+                .collect();
+            assert_eq!(hashes, vec![exact.hash(), broad.hash(), global.hash()]);
+            assert_eq!(
+                cache.first_matching_certificate(name).unwrap().hash(),
+                exact.hash()
+            );
+        }
+        assert_eq!(
+            cache
+                .first_matching_certificate("trailing.")
+                .unwrap()
+                .hash(),
+            global.hash()
+        );
+        assert_eq!(cache.all_matching_certificates("*").len(), 1);
     }
 
     #[test]
