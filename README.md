@@ -222,6 +222,21 @@ delegate to the backend instead of mixing cached entries. Cancellation
 cannot retract a dispatched backend write: after an ambiguous outcome, read
 from the authoritative backend rather than assuming the local cache is current.
 
+Exact key movement is a backend operation (`Storage::move_key`); it must not be
+emulated using recursive `delete`. Canonical self moves are no-ops, descendants
+survive, and an occupied destination returns `StorageError::Conflict`. A custom
+Storage using KeyValueCertStore must implement this optional method to support
+private-key archival; the default fails before any copy/delete. FileStorage
+stages regular files in a private, fsynced sibling copy, publishes the complete
+archive through a no-clobber hard link, then unlinks the source. Directory and
+symlink sources are rejected. Archive copies remain owner-only on Unix even
+when the imported source has broader permissions. The destination filesystem
+must support hard links; unsupported filesystems fail with the source intact.
+Interrupted filesystem moves may leave both names and are not a cross-file crash
+transaction. Redis uses one atomic rename script; etcd uses revision comparisons.
+Guarded etcd moves distinguish data conflicts from lost ownership inside one
+transaction, keeping a valid lease available after an archive conflict.
+
 Certificate/private-key resources can use an independent `CertStore` through
 `ConfigBuilder::cert_store`; accounts, challenge publications, locks and OCSP
 remain on `Storage`. A transactional database or a versioned object bundle can
@@ -280,7 +295,8 @@ a separately connected handle or a different backend is rejected. An etcd lock
 combined with an arbitrary S3/secret-store CertStore does **not** provide a
 cross-system transaction. Those adapters remain separate work.
 
-Complete certificate reads use `load_many` and existence checks use `exists_many`.
+Complete certificate reads use `load_many` and value-presence checks use
+`exists_exact_many`; prefix-aware `exists`/`exists_many` retain their existing semantics.
 Etcd performs each group in one transaction; LocalCache delegates bundle reads
 together to avoid mixing cached generations. Generic backends retain their
 parallel-read behavior. Prefix listing uses pagination at a fixed revision;

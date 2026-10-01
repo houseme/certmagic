@@ -8,6 +8,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Add explicit exact-value existence checks and non-overwriting exact-key moves.
+  Custom storage backends without move support fail before mutating either key.
 - Add optional `etcd-storage` using etcd-client 0.20 with namespaced binary
   records, paginated revision snapshots, renewable leases, multi-endpoint
   connections, password authentication and TLS/mutual TLS.
@@ -33,6 +35,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Share certificate-resource write preparation and backend move implementations
+  between guarded and legacy entry points.
 - Use etcd transactions for complete-resource reads and existence snapshots.
 - Route Config issuance, renewal and compromised-key archival through guarded
   operations, checking destination compatibility before contacting an issuer.
@@ -71,6 +75,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Preserve source descendants and canonical self aliases when moving private
+  keys, and refuse to overwrite an existing archive destination.
+- Count only terminal certificate/key/metadata values when checking resource
+  presence; prefixes alone no longer masquerade as a complete certificate.
+- Report etcd archive/source conflicts separately from ownership loss without
+  cancelling an otherwise valid lease; both checks remain in one transaction.
 - Reject expired/replaced etcd owners in the same transaction as certificate
   publication or private-key archival, closing the local lease-check/write race.
 - Invalidate etcd ownership when a pending renewal is cancelled, preventing a

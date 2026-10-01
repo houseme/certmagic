@@ -317,6 +317,34 @@ async fn three_node_storage_fencing_and_failure_recovery() {
     storage.delete("missing").await.unwrap();
     assert!(storage.store("a/../outside", b"v").await.is_err());
 
+    storage.store("move/value", b"parent").await.unwrap();
+    storage.store("move/value/child", b"child").await.unwrap();
+    storage
+        .move_key("move/value", "/move/./value/")
+        .await
+        .unwrap();
+    storage
+        .move_key("move/value", "archive/exact")
+        .await
+        .unwrap();
+    assert_eq!(storage.load("move/value/child").await.unwrap(), b"child");
+    assert_eq!(storage.load("archive/exact").await.unwrap(), b"parent");
+
+    let prefix_keys = certmagic::StorageKeys::new("issuer", "prefix.test");
+    for key in [&prefix_keys.cert, &prefix_keys.key, &prefix_keys.meta] {
+        storage
+            .store(&format!("{key}/child"), b"child")
+            .await
+            .unwrap();
+        assert!(storage.exists(key).await.unwrap());
+    }
+    assert!(
+        !KeyValueCertStore::new(storage.clone())
+            .has("issuer", "prefix.test")
+            .await
+            .unwrap()
+    );
+
     let guard = storage.lock(&ct, "publish").await.unwrap();
     let peer = cluster.storage("values").await;
     assert!(peer.try_lock(&ct, "publish").await.unwrap().is_none());
@@ -386,6 +414,21 @@ async fn three_node_storage_fencing_and_failure_recovery() {
         new_guard.is_valid(),
         "old release must not affect the replacement lease"
     );
+    peer.store("archive/key", b"reserved").await.unwrap();
+    assert!(matches!(
+        peer_store
+            .move_private_key_with_lock("issuer", "example.test", "archive/key", &new_guard)
+            .await,
+        Err(certmagic::Error::Storage(
+            certmagic::error::StorageError::Conflict(_)
+        ))
+    ));
+    assert!(
+        new_guard.is_valid(),
+        "an archive collision does not revoke valid ownership"
+    );
+    assert_eq!(peer.load(&keys.key).await.unwrap(), vec![2; 16]);
+    peer.delete("archive/key").await.unwrap();
     peer_store
         .move_private_key_with_lock("issuer", "example.test", "archive/key", &new_guard)
         .await

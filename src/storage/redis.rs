@@ -43,6 +43,19 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0
 "#;
+const EXISTS_EXACT: &str = r#"
+local values = {}
+for i, key in ipairs(KEYS) do values[i] = redis.call('HEXISTS', key, 'value') end
+return values
+"#;
+const MOVE: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+if redis.call('HEXISTS', KEYS[1], 'value') == 0 or redis.call('HEXISTS', KEYS[1], 'modified') == 0 then
+  return redis.error_reply('invalid certmagic record')
+end
+if redis.call('RENAMENX', KEYS[1], KEYS[2]) == 0 then return -1 end
+return 1
+"#;
 const RENEW: &str = r#"
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
 local remaining = redis.call('PTTL', KEYS[1])
@@ -253,6 +266,27 @@ impl Storage for RedisStorage {
             .ok_or(Error::Storage(StorageError::NotFound(key.into_owned())))
     }
 
+    async fn move_key(&self, source: &str, destination: &str) -> Result<()> {
+        let source = self.canonical_key(source)?;
+        let destination = self.canonical_key(destination)?;
+        if source == destination {
+            return Ok(());
+        }
+        let mut command = ::redis::cmd("EVAL");
+        command
+            .arg(MOVE)
+            .arg(2)
+            .arg(self.data_key(&source))
+            .arg(self.data_key(&destination));
+        match self.query::<i64>(command, "move exact key").await? {
+            1 => Ok(()),
+            0 => Err(Error::Storage(StorageError::NotFound(source.into_owned()))),
+            _ => Err(Error::Storage(StorageError::Conflict(
+                "move destination already exists".into(),
+            ))),
+        }
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         let key = self.canonical_key(key)?;
         let mut command = ::redis::cmd("DEL");
@@ -279,6 +313,23 @@ impl Storage for RedisStorage {
             return Ok(true);
         }
         Ok(!self.scan_children(&key, true).await?.is_empty())
+    }
+
+    async fn exists_exact_many(&self, keys: &[&str]) -> Result<Vec<bool>> {
+        let physical = keys
+            .iter()
+            .map(|key| self.canonical_key(key).map(|key| self.data_key(&key)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut values = Vec::with_capacity(keys.len());
+        // Bound server-side script work. Redis does not promise a snapshot
+        // across chunks; etcd provides the transactional implementation.
+        for chunk in physical.chunks(64) {
+            let mut command = ::redis::cmd("EVAL");
+            command.arg(EXISTS_EXACT).arg(chunk.len()).arg(chunk);
+            let found: Vec<bool> = self.query(command, "exact existence").await?;
+            values.extend(found);
+        }
+        Ok(values)
     }
 
     async fn list(&self, prefix: &str, recursive: bool) -> Result<Vec<String>> {

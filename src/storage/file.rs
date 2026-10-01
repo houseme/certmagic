@@ -350,6 +350,69 @@ fn spawn_heartbeat(path: PathBuf, owner: String, ct: CancellationToken) {
     });
 }
 
+/// Stage a complete private archive without touching the source. Publication
+/// is no-clobber, and the source is only unlinked after this worker is awaited.
+fn archive_move_source(key: &str, source: &Path, destination: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(source).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Error::Storage(StorageError::NotFound(key.into()))
+        } else {
+            error.into()
+        }
+    })?;
+    if !metadata.is_file() {
+        return Err(Error::Storage(StorageError::InvalidKey(key.into())));
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    copy_move_source(source, destination)
+}
+
+// Copy into a private sibling first (also works across devices), then publish the
+// completed value without clobbering a concurrently created destination. If
+// the destination filesystem cannot hard-link, fail with the source intact.
+fn copy_move_source(source: &Path, destination: &Path) -> Result<()> {
+    let mut input = std::fs::File::open(source)?;
+    if !input.metadata()?.is_file() {
+        return Err(Error::Storage(StorageError::Other(
+            "move source is not a regular file".into(),
+        )));
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        Error::Storage(StorageError::InvalidKey(
+            "move destination has no parent".into(),
+        ))
+    })?;
+    let temporary = parent.join(format!(
+        ".cm-move-{}-{}",
+        std::process::id(),
+        rand::rng().random::<u64>()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(&temporary)?;
+    let _cleanup = TempFileCleanup(Some(temporary.clone()));
+    let result = std::io::copy(&mut input, &mut output).and_then(|_| output.sync_all());
+    drop(output);
+    result?;
+    std::fs::hard_link(&temporary, destination).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Error::Storage(StorageError::Conflict(
+                "move destination already exists".into(),
+            ))
+        } else {
+            error.into()
+        }
+    })?;
+    Ok(())
+}
+
 #[async_trait]
 impl Storage for FileStorage {
     fn canonical_key<'a>(&self, key: &'a str) -> Result<std::borrow::Cow<'a, str>> {
@@ -401,6 +464,29 @@ impl Storage for FileStorage {
         }
     }
 
+    async fn move_key(&self, source: &str, destination: &str) -> Result<()> {
+        let source_key = self.canonical_key(source)?.into_owned();
+        let destination_key = self.canonical_key(destination)?;
+        if source_key == destination_key {
+            return Ok(());
+        }
+        let source = self.root.join(&source_key);
+        let destination = self.root.join(destination_key.as_ref());
+        // Only archive creation runs detached. If this future is cancelled
+        // before acknowledgement, its worker must not later unlink a source
+        // that a subsequent owner may already have replaced.
+        let archive_source = source.clone();
+        tokio::task::spawn_blocking(move || {
+            archive_move_source(&source_key, &archive_source, &destination)
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("file move worker failed: {error}")))??;
+        // An interrupted unlink has the usual filesystem I/O ambiguity. Keep
+        // the acknowledged archive, including when source removal fails.
+        tokio::fs::remove_file(source).await?;
+        Ok(())
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.checked_filename(key)?;
         match tokio::fs::metadata(&path).await {
@@ -417,6 +503,17 @@ impl Storage for FileStorage {
     async fn exists(&self, key: &str) -> Result<bool> {
         let path = self.checked_filename(key)?;
         Ok(tokio::fs::try_exists(&path).await?)
+    }
+
+    async fn exists_exact_many(&self, keys: &[&str]) -> Result<Vec<bool>> {
+        futures::future::try_join_all(keys.iter().map(|key| async move {
+            match tokio::fs::metadata(self.checked_filename(key)?).await {
+                Ok(metadata) => Ok(metadata.is_file()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error.into()),
+            }
+        }))
+        .await
     }
 
     async fn list(&self, prefix: &str, recursive: bool) -> Result<Vec<String>> {
@@ -562,6 +659,86 @@ mod tests {
                     .is_none()
             );
         });
+    }
+
+    #[tokio::test]
+    async fn exact_move_is_non_recursive_non_clobbering_and_alias_safe() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(directory.path());
+        storage.store("source/key", b"original").await.unwrap();
+        storage
+            .move_key("source/key", "/source/./key/")
+            .await
+            .unwrap();
+        assert_eq!(storage.load("source/key").await.unwrap(), b"original");
+        storage.store("archive/key", b"reserved").await.unwrap();
+        assert!(matches!(
+            storage.move_key("source/key", "archive/key").await,
+            Err(Error::Storage(StorageError::Conflict(_)))
+        ));
+        assert_eq!(storage.load("source/key").await.unwrap(), b"original");
+        assert_eq!(storage.load("archive/key").await.unwrap(), b"reserved");
+        assert!(storage.move_key("source", "archive/tree").await.is_err());
+        assert_eq!(storage.load("source/key").await.unwrap(), b"original");
+        storage
+            .move_key("source/key", "archive/moved")
+            .await
+            .unwrap();
+        assert!(!storage.exists("source/key").await.unwrap());
+        assert_eq!(storage.load("archive/moved").await.unwrap(), b"original");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let source = directory.path().join("imported");
+            std::fs::write(&source, b"imported key").unwrap();
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+            storage
+                .move_key("imported", "archive/private")
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::metadata(directory.path().join("archive/private"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn portable_move_copy_keeps_source_and_never_clobbers_an_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        std::fs::write(&source, b"original").unwrap();
+        copy_move_source(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        std::fs::write(&source, b"changed").unwrap();
+        assert!(matches!(
+            copy_move_source(&source, &destination),
+            Err(Error::Storage(StorageError::Conflict(_)))
+        ));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            2,
+            "owned temporary files must be reclaimed"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[tokio::test]

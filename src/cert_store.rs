@@ -70,6 +70,8 @@ pub trait CertStore: Send + Sync + std::fmt::Debug {
     async fn remove(&self, issuer_key: &str, domain: &str) -> Result<()>;
 
     /// Move only the private key to `destination_key`, removing the source key.
+    /// Existing destination values must not be overwritten. A canonical self
+    /// move is a no-op; descendants of the source must remain untouched.
     ///
     /// This is used before replacing a compromised certificate. Keeping it on
     /// the certificate-store trait prevents that safety-critical path from
@@ -106,6 +108,33 @@ impl KeyValueCertStore {
         &self.storage
     }
 
+    async fn save_resource(
+        &self,
+        issuer_key: &str,
+        domain: &str,
+        resource: &CertificateResource,
+        guard: Option<&LockGuard>,
+    ) -> Result<()> {
+        if let Some(guard) = guard {
+            self.validate_write_guard(guard)?;
+        }
+        let (certificate, private_key, metadata) = self.paths(issuer_key, domain);
+        let metadata_value = serde_json::to_vec(resource).map_err(|_| {
+            Error::Storage(StorageError::Other(
+                "certificate metadata encoding failed".into(),
+            ))
+        })?;
+        let items = [
+            (&*certificate, resource.certificate_pem.clone()),
+            (&*private_key, resource.private_key_pem.clone()),
+            (&*metadata, metadata_value),
+        ];
+        match guard {
+            Some(guard) => self.storage.store_tx_with_lock(&items, guard).await,
+            None => store_tx(self.storage.as_ref(), &items).await,
+        }
+    }
+
     fn paths(&self, issuer_key: &str, domain: &str) -> (String, String, String) {
         (
             STORAGE_KEYS.site_cert(issuer_key, domain),
@@ -128,22 +157,7 @@ impl CertStore for KeyValueCertStore {
         resource: &CertificateResource,
         guard: &LockGuard,
     ) -> Result<()> {
-        self.validate_write_guard(guard)?;
-        let (certificate, private_key, metadata) = self.paths(issuer_key, domain);
-        let metadata_value = serde_json::to_vec(resource).map_err(|_| {
-            Error::Storage(StorageError::Other(
-                "certificate metadata encoding failed".into(),
-            ))
-        })?;
-        self.storage
-            .store_tx_with_lock(
-                &[
-                    (&certificate, resource.certificate_pem.clone()),
-                    (&private_key, resource.private_key_pem.clone()),
-                    (&metadata, metadata_value),
-                ],
-                guard,
-            )
+        self.save_resource(issuer_key, domain, resource, Some(guard))
             .await
     }
 
@@ -192,26 +206,14 @@ impl CertStore for KeyValueCertStore {
         domain: &str,
         resource: &CertificateResource,
     ) -> Result<()> {
-        let (certificate_key, private_key_key, metadata_key) = self.paths(issuer_key, domain);
-        let metadata = serde_json::to_vec(resource).map_err(|error| {
-            Error::Storage(StorageError::Other(format!("meta encode: {error}")))
-        })?;
-        store_tx(
-            self.storage.as_ref(),
-            &[
-                (&certificate_key, resource.certificate_pem.clone()),
-                (&private_key_key, resource.private_key_pem.clone()),
-                (&metadata_key, metadata),
-            ],
-        )
-        .await
+        self.save_resource(issuer_key, domain, resource, None).await
     }
 
     async fn has(&self, issuer_key: &str, domain: &str) -> Result<bool> {
         let (certificate_key, private_key_key, metadata_key) = self.paths(issuer_key, domain);
         let values = self
             .storage
-            .exists_many(&[&certificate_key, &private_key_key, &metadata_key])
+            .exists_exact_many(&[&certificate_key, &private_key_key, &metadata_key])
             .await?;
         if values.len() != 3 {
             return Err(Error::Internal(
@@ -243,9 +245,9 @@ impl CertStore for KeyValueCertStore {
         destination_key: &str,
     ) -> Result<()> {
         let (_, private_key_key, _) = self.paths(issuer_key, domain);
-        let private_key = self.storage.load(&private_key_key).await?;
-        self.storage.store(destination_key, &private_key).await?;
-        self.storage.delete(&private_key_key).await
+        self.storage
+            .move_key(&private_key_key, destination_key)
+            .await
     }
 }
 
@@ -253,6 +255,22 @@ impl CertStore for KeyValueCertStore {
 mod tests {
     use super::*;
     use crate::storage::FileStorage;
+
+    #[tokio::test]
+    async fn has_requires_terminal_component_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = FileStorage::new(directory.path());
+        let keys = crate::storage::StorageKeys::new("issuer", "prefix.test");
+        for key in [&keys.cert, &keys.key, &keys.meta] {
+            storage
+                .store(&format!("{key}/child"), b"child")
+                .await
+                .unwrap();
+            assert!(storage.exists(key).await.unwrap());
+        }
+        let store = KeyValueCertStore::new(storage);
+        assert!(!store.has("issuer", "prefix.test").await.unwrap());
+    }
 
     #[tokio::test]
     async fn key_value_store_roundtrips_and_moves_private_key() {

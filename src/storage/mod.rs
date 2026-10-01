@@ -78,6 +78,9 @@ pub struct KeyInfo {
 /// - [`Storage::delete`] on a prefix removes everything under it.
 /// - [`Storage::exists`] is `true` for both terminal keys and prefixes.
 /// - [`Storage::load`] on a missing key yields [`StorageError::NotFound`].
+/// - [`Storage::exists_exact_many`] counts terminal values, not prefixes.
+/// - [`Storage::move_key`] moves only a terminal value and never overwrites
+///   another value; unsupported backends fail before mutating storage.
 #[async_trait]
 pub trait Storage: Locker {
     /// Canonical identity for a value or non-root prefix. Decorators use this
@@ -116,12 +119,20 @@ pub trait Storage: Locker {
     ) -> Result<()> {
         self.validate_write_guard(guard)?;
         guard.check_unfenced_write()?;
-        if source == destination {
-            return Ok(());
-        }
-        let value = self.load(source).await?;
-        self.store(destination, &value).await?;
-        self.delete(source).await
+        self.move_key(source, destination).await
+    }
+
+    /// Move one terminal value without overwriting an existing destination value or
+    /// deleting descendants. Moving to the same canonical key is a no-op.
+    /// Backends must implement this explicitly: prefix deletion is not a safe
+    /// substitute. Unsupported backends fail before changing either key.
+    /// Filesystem moves may leave both names after an interrupted operation;
+    /// callers must serialize competing mutations unless the backend fences them.
+    async fn move_key(&self, _source: &str, _destination: &str) -> Result<()> {
+        Err(Error::Storage(StorageError::Other(
+            "exact-key moves are not supported by this storage".into(),
+        ))
+        .no_retry())
     }
 
     /// Store `value` at `key`, creating or overwriting.
@@ -155,6 +166,19 @@ pub trait Storage: Locker {
     /// existence checks; transactional backends can provide a coherent view.
     async fn exists_many(&self, keys: &[&str]) -> Result<Vec<bool>> {
         futures::future::try_join_all(keys.iter().map(|key| self.exists(key))).await
+    }
+
+    /// Test terminal values only, preserving key order. Unlike exists_many,
+    /// virtual prefixes/directories do not count. The default uses load_many
+    /// to retain any snapshot guarantee; backends can avoid transferring values.
+    async fn exists_exact_many(&self, keys: &[&str]) -> Result<Vec<bool>> {
+        let values = self.load_many(keys).await?;
+        if values.len() != keys.len() {
+            return Err(Error::Internal(
+                "storage returned an invalid existence snapshot".into(),
+            ));
+        }
+        Ok(values.into_iter().map(|value| value.is_some()).collect())
     }
 
     /// List keys under `path`; recurse into children when `recursive`.

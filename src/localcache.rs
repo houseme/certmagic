@@ -255,6 +255,20 @@ impl Storage for LocalCache {
             .await
     }
 
+    async fn move_key(&self, source: &str, destination: &str) -> Result<()> {
+        let source = self.canonical_key(source)?;
+        let destination = self.canonical_key(destination)?;
+        let _prefix = self.prefixes.write().await;
+        self.forget(&source, false);
+        self.forget(&destination, false);
+        self.inner.move_key(&source, &destination).await
+    }
+
+    async fn exists_exact_many(&self, keys: &[&str]) -> Result<Vec<bool>> {
+        let _prefix = self.prefixes.read().await;
+        self.inner.exists_exact_many(keys).await
+    }
+
     async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
         let key = self.canonical_key(key)?;
         let key = key.as_ref();

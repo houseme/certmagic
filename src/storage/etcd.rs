@@ -311,6 +311,127 @@ impl EtcdStorage {
             result.extend_from_slice(page);
         }
     }
+    async fn existence(&self, keys: &[&str], include_prefixes: bool) -> Result<Vec<bool>> {
+        if keys.len() > MAX_BATCH {
+            return Err(other("etcd existence batch exceeds 64 keys"));
+        }
+        let expected = keys.len() * if include_prefixes { 2 } else { 1 };
+        let mut operations = Vec::with_capacity(expected);
+        for key in keys {
+            let key = self.canonical_key(key)?;
+            operations.push(TxnOp::get(
+                self.data_key(&key)?,
+                Some(GetOptions::new().with_count_only()),
+            ));
+            if include_prefixes {
+                operations.push(TxnOp::get(
+                    self.child_prefix(&key),
+                    Some(
+                        GetOptions::new()
+                            .with_prefix()
+                            .with_limit(1)
+                            .with_keys_only(),
+                    ),
+                ));
+            }
+        }
+        let mut client = self.inner.client.clone();
+        let response = rpc(
+            self.inner.options.operation_timeout,
+            "existence snapshot",
+            client.txn(Txn::new().and_then(operations)),
+        )
+        .await?;
+        let values = response
+            .op_responses()
+            .into_iter()
+            .map(|response| match response {
+                etcd_client::TxnOpResponse::Get(range) => Ok(range.count() > 0),
+                _ => Err(other("unexpected etcd existence response")),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if values.len() != expected {
+            return Err(other("invalid etcd existence response length"));
+        }
+        if include_prefixes {
+            Ok(values
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| pair[0] || pair[1])
+                .collect())
+        } else {
+            Ok(values)
+        }
+    }
+
+    async fn move_value(
+        &self,
+        source: &str,
+        destination: &str,
+        lease: Option<&Lease>,
+    ) -> Result<()> {
+        let source = self.data_key(source)?;
+        let destination = self.data_key(destination)?;
+        if source == destination {
+            return match lease {
+                Some(lease) => self.put_batch(&[], lease).await,
+                None => Ok(()),
+            };
+        }
+        let mut client = self.inner.client.clone();
+        let response = rpc(
+            self.inner.options.operation_timeout,
+            "read move source",
+            client.get(source.as_bytes(), None),
+        )
+        .await?;
+        let value = response
+            .kvs()
+            .first()
+            .ok_or_else(|| Error::Storage(StorageError::NotFound("move source".into())))?;
+        decode(value.value())?;
+        let compares = vec![
+            Compare::mod_revision(source.as_bytes(), CompareOp::Equal, value.mod_revision()),
+            Compare::version(destination.as_bytes(), CompareOp::Equal, 0),
+        ];
+        let mutation = Txn::new().when(compares).and_then(vec![
+            TxnOp::put(destination, value.value().to_vec(), None),
+            TxnOp::delete(source, None),
+        ]);
+        let transaction = match lease {
+            Some(lease) => Txn::new()
+                .when(lease.compares()?)
+                .and_then(vec![TxnOp::txn(mutation)]),
+            None => mutation,
+        };
+        let response = rpc(
+            self.inner.options.operation_timeout,
+            "move exact key",
+            client.txn(transaction),
+        )
+        .await?;
+        let moved = if let Some(lease) = lease {
+            if !response.succeeded() {
+                lease.lose();
+                return Err(stale(&lease.name));
+            }
+            match response.op_responses().into_iter().next() {
+                Some(etcd_client::TxnOpResponse::Txn(result)) => result.succeeded(),
+                _ => return Err(other("unexpected etcd move response")),
+            }
+        } else {
+            response.succeeded()
+        };
+        if moved {
+            Ok(())
+        } else {
+            Err(Error::Storage(StorageError::Conflict(
+                "move source changed or destination already exists".into(),
+            )))
+        }
+    }
+
     async fn put_batch(&self, items: &[KeyValue<'_>], lease: &Lease) -> Result<()> {
         let mut keys = HashSet::new();
         let mut bytes = 0_usize;
@@ -364,50 +485,11 @@ impl Storage for EtcdStorage {
         destination: &str,
         guard: &LockGuard,
     ) -> Result<()> {
-        let lease = self.lease(guard)?;
-        let source = self.data_key(source)?;
-        let destination = self.data_key(destination)?;
-        if source == destination {
-            return self.put_batch(&[], lease).await;
-        }
-        let mut client = self.inner.client.clone();
-        let response = rpc(
-            self.inner.options.operation_timeout,
-            "read move source",
-            client.get(source.as_bytes(), None),
-        )
-        .await?;
-        let value = response
-            .kvs()
-            .first()
-            .ok_or_else(|| Error::Storage(StorageError::NotFound("move source".into())))?;
-        let mut compares = lease.compares()?;
-        compares.push(Compare::mod_revision(
-            source.as_bytes(),
-            CompareOp::Equal,
-            value.mod_revision(),
-        ));
-        compares.push(Compare::version(
-            destination.as_bytes(),
-            CompareOp::Equal,
-            0,
-        ));
-        let response = rpc(
-            self.inner.options.operation_timeout,
-            "guarded move",
-            client.txn(Txn::new().when(compares).and_then(vec![
-                TxnOp::put(destination, encode(decode(value.value())?.1)?, None),
-                TxnOp::delete(source, None),
-            ])),
-        )
-        .await?;
-        if !response.succeeded() {
-            // Fail closed for either lost ownership or an unexpected source/
-            // archive modification. Do not blindly retry a destructive move.
-            lease.lose();
-            return Err(stale(&lease.name));
-        }
-        Ok(())
+        self.move_value(source, destination, Some(self.lease(guard)?))
+            .await
+    }
+    async fn move_key(&self, source: &str, destination: &str) -> Result<()> {
+        self.move_value(source, destination, None).await
     }
     async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
         let mut client = self.inner.client.clone();
@@ -463,47 +545,11 @@ impl Storage for EtcdStorage {
     }
 
     async fn exists_many(&self, keys: &[&str]) -> Result<Vec<bool>> {
-        if keys.len() > MAX_BATCH {
-            return Err(other("etcd existence batch exceeds 64 keys"));
-        }
-        let mut operations = Vec::with_capacity(keys.len() * 2);
-        for key in keys {
-            let key = self.canonical_key(key)?;
-            operations.push(TxnOp::get(
-                self.data_key(&key)?,
-                Some(GetOptions::new().with_count_only()),
-            ));
-            operations.push(TxnOp::get(
-                self.child_prefix(&key),
-                Some(
-                    GetOptions::new()
-                        .with_prefix()
-                        .with_limit(1)
-                        .with_keys_only(),
-                ),
-            ));
-        }
-        let mut client = self.inner.client.clone();
-        let response = rpc(
-            self.inner.options.operation_timeout,
-            "existence snapshot",
-            client.txn(Txn::new().and_then(operations)),
-        )
-        .await?;
-        let values = response
-            .op_responses()
-            .into_iter()
-            .map(|response| match response {
-                etcd_client::TxnOpResponse::Get(range) => Ok(range.count() > 0),
-                _ => Err(other("unexpected etcd existence response")),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(values
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| pair[0] || pair[1])
-            .collect())
+        self.existence(keys, true).await
+    }
+
+    async fn exists_exact_many(&self, keys: &[&str]) -> Result<Vec<bool>> {
+        self.existence(keys, false).await
     }
 
     async fn delete(&self, key: &str) -> Result<()> {

@@ -265,6 +265,21 @@ async fn guarded_defaults_reject_unknown_proofs_without_calling_legacy_mutations
     );
     assert_eq!(store.0.load(Ordering::SeqCst), 0);
     let legacy = LockGuard::new("legacy", Box::new(WriteProof(false)));
+    assert!(
+        backend
+            .move_key("source", "destination")
+            .await
+            .unwrap_err()
+            .has_no_retry()
+    );
+    assert!(
+        backend
+            .move_with_lock("source", "destination", &legacy)
+            .await
+            .unwrap_err()
+            .has_no_retry()
+    );
+
     store
         .save_with_lock("issuer", "domain", &Default::default(), &legacy)
         .await

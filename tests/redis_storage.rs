@@ -776,3 +776,71 @@ async fn failed_release_keeps_ownership_available_for_explicit_retry() {
     );
     guard.release_and_wait().await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires local redis-server; starts an isolated instance"]
+async fn exact_move_preserves_children() {
+    let server = Server::start().await;
+    let storage = server.storage("exact-move").await;
+    storage.store("source", b"parent").await.unwrap();
+    storage.store("source/child", b"child").await.unwrap();
+    let guard = storage
+        .lock(&CancellationToken::new(), "move")
+        .await
+        .unwrap();
+    storage
+        .move_with_lock("source", "archive", &guard)
+        .await
+        .unwrap();
+    assert_eq!(storage.load("archive").await.unwrap(), b"parent");
+    assert_eq!(storage.load("source/child").await.unwrap(), b"child");
+    storage.store("next", b"next").await.unwrap();
+    assert!(matches!(
+        storage.move_key("next", "archive").await,
+        Err(certmagic::Error::Storage(
+            certmagic::error::StorageError::Conflict(_)
+        ))
+    ));
+    assert_eq!(storage.load("next").await.unwrap(), b"next");
+    assert_eq!(storage.load("archive").await.unwrap(), b"parent");
+
+    guard.release_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires local redis-server; starts an isolated instance"]
+async fn private_key_move_to_its_alias_is_non_destructive() {
+    use certmagic::cert_store::{CertStore, KeyValueCertStore};
+    let server = Server::start().await;
+    let storage = server.storage("self-move").await;
+    let source = certmagic::storage::site_private_key("issuer", "example.test");
+    storage.store(&source, b"private-key").await.unwrap();
+    let store = KeyValueCertStore::new(storage.clone());
+    store
+        .move_private_key("issuer", "example.test", &format!("/{source}/"))
+        .await
+        .unwrap();
+    assert_eq!(storage.load(&source).await.unwrap(), b"private-key");
+}
+
+#[tokio::test]
+#[ignore = "requires local redis-server; starts an isolated instance"]
+async fn certificate_presence_rejects_prefix_only_records() {
+    use certmagic::cert_store::{CertStore, KeyValueCertStore};
+    let server = Server::start().await;
+    let storage = server.storage("terminal-presence").await;
+    let keys = certmagic::StorageKeys::new("issuer", "prefix.test");
+    for key in [&keys.cert, &keys.key, &keys.meta] {
+        storage
+            .store(&format!("{key}/child"), b"child")
+            .await
+            .unwrap();
+        assert!(storage.exists(key).await.unwrap());
+    }
+    let store = KeyValueCertStore::new(storage);
+    assert!(
+        !store.has("issuer", "prefix.test").await.unwrap(),
+        "prefixes are not certificate component values"
+    );
+    assert!(store.load("issuer", "prefix.test").await.unwrap().is_none());
+}

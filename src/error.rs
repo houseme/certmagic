@@ -111,6 +111,10 @@ pub enum StorageError {
     #[error("destination does not support this lock's write fence")]
     UnsupportedFencing,
 
+    /// A move destination exists or the source changed before commit.
+    #[error("storage conflict: {0}")]
+    Conflict(String),
+
     /// Underlying I/O failure (message preserved; kind lost across clone).
     #[error("io: {0}")]
     Io(String),
