@@ -9,16 +9,19 @@ all-features = true
 version = 2
 confidence-threshold = 0.93
 allow = [
-  "Apache-2.0",
-  "MIT",
-  "BSD-2-Clause",
-  "BSD-3-Clause",
-  "ISC",
-  "Unicode-3.0",
-  "Unicode-DFS-2016",
-  "Zlib",
-  # License for webpki-roots 0.26+ root certificate data.
-  "CDLA-Permissive-2.0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0", # boost; tracing-related crates
+    "CC0-1.0",
+    "CDLA-Permissive-2.0", # webpki / linux-raw-sys metadata / License for webpki-roots 0.26+ root certificate data.
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
 ]
 
 # ring uses a non-standard SPDX declaration (OpenSSL-derived terms); clarify
