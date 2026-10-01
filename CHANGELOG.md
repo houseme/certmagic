@@ -81,6 +81,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Replace the deprecated atomic fetch_update call with try_update, preserving
+  lock-release ordering while keeping strict stable/nightly lint checks compatible.
 - Include in-flight backend attempts in try-lock timeouts and reject overflowing
   timeout durations without panicking.
 - Preserve source descendants and canonical self aliases when moving private

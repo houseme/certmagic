@@ -158,7 +158,7 @@ impl ReleaseState {
     fn request(&self) {
         if self
             .phase
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |phase| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |phase| {
                 (phase < FALLBACK_REQUESTED).then_some(FALLBACK_REQUESTED)
             })
             .is_ok()
