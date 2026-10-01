@@ -123,6 +123,51 @@ fn main() {
         .unwrap_or(5usize)
         .max(1);
     println!("case,sample,iterations,elapsed_ns,ns_per_operation");
+    if std::env::var_os("CERTMAGIC_BENCH_GUARDED_ONLY").is_some() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = LocalCache::new(Arc::new(MemoryStorage {
+            latency: Duration::from_millis(1),
+            ..Default::default()
+        }));
+        let keys: Vec<_> = (0..8).map(|index| format!("key{index}")).collect();
+        let guards: Vec<_> = keys
+            .iter()
+            .map(|key| LockGuard::new(key.clone(), Box::new(NoopRelease)))
+            .collect();
+        let batches: Vec<_> = keys
+            .iter()
+            .map(|key| vec![(key.as_str(), b"updated".to_vec())])
+            .collect();
+        let iterations = std::env::var("CERTMAGIC_BENCH_GUARDED_ITERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10usize)
+            .max(1);
+        for shared in [false, true] {
+            let name = if shared {
+                "guarded_8_same_key_1ms"
+            } else {
+                "guarded_8_independent_keys_1ms"
+            };
+            measure(name, iterations, samples, || {
+                runtime.block_on(async {
+                    let writes = (0..8).map(|index| {
+                        local.store_tx_with_lock(
+                            &batches[if shared { 0 } else { index }],
+                            &guards[index],
+                        )
+                    });
+                    for result in futures::future::join_all(writes).await {
+                        result.unwrap();
+                    }
+                });
+            });
+        }
+        return;
+    }
     #[cfg(feature = "file-storage")]
     if std::env::var_os("CERTMAGIC_BENCH_STORAGE_ONLY").is_some() {
         let file_iterations = std::env::var("CERTMAGIC_BENCH_FILE_ITERS")

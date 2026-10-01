@@ -205,3 +205,85 @@ reuse. For a zero-latency in-memory backend with frequent writes, this is a real
 tradeoff. It does not erase the large independent-I/O concurrency benefit, nor
 justify describing this design as universally optimal. No live Redis, filesystem
 or TLS-handshake throughput speedup is inferred from these microbenchmarks.
+
+## Guarded-operation review (2026-10-01)
+
+This review covered the seven commits `cd91fc3..221c8fe` together. Compiler and
+strict Clippy checks passed before review; the failures below were behavioral.
+The original single certificate read/write lock, acquisition-scoped cleanup,
+backend lease state machines and etcd publication fence remain in place.
+Authoritative grouped reads still bypass per-key cached generations.
+
+### Findings and resolution
+
+- **Exact values and prefixes were conflated.** The default guarded move used
+  recursive delete, removing descendants of a Redis source. The legacy private-key
+  move could also delete itself when destination and source were canonical aliases.
+  Storage now provides an explicit no-clobber `move_key` primitive; guarded and
+  legacy entry points share native backend implementations. Certificate presence
+  uses `exists_exact_many`, since virtual prefixes are not certificate components.
+  Existing prefix-aware existence/list/delete behavior is preserved.
+- **Grouped operations reintroduced global serialization.** LocalCache guarded
+  writes and moves held the prefix writer across backend I/O. Groups now acquire
+  existing per-key gates in canonical sorted order. This permits disjoint I/O,
+  serializes overlapping groups and avoids reverse-order/alias deadlocks. Group
+  reads/existence checks follow the same ordering; prefix deletion retains the
+  exclusive barrier. Cancellation releases partially acquired gates.
+- **Try-lock deadlines excluded backend calls.** A pending try_lock could wait
+  forever, and Duration::MAX could panic. One checked deadline now covers both
+  backend attempts and retry delays, with the existing cancellation/TTL fallback.
+- **Etcd data conflicts were classified as lease loss.** Nested transaction
+  comparisons now separate ownership from source/destination conditions. A data
+  conflict returns StorageError::Conflict without revoking valid ownership; stale
+  owners still fail before any mutation in that same transaction.
+
+Six focused failures were reproduced before their fixes: descendant deletion,
+self-alias deletion, prefix-only resource presence, blocked independent writes,
+an unbounded in-flight try-lock and timeout overflow. Follow-up coverage also
+checks archive collisions, retained etcd ownership, overlapping/reversed groups,
+cancellation, filesystem directory rejection, temporary-file cleanup and private
+archive permissions. FileStorage always stages a complete owner-only copy before
+no-clobber publication; it does not expose a partially copied destination or
+inherit overly broad permissions from imported files. Destination filesystems
+without hard links fail with the source intact. Cross-file crash atomicity and
+cancellation of already dispatched I/O are not claimed.
+
+The final all-feature regression passed 248 unit tests plus integrations and
+doctests. The final filesystem implementation passed its 23 focused tests.
+Explicit Redis testing passed 20 cases. Three-node etcd failure/recovery and
+mutual-TLS tests passed separately under AWS-LC and Ring; custom-backend and
+timeout testing passed seven cases. Strict Clippy/rustdoc, formatting and typo
+checks passed. Runtime resource cleanup is checked after the integration lanes.
+
+### Focused performance evidence
+
+```sh
+CERTMAGIC_BENCH_GUARDED_ONLY=1 CERTMAGIC_BENCH_GUARDED_ITERS=10 \
+CERTMAGIC_BENCH_SAMPLES=5 cargo bench --locked --bench cache_paths \
+  --no-default-features --features ring,file-storage,local-cache
+```
+
+Baseline is **221c8fe plus the identical extended driver**; candidate is this
+refactor. Saved binaries use the same lockfile, Rust 1.98.1, macOS/aarch64 and
+optimized profile/features. They run in A1–B1–B2–A2 order, with no other builds or
+tests from this task during measurement. Each phase has five samples of ten
+batches after ten warm-up batches. Values average the two phase medians; absolute
+baseline drift must stay below 10%, and effects below 5% are treated as unchanged.
+
+Each batch submits eight guarded single-key writes. The memory backend injects
+1 ms into each load and store, so the generic compensated write includes both
+operations; Tokio scheduling makes wall time exceed the injected duration.
+Guards are inert test contexts: this measures LocalCache coordination, not real
+network lock throughput. The same-key control must continue to serialize.
+Raw samples are in [guarded-groups-abba.csv](results/guarded-groups-abba.csv).
+
+| Case | Baseline batch time | Candidate batch time | Time change | Baseline drift |
+| --- | ---: | ---: | ---: | ---: |
+| `guarded_8_independent_keys_1ms` | 36.169 ms | 4.560 ms | -87.39% | +0.03% |
+| `guarded_8_same_key_1ms` | 36.106 ms | 36.149 ms | +0.12% | -0.05% |
+
+The disjoint case improves by about eightfold; the same-key control remains
+unchanged. This result does not claim universal optimality, zero coordination
+cost on an in-memory backend, or an equivalent Redis/etcd/TLS throughput gain.
+The earlier pure-memory write tradeoff remains documented above. No new
+application dependency or storage wire-format migration is introduced.

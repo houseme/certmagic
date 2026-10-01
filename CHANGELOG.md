@@ -8,6 +8,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Add focused guarded-group benchmarks and publish ABBA samples, same-key
+  controls, review findings and verification boundaries.
 - Add explicit exact-value existence checks and non-overwriting exact-key moves.
   Custom storage backends without move support fail before mutating either key.
 - Add optional `etcd-storage` using etcd-client 0.20 with namespaced binary
