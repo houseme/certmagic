@@ -35,6 +35,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Coordinate LocalCache grouped reads, existence checks, writes and moves through
+  canonical sorted key gates; reserve the exclusive global barrier for prefix deletion.
 - Share certificate-resource write preparation and backend move implementations
   between guarded and legacy entry points.
 - Use etcd transactions for complete-resource reads and existence snapshots.

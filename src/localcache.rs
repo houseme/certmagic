@@ -138,6 +138,42 @@ impl LocalCache {
         gate
     }
 
+    fn group_gates<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<Arc<KeyGate>>> {
+        let mut keys = keys
+            .into_iter()
+            .map(|key| self.canonical_key(key))
+            .collect::<Result<Vec<_>>>()?;
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys.iter().map(|key| self.key_gate(key)).collect())
+    }
+
+    async fn move_value(
+        &self,
+        source: &str,
+        destination: &str,
+        guard: Option<&LockGuard>,
+    ) -> Result<()> {
+        if let Some(guard) = guard {
+            self.validate_write_guard(guard)?;
+        }
+        let _prefix = self.prefixes.read().await;
+        let gates = self.group_gates([source, destination])?;
+        let _keys = lock_group(&gates).await;
+        if gates.len() > 1 {
+            for gate in &gates {
+                self.forget(&gate.key, false);
+            }
+        }
+        match guard {
+            Some(guard) => self.inner.move_with_lock(source, destination, guard).await,
+            None => self.inner.move_key(source, destination).await,
+        }
+    }
+
     fn cached(&self, key: &str) -> Option<Vec<u8>> {
         self.cache
             .lock()
@@ -192,6 +228,15 @@ struct KeyGate {
     operation: tokio::sync::Mutex<()>,
 }
 
+/// Canonical sorted order prevents AB/BA deadlocks between overlapping groups.
+async fn lock_group(gates: &[Arc<KeyGate>]) -> Vec<tokio::sync::MutexGuard<'_, ()>> {
+    let mut locks = Vec::with_capacity(gates.len());
+    for gate in gates {
+        locks.push(gate.operation.lock().await);
+    }
+    locks
+}
+
 impl Drop for KeyGate {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade() {
@@ -225,13 +270,11 @@ impl Storage for LocalCache {
         guard: &LockGuard,
     ) -> Result<()> {
         self.validate_write_guard(guard)?;
-        let keys: Vec<_> = items
-            .iter()
-            .map(|(key, _)| self.canonical_key(key))
-            .collect::<Result<_>>()?;
-        let _prefix = self.prefixes.write().await;
-        for key in keys {
-            self.forget(&key, false);
+        let _prefix = self.prefixes.read().await;
+        let gates = self.group_gates(items.iter().map(|(key, _)| *key))?;
+        let _keys = lock_group(&gates).await;
+        for gate in &gates {
+            self.forget(&gate.key, false);
         }
         // Delegate the entire transaction; individual store calls would lose
         // the ownership comparison and atomic publication guarantee.
@@ -244,29 +287,11 @@ impl Storage for LocalCache {
         destination: &str,
         guard: &LockGuard,
     ) -> Result<()> {
-        self.validate_write_guard(guard)?;
-        let source = self.canonical_key(source)?;
-        let destination = self.canonical_key(destination)?;
-        let _prefix = self.prefixes.write().await;
-        self.forget(&source, false);
-        self.forget(&destination, false);
-        self.inner
-            .move_with_lock(&source, &destination, guard)
-            .await
+        self.move_value(source, destination, Some(guard)).await
     }
 
     async fn move_key(&self, source: &str, destination: &str) -> Result<()> {
-        let source = self.canonical_key(source)?;
-        let destination = self.canonical_key(destination)?;
-        let _prefix = self.prefixes.write().await;
-        self.forget(&source, false);
-        self.forget(&destination, false);
-        self.inner.move_key(&source, &destination).await
-    }
-
-    async fn exists_exact_many(&self, keys: &[&str]) -> Result<Vec<bool>> {
-        let _prefix = self.prefixes.read().await;
-        self.inner.exists_exact_many(keys).await
+        self.move_value(source, destination, None).await
     }
 
     async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
@@ -307,6 +332,8 @@ impl Storage for LocalCache {
         // Mixing cached generations would destroy an inner backend's snapshot
         // guarantee. Bundle reads go to the authoritative backend together.
         let _prefix = self.prefixes.read().await;
+        let gates = self.group_gates(keys.iter().copied())?;
+        let _keys = lock_group(&gates).await;
         self.inner.load_many(keys).await
     }
 
@@ -323,7 +350,17 @@ impl Storage for LocalCache {
     }
 
     async fn exists_many(&self, keys: &[&str]) -> Result<Vec<bool>> {
+        let _prefix = self.prefixes.read().await;
+        let gates = self.group_gates(keys.iter().copied())?;
+        let _keys = lock_group(&gates).await;
         self.inner.exists_many(keys).await
+    }
+
+    async fn exists_exact_many(&self, keys: &[&str]) -> Result<Vec<bool>> {
+        let _prefix = self.prefixes.read().await;
+        let gates = self.group_gates(keys.iter().copied())?;
+        let _keys = lock_group(&gates).await;
+        self.inner.exists_exact_many(keys).await
     }
 
     async fn list(&self, prefix: &str, recursive: bool) -> Result<Vec<String>> {
@@ -538,6 +575,93 @@ mod tests {
         assert!(local.load("dir/key").await.is_err());
         assert!(local.cache.lock().unwrap().values.is_empty());
         assert!(local.keys.lock().unwrap().is_empty());
+    }
+
+    struct NoopRelease;
+    impl crate::storage::LockRelease for NoopRelease {
+        fn release(&self) {}
+    }
+
+    #[tokio::test]
+    async fn grouped_write_does_not_block_unrelated_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let inner = FileStorage::new(directory.path());
+        inner.store("slow", b"old").await.unwrap();
+        let backend = Arc::new(PausedReadStorage {
+            inner,
+            read_started: tokio::sync::Notify::new(),
+            resume: tokio::sync::Semaphore::new(0),
+        });
+        let local = LocalCache::new(backend.clone());
+        let guard = LockGuard::new("test-write", Box::new(NoopRelease));
+        let items = [("slow", b"new".to_vec())];
+        let mut slow = Box::pin(local.store_tx_with_lock(&items, &guard));
+        tokio::select! {
+            result = &mut slow => panic!("operation unexpectedly completed: {result:?}"),
+            () = backend.read_started.notified() => {}
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            local.store("independent", b"ready"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        backend.resume.add_permits(1);
+        slow.await.unwrap();
+        backend.resume.add_permits(1);
+        assert_eq!(local.load("slow").await.unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn overlapping_groups_take_canonical_keys_in_one_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let local = LocalCache::new(FileStorage::new(directory.path()));
+        let a = LockGuard::new("a", Box::new(NoopRelease));
+        let b = LockGuard::new("b", Box::new(NoopRelease));
+        let first = [("dir/a", b"first".to_vec()), ("dir/b", b"first".to_vec())];
+        let second = [
+            ("dir/./b", b"second".to_vec()),
+            ("dir//a", b"second".to_vec()),
+        ];
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (first, second) = tokio::join!(
+                local.store_tx_with_lock(&first, &a),
+                local.store_tx_with_lock(&second, &b)
+            );
+            first.unwrap();
+            second.unwrap();
+        })
+        .await
+        .unwrap();
+        let values = local.load_many(&["dir/a", "dir/b"]).await.unwrap();
+        assert_eq!(
+            values[0], values[1],
+            "overlapping writes must not interleave"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_group_releases_partially_acquired_gates() {
+        let directory = tempfile::tempdir().unwrap();
+        let local = LocalCache::new(FileStorage::new(directory.path()));
+        let b = local.key_gate("b");
+        let held_b = b.operation.lock().await;
+        let guard = LockGuard::new("test", Box::new(NoopRelease));
+        let items = [("a", b"a".to_vec()), ("b", b"b".to_vec())];
+        let mut grouped = Box::pin(local.store_tx_with_lock(&items, &guard));
+        assert!(futures::poll!(&mut grouped).is_pending());
+        drop(grouped);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            local.store("a", b"unblocked"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(held_b);
+        drop(b);
+        assert_eq!(local.keys.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

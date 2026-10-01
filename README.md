@@ -211,7 +211,9 @@ automatic registration; dropping an unrelated same-name guard no longer removes
 manual ownership. Prefer the automatic acquisition helpers for new adapters.
 
 LocalCache serves hits without awaiting backend operations and serializes
-misses/writes per canonical key. Prefix deletion excludes fills and writes;
+misses/writes per canonical key. Grouped reads, writes and moves acquire the
+same gates in canonical sorted order, so independent groups overlap and
+reversed/aliased key lists cannot deadlock. Prefix deletion excludes these operations;
 concurrent misses for one key share the resulting fill. Cached entries retain
 and reuse their key gates; eviction or the last in-flight operation reclaims
 unused gates. Custom backends with aliases should override
