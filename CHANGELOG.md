@@ -77,6 +77,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Include in-flight backend attempts in try-lock timeouts and reject overflowing
+  timeout durations without panicking.
 - Preserve source descendants and canonical self aliases when moving private
   keys, and refuse to overwrite an existing archive destination.
 - Count only terminal certificate/key/metadata values when checking resource

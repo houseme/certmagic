@@ -290,3 +290,40 @@ async fn guarded_defaults_reject_unknown_proofs_without_calling_legacy_mutations
         .unwrap();
     assert_eq!(store.0.load(Ordering::SeqCst), 2);
 }
+
+#[derive(Debug)]
+struct PendingLocker;
+#[async_trait]
+impl Locker for PendingLocker {
+    async fn lock(&self, _: &CancellationToken, _: &str) -> Result<LockGuard> {
+        std::future::pending().await
+    }
+    async fn try_lock(&self, _: &CancellationToken, _: &str) -> Result<Option<LockGuard>> {
+        std::future::pending().await
+    }
+    async fn unlock(&self, _: &str) -> Result<()> {
+        Ok(())
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn bounded_try_lock_includes_the_inflight_backend_attempt() {
+    use std::time::Duration;
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        PendingLocker.try_lock_with_timeout("pending", Duration::from_millis(10)),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Ok(None))),
+        "backend calls must share the caller's deadline"
+    );
+}
+#[tokio::test]
+async fn bounded_try_lock_rejects_overflow_instead_of_panicking() {
+    assert!(
+        PendingLocker
+            .try_lock_with_timeout("overflow", std::time::Duration::MAX)
+            .await
+            .is_err()
+    );
+}

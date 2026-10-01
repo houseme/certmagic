@@ -47,20 +47,26 @@ pub trait Locker: Send + Sync + Debug {
     ///
     /// Backends keep their existing non-blocking [`Locker::try_lock`]
     /// implementation; this default method retries it with a small bounded
-    /// delay. `Ok(None)` means the timeout elapsed while another owner held
-    /// the lock. Unsupported backends still return their original error.
+    /// delay. The deadline covers in-flight attempts as well as retry waits.
+    /// `Ok(None)` means acquisition did not complete within the budget.
+    /// Unsupported backends still return their original error.
     async fn try_lock_with_timeout(
         &self,
         name: &str,
         timeout: Duration,
     ) -> Result<Option<LockGuard>> {
         const RETRY_INTERVAL: Duration = Duration::from_millis(25);
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::Storage(StorageError::Other("lock timeout overflow".into())))?;
         let ct = CancellationToken::new();
 
         loop {
-            if let Some(guard) = self.try_lock(&ct, name).await? {
-                return Ok(Some(guard));
+            match tokio::time::timeout_at(deadline, self.try_lock(&ct, name)).await {
+                Ok(Ok(Some(guard))) => return Ok(Some(guard)),
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Ok(None),
             }
 
             let now = tokio::time::Instant::now();

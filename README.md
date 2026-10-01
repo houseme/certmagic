@@ -239,6 +239,10 @@ transaction. Redis uses one atomic rename script; etcd uses revision comparisons
 Guarded etcd moves distinguish data conflicts from lost ownership inside one
 transaction, keeping a valid lease available after an archive conflict.
 
+Try-lock timeout budgets cover backend attempts as well as retry sleeps. Like
+other async deadlines, cancellation is cooperative and cannot retract a command
+already dispatched to a backend; expiring leases remain the recovery mechanism.
+
 Certificate/private-key resources can use an independent `CertStore` through
 `ConfigBuilder::cert_store`; accounts, challenge publications, locks and OCSP
 remain on `Storage`. A transactional database or a versioned object bundle can
