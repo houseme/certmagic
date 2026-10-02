@@ -109,6 +109,8 @@ pub type CertCache = Cache;
 pub use acme::acme_issuer::ChainPreference;
 #[cfg(feature = "remote-cert-store")]
 pub use cert_store::remote::{ImmutableBlobStore, RemoteCertStore};
+#[cfg(feature = "s3-cert-store")]
+pub use cert_store::s3::{S3BlobStore, S3BlobStoreOptions, S3CertStore};
 pub use cert_store::{CertStore, KeyValueCertStore};
 pub use certificate::{
     Certificate, RenewalInfo, RenewalWindow, cert_needs_renewal, currently_in_renewal_window,

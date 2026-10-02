@@ -12,6 +12,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   certificate blobs, bounded encoding and coordinated reference publication.
   Guarded publication and private-key archival preserve the originating etcd
   coordinator's fencing; interrupted uploads never trigger unsafe blob cleanup.
+- Add optional `s3-cert-store` with conditional object creation, bounded streamed
+  reads, caller-configured SDK clients and explicit missing-bucket/error handling.
 
 - Add focused guarded-group benchmarks and publish ABBA samples, same-key
   controls, review findings and verification boundaries.
