@@ -104,6 +104,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Build the isolated MinIO test image from a fixed official source commit,
+  replacing the unavailable community image that prevented CI service tests
+  and package verification from running.
+
 - Redact malformed certificate metadata from decoding errors and reject remote
   metadata nesting that cannot be decoded before uploading or publishing it.
 

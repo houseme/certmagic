@@ -397,10 +397,13 @@ certificates: [`s3_cert_store`](examples/s3_cert_store.rs),
 [`secrets_manager_cert_store`](examples/secrets_manager_cert_store.rs).
 Compile with the corresponding adapter feature plus `etcd-storage` (requires
 `protoc`). Protocol tests use loopback mocks; explicit Docker tests use isolated
-MinIO, Vault dev mode and LocalStack, never production credentials:
+MinIO, Vault dev mode and LocalStack, never production credentials. MinIO's
+[community distribution is source-only](https://github.com/minio/minio#source-only-distribution);
+the test Dockerfile builds the official release's fixed commit instead of
+pulling the unavailable upstream image:
 
 ```sh
-docker pull minio/minio:RELEASE.2025-09-07T16-13-09Z
+docker build -f tests/support/minio.Dockerfile -t certmagic-minio-test:07c3a429 tests/support
 docker pull hashicorp/vault:1.21.0
 docker pull localstack/localstack:4.14.0
 cargo test --locked --no-default-features \

@@ -340,7 +340,8 @@ S3/Vault 限制下载响应大小；Secrets Manager 在 SDK 解码 JSON 后检�
 示例 [S3](examples/s3_cert_store.rs)、[Vault](examples/vault_cert_store.rs)、
 [Secrets Manager](examples/secrets_manager_cert_store.rs) 共享 etcd 协调实例，运行时不签发证书；
 编译需启用对应适配器和 `etcd-storage` 并安装 `protoc`。协议测试使用本地 mock；显式集成测试
-使用独立 MinIO、Vault dev 和 LocalStack 容器，不访问生产服务。运行命令见英文 README 的
+使用独立 MinIO、Vault dev 和 LocalStack 容器，不访问生产服务。MinIO 测试镜像从固定
+官方源码提交构建，避免依赖已不可用的上游镜像。运行命令见英文 README 的
 [远程证书存储](README.md#remote-certificate-stores) 部分。
 
 ## 文件存储协调

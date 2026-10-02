@@ -267,7 +267,7 @@ jobs:
       - name: Install protobuf compiler and pinned test images
         run: |
           sudo apt-get update && sudo apt-get install -y protobuf-compiler
-          docker pull minio/minio:RELEASE.2025-09-07T16-13-09Z
+          docker build -f tests/support/minio.Dockerfile -t certmagic-minio-test:07c3a429 tests/support
           docker pull hashicorp/vault:1.21.0
           docker pull localstack/localstack:4.14.0
       - name: Protocol and owned-service tests

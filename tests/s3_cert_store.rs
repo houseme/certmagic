@@ -1,6 +1,8 @@
 #![cfg(feature = "s3-cert-store")]
 //! Protocol tests use owned loopback listeners and static dummy credentials.
 //! The ignored Docker lane starts and removes its own MinIO container.
+//! Build its image first: docker build -f tests/support/minio.Dockerfile
+//! -t certmagic-minio-test:07c3a429 tests/support
 
 use std::time::Duration;
 
@@ -244,7 +246,7 @@ mod docker {
                 client: client("http://127.0.0.1:1"),
             };
             let image = std::env::var("CERTMAGIC_S3_IMAGE")
-                .unwrap_or_else(|_| "minio/minio:RELEASE.2025-09-07T16-13-09Z".into());
+                .unwrap_or_else(|_| "certmagic-minio-test:07c3a429".into());
             docker(&[
                 "run",
                 "-d",
@@ -297,7 +299,7 @@ mod docker {
     }
 
     #[tokio::test]
-    #[ignore = "requires Docker; starts a disposable loopback MinIO server"]
+    #[ignore = "requires Docker and the source-built MinIO test image; see module docs"]
     async fn s3_immutable_blobs_and_coordinated_resource_archive_roundtrip() {
         let server = Server::start().await;
         let backend = server.backend();
