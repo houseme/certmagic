@@ -107,6 +107,8 @@ pub use cache::{Cache, CacheEvent, CacheOptions, SubjectIssuer};
 /// Alias for [`Cache`].
 pub type CertCache = Cache;
 pub use acme::acme_issuer::ChainPreference;
+#[cfg(feature = "remote-cert-store")]
+pub use cert_store::remote::{ImmutableBlobStore, RemoteCertStore};
 pub use cert_store::{CertStore, KeyValueCertStore};
 pub use certificate::{
     Certificate, RenewalInfo, RenewalWindow, cert_needs_renewal, currently_in_renewal_window,

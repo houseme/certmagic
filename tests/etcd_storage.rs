@@ -871,3 +871,198 @@ async fn mutual_tls_requires_trusted_ca_and_client_identity() {
     untrusted.tls.as_mut().unwrap().ca_pem.clear();
     assert!(EtcdStorage::connect(&[&endpoint], untrusted).await.is_err());
 }
+
+#[cfg(feature = "remote-cert-store")]
+mod remote_publication {
+    use super::*;
+    use async_trait::async_trait;
+    use certmagic::cert_store::remote::{ImmutableBlobStore, RemoteCertStore};
+    use certmagic::error::Result;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tokio::sync::Semaphore;
+
+    struct Objects {
+        values: Mutex<HashMap<String, Vec<u8>>>,
+        pause_next: AtomicBool,
+        resume: Semaphore,
+    }
+
+    #[derive(Clone)]
+    struct PausedBlobs(Arc<Objects>);
+
+    impl std::fmt::Debug for PausedBlobs {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("PausedBlobs")
+        }
+    }
+
+    impl PausedBlobs {
+        fn new() -> Self {
+            Self(Arc::new(Objects {
+                values: Mutex::new(HashMap::new()),
+                pause_next: AtomicBool::new(false),
+                resume: Semaphore::new(0),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl ImmutableBlobStore for PausedBlobs {
+        fn kind(&self) -> &'static str {
+            "etcd-test-blobs"
+        }
+        fn max_blob_size(&self) -> usize {
+            65_536
+        }
+        async fn create(&self, key: &str, value: &[u8]) -> Result<bool> {
+            if self.0.pause_next.swap(false, Ordering::SeqCst) {
+                self.0.resume.acquire().await.unwrap().forget();
+            }
+            let mut values = self.0.values.lock().unwrap();
+            if values.contains_key(key) {
+                return Ok(false);
+            }
+            values.insert(key.to_owned(), value.to_vec());
+            Ok(true)
+        }
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.0.values.lock().unwrap().get(key).cloned())
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker; starts three task-owned etcd members"]
+    async fn remote_manifest_fencing_snapshots_and_archives_use_real_etcd() {
+        let cluster = Cluster::start().await;
+        let coordinator = cluster.storage("remote-publication").await;
+        let peer = cluster.storage("remote-publication").await;
+        let blobs = PausedBlobs::new();
+        let store =
+            RemoteCertStore::new(blobs.clone(), coordinator.clone(), "remote-location").unwrap();
+        let peer_store =
+            RemoteCertStore::new(blobs.clone(), peer.clone(), "remote-location").unwrap();
+        let ct = CancellationToken::new();
+        let old_guard = coordinator.lock(&ct, "publish").await.unwrap();
+        let old_resource = bundle(1);
+        blobs.0.pause_next.store(true, Ordering::SeqCst);
+        let mut uploading =
+            Box::pin(store.save_with_lock("issuer", "example.test", &old_resource, &old_guard));
+        assert!(futures::poll!(&mut uploading).is_pending());
+
+        // Delete the server's ownership record without revoking the old lease.
+        // Its keep-alive therefore remains healthy: only the atomic ownership
+        // comparison can reject the old writer when its upload resumes.
+        let mut raw = cluster.raw().await;
+        assert_eq!(
+            raw.delete(lock_key("remote-publication", "publish"), None)
+                .await
+                .unwrap()
+                .deleted(),
+            1
+        );
+        let new_guard = peer.lock(&ct, "publish").await.unwrap();
+        peer_store
+            .save_with_lock("issuer", "example.test", &bundle(2), &new_guard)
+            .await
+            .unwrap();
+        assert!(
+            old_guard.is_valid(),
+            "test must exercise a locally healthy stale owner"
+        );
+        blobs.0.resume.add_permits(1);
+        assert!(uploading.await.unwrap_err().has_no_retry());
+        assert_eq!(
+            store
+                .load("issuer", "example.test")
+                .await
+                .unwrap()
+                .unwrap()
+                .private_key_pem,
+            vec![2; 16]
+        );
+        assert_eq!(
+            blobs.0.values.lock().unwrap().len(),
+            2,
+            "rejected upload remains an orphan; publication never deletes blobs"
+        );
+        assert!(
+            store
+                .move_private_key_with_lock("issuer", "example.test", "archive/stale", &old_guard)
+                .await
+                .is_err()
+        );
+        assert!(
+            peer_store
+                .load_archived_private_key("archive/stale")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        old_guard.release_and_wait().await.unwrap();
+        assert!(
+            new_guard.is_valid(),
+            "old lease cleanup must not affect its replacement"
+        );
+
+        // Exercise the three-reference snapshot through the private manifest
+        // decorator while another node publishes changing immutable resources.
+        let reader = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                for _ in 0..40 {
+                    let resource = store.load("issuer", "example.test").await.unwrap().unwrap();
+                    let generation = resource.private_key_pem[0];
+                    assert_eq!(resource.certificate_pem, vec![generation; 32]);
+                    assert_eq!(resource.issuer_data.unwrap()["generation"], generation);
+                }
+            })
+        };
+        for generation in 3..16 {
+            peer_store
+                .save_with_lock("issuer", "example.test", &bundle(generation), &new_guard)
+                .await
+                .unwrap();
+        }
+        reader.await.unwrap();
+
+        let source = certmagic::storage::STORAGE_KEYS.site_private_key("issuer", "example.test");
+        let archive = format!("{source}/compromised");
+        peer_store
+            .move_private_key_with_lock("issuer", "example.test", &archive, &new_guard)
+            .await
+            .unwrap();
+        assert!(store.load("issuer", "example.test").await.is_err());
+        assert_eq!(
+            store.load_archived_private_key(&archive).await.unwrap(),
+            Some(vec![15; 16])
+        );
+        peer_store
+            .save_with_lock("issuer", "example.test", &bundle(16), &new_guard)
+            .await
+            .unwrap();
+        assert!(
+            peer_store
+                .move_private_key_with_lock("issuer", "example.test", &archive, &new_guard)
+                .await
+                .is_err()
+        );
+        assert!(
+            new_guard.is_valid(),
+            "an archive conflict must not discard valid lease ownership"
+        );
+        peer_store.remove("issuer", "example.test").await.unwrap();
+        assert!(
+            store
+                .load("issuer", "example.test")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.load_archived_private_key(&archive).await.unwrap(),
+            Some(vec![15; 16])
+        );
+        new_guard.release_and_wait().await.unwrap();
+    }
+}

@@ -148,6 +148,7 @@ jobs:
           - 'ring,ocsp'
           - 'ring,zerossl'
           - 'ring,local-cache'
+          - 'ring,remote-cert-store'
           - 'ring,redis-storage'
           - 'aws-lc-rs,redis-storage'
           - 'rsa'                   # RSA implies the AWS-LC-RS provider
@@ -240,9 +241,9 @@ jobs:
           sudo apt-get install -y protobuf-compiler
           docker pull quay.io/coreos/etcd:v3.6.5
       - name: Default provider with etcd
-        run: cargo test --locked --features etcd-storage,local-cache --test etcd_storage -- --include-ignored
+        run: cargo test --locked --features etcd-storage,local-cache,remote-cert-store --test etcd_storage -- --include-ignored
       - name: Ring without file storage
-        run: cargo test --locked --no-default-features --features ring,etcd-storage,local-cache --test etcd_storage --test custom_locker -- --include-ignored
+        run: cargo test --locked --no-default-features --features ring,etcd-storage,local-cache,remote-cert-store --test etcd_storage --test custom_locker -- --include-ignored
       - name: Compile explicit example
         run: cargo check --locked --features etcd-storage --example etcd_storage
 

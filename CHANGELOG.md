@@ -8,6 +8,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Add optional `remote-cert-store` with immutable, content-addressed complete
+  certificate blobs, bounded encoding and coordinated reference publication.
+  Guarded publication and private-key archival preserve the originating etcd
+  coordinator's fencing; interrupted uploads never trigger unsafe blob cleanup.
+
 - Add focused guarded-group benchmarks and publish ABBA samples, same-key
   controls, review findings and verification boundaries.
 - Add explicit exact-value existence checks and non-overwriting exact-key moves.
@@ -80,6 +85,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   key-value certificate store while retaining incomplete-resource detection.
 
 ### Fixed
+
+- Redact malformed certificate metadata from decoding errors and reject remote
+  metadata nesting that cannot be decoded before uploading or publishing it.
 
 - Replace the deprecated atomic fetch_update call with try_update, preserving
   lock-release ordering while keeping strict stable/nightly lint checks compatible.

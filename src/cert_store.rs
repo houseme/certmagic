@@ -5,6 +5,9 @@
 //! a separate [`CertStore`] while leaving the ground-truth [`crate::storage::Storage`]
 //! for ACME accounts, locks and OCSP data.
 
+#[cfg(feature = "remote-cert-store")]
+pub mod remote;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -187,8 +190,10 @@ impl CertStore for KeyValueCertStore {
             (None, None, None) => Ok(None),
             (Some(certificate_pem), Some(private_key_pem), Some(metadata)) => {
                 let mut resource: CertificateResource =
-                    serde_json::from_slice(&metadata).map_err(|error| {
-                        Error::Storage(StorageError::Other(format!("meta decode: {error}")))
+                    serde_json::from_slice(&metadata).map_err(|_| {
+                        Error::Storage(StorageError::Other(
+                            "certificate metadata decoding failed".into(),
+                        ))
                     })?;
                 resource.certificate_pem = certificate_pem;
                 resource.private_key_pem = private_key_pem;
