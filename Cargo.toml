@@ -55,6 +55,7 @@ redis = { version = "1.7.1", optional = true, default-features = false, features
 etcd-client = { version = "0.20.0", optional = true, default-features = false, features = ["tls-webpki-roots"] }
 
 aws-sdk-s3 = { version = "1.150.0", optional = true, default-features = false, features = ["rt-tokio"] }
+aws-sdk-secretsmanager = { version = "1.120.0", optional = true, default-features = false, features = ["rt-tokio"] }
 aws-smithy-http-client = { version = "1.5.0", optional = true, default-features = false, features = ["rt-tokio"] }
 
 [dev-dependencies]
@@ -106,6 +107,7 @@ etcd-storage = ["dep:etcd-client"]
 remote-cert-store = []
 s3-cert-store = ["remote-cert-store", "dep:aws-sdk-s3", "dep:aws-smithy-http-client"]
 vault-cert-store = ["remote-cert-store"]
+secrets-manager-cert-store = ["remote-cert-store", "dep:aws-sdk-secretsmanager", "dep:aws-smithy-http-client"]
 http-01 = []
 dns-01 = ["dep:hickory-resolver"]
 ocsp = []
@@ -150,3 +152,7 @@ required-features = ["s3-cert-store", "etcd-storage"]
 [[example]]
 name = "vault_cert_store"
 required-features = ["vault-cert-store", "etcd-storage"]
+
+[[example]]
+name = "secrets_manager_cert_store"
+required-features = ["secrets-manager-cert-store", "etcd-storage"]

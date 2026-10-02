@@ -152,6 +152,10 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 | `aws-lc-rs`         | ✔   | AWS-LC 加密后端与 `x509-parser/verify-aws`（含 P-521 CSR 签名） |
 | `redis-storage`     |     | 可选 Redis 存储与所有者校验租约锁         |
 | `etcd-storage`      |     | etcd 租约、快照读取和受保护的证书发布     |
+| `remote-cert-store` |      | 不可变证书对象与协调引用的公共实现 |
+| `s3-cert-store` |      | S3 证书对象，调用方提供 AWS SDK client |
+| `vault-cert-store` |      | Vault KV v2 CAS 写入与证书对象 |
+| `secrets-manager-cert-store` |      | AWS Secrets Manager 固定版本证书对象 |
 | `integration-tests` |      | Pebble 端到端测试                         |
 
 `https` / `https_on` 包装器仅协商 HTTP/1.1，接收不超过 1 MiB 的 Content-Length
@@ -160,7 +164,8 @@ let acceptor = std::sync::Arc::new(manager.config().certmagic_acceptor()?);
 ## 存储后端选择
 
 当前内置持久化后端为 FileStorage；LocalCache 是节点本地读缓存，不是分布式权威存储。
-提供可选的 `redis-storage` 与 `etcd-storage`；SQL 和对象存储适配器尚未内置。
+提供可选的 `redis-storage` 与 `etcd-storage`；S3、Vault KV v2 和 AWS Secrets Manager
+通过独立的 `CertStore` 适配完整证书资源。SQL 适配器尚未内置。
 
 自定义后端实现 `Storage` 和 `Locker`，通过 `ConfigBuilder::storage` 注入。
 `LockGuard::new` 已开放，未启用 `file-storage` 时也能创建后端自有的锁句柄。
@@ -228,7 +233,7 @@ TLS 使用所选择的 Ring 或 AWS-LC provider。
 `LockRelease::write_fence` 携带后端专用上下文；不支持该上下文的默认实现会直接报错，
 Config 在联系 CA 前就检查兼容性。etcd 上下文支持原存储句柄的克隆及装饰器，
 不同连接实例或不同后端会被拒绝。etcd 锁搭配任意 S3/秘密存储并不自动具备跨系统原子性，
-这些 `CertStore` 适配器仍属后续工作。
+以下远程 `CertStore` 通过原协调后端发布不可变对象引用，保留其所有权检查。
 
 完整资源的 `load_many` / `exists_exact_many` 在 etcd 中使用事务快照；仅有子键的前缀
 不再算作证书组件值，原有 `exists/exists_many` 的前缀语义保持不变。LocalCache 整组透传，
@@ -295,12 +300,48 @@ cargo test --locked --no-default-features --features ring,redis-storage --test r
 | Consul KV | `Storage` + session 锁 | 需处理 session 失效、续期和 lock-delay |
 | DynamoDB | 条件写、租约记录 | TTL 异步删除，不能直接当成锁过期判定 |
 | redb / RocksDB | 单机嵌入式 KV | 阻塞工作移出 Tokio；不等同于分布式共享存储 |
-| S3 兼容存储/密钥服务 | 优先适配完整资源 `CertStore` | 仍需合适的账号、挑战和锁后端 |
+| S3 / Vault KV v2 / AWS Secrets Manager | 完整资源 `CertStore` | 已实现；引用、账号、挑战与锁仍需共享协调后端 |
 
 参考 [Valkey 兼容说明](https://valkey.io/topics/migration/)、
 [Consul session](https://developer.hashicorp.com/consul/docs/automate/session)、
 [DynamoDB TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ttl-expired-items.html)。
-以上其他后端是候选方案，目前没有对应的内置适配器。
+Valkey、Consul、DynamoDB 与嵌入式 KV 仍是候选方案。
+
+## S3 与密钥服务证书存储
+
+本轮功能属于 **Unreleased**，不包含在已发布的 0.1.0 中。分别启用
+`s3-cert-store`、`vault-cert-store`、`secrets-manager-cert-store`；默认功能不变。
+三者复用 `RemoteCertStore<B>`，其他服务可实现 `ImmutableBlobStore`。
+创建对象后端后调用 `RemoteCertStore::new(backend, coordinator.clone(), namespace)`，
+再将同一个协调存储实例交给 `Config::builder().storage(coordinator).cert_store(certificates)`。
+
+证书、私钥和签发元数据合并为一个有大小上限、按内容寻址的不可变对象；协调后端只存小引用。
+冷读取查询引用后只需获取一次远程对象。发布时先上传对象，再由 etcd 在同一事务中检查
+锁所有权并更新引用。旧持有者的上传可能留下未引用对象，但不能覆盖新发布的引用。
+FileStorage/Redis 保留已有的较弱协调语义；不承诺跨两套服务的原子事务。
+
+每个远程位置使用独立 namespace，所有节点保持配置一致，并同时备份协调数据与对象。
+引用混杂、内容损坏、已引用对象缺失和权限错误均报错。旧 `save/remove` 管理接口仍不受锁保护。
+私钥归档移动引用且不覆盖目标，可通过 `load_archived_private_key(destination)` 读取。
+删除和归档只改变引用，不物理擦除历史私钥或对象；取消、失败或响应丢失也不自动删除上传对象。
+当前没有自动垃圾回收，保留策略必须考虑活动引用、归档及结果不确定的写入。
+
+| 后端 | 约束与配置 |
+| --- | --- |
+| `S3CertStore` / `S3BlobStore` | 使用已有 bucket，要求支持 `If-None-Match: *`。编码后默认上限 1 MiB；加密和权限由 bucket 策略配置。存在性通过有界 GET 区分对象缺失与 bucket 缺失。 |
+| `VaultCertStore` / `VaultKv2BlobStore` | KV v2、CAS=0、不可变版本 1，默认 HTTPS 和 256 KiB 对象上限。token 需要 data 路径 create/update/read、metadata 路径 read。禁用定时版本删除；调用方负责 token 续期。 |
+| `SecretsManagerCertStore` / `SecretsManagerBlobStore` | 每个对象一个 secret，按版本 ID 读取，含 base64 PEM 与元数据的编码总量不得超过 64 KiB。规划 secret 数量、配额与费用，IAM 禁止修改/删除保留版本。可配置 KMS 加密密钥；仍存储可导出的私钥，并非 HSM 远程签名。 |
+
+AWS 适配器接受调用方配置的 SDK client，不自动发现凭据；显式设置凭据、region、重试与
+HTTP transport，`cert_store::remote::aws_http_client()` 使用所选 Ring/AWS-LC provider。
+S3/Vault 限制下载响应大小；Secrets Manager 在 SDK 解码 JSON 后检查 64 KiB 二进制上限，
+自定义端点必须可信并遵循服务响应上限。构造函数仅校验本地配置，不验证远端可用性和权限。
+
+示例 [S3](examples/s3_cert_store.rs)、[Vault](examples/vault_cert_store.rs)、
+[Secrets Manager](examples/secrets_manager_cert_store.rs) 共享 etcd 协调实例，运行时不签发证书；
+编译需启用对应适配器和 `etcd-storage` 并安装 `protoc`。协议测试使用本地 mock；显式集成测试
+使用独立 MinIO、Vault dev 和 LocalStack 容器，不访问生产服务。运行命令见英文 README 的
+[远程证书存储](README.md#remote-certificate-stores) 部分。
 
 ## 文件存储协调
 

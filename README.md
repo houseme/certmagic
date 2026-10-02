@@ -182,6 +182,10 @@ Three paths, pick per deployment:
 | `local-cache`       |         | Node-local read-through storage cache                    |
 | `redis-storage`     |         | Redis values and owner-checked renewable leases         |
 | `etcd-storage`      |         | Etcd leases, snapshot reads and guarded publication     |
+| `remote-cert-store` |         | Immutable certificate blobs with coordinated references |
+| `s3-cert-store` |         | S3 certificate blobs (caller-configured AWS SDK client) |
+| `vault-cert-store` |         | Vault KV v2 certificate blobs with CAS writes |
+| `secrets-manager-cert-store` |         | AWS Secrets Manager certificate blobs with pinned versions |
 | `rsa`               |        | Opt-in RSA 2048/4096/8192 key generation                |
 | `ring`              |         | Ring crypto provider and `x509-parser/verify`             |
 | `aws-lc-rs`         | ✔      | AWS-LC crypto provider and `x509-parser/verify-aws` (including P-521 CSR signing) |
@@ -192,8 +196,9 @@ Three paths, pick per deployment:
 FileStorage remains the built-in durable backend. LocalCache is a node-local
 read-through decorator, not a distributed source of truth. `redis-storage` adds
 an optional Redis adapter. `etcd-storage` adds transaction-checked publication
-for deployments using etcd for coordination. SQL and object-store adapters are
-not bundled.
+for deployments using etcd for coordination. Optional S3, Vault KV v2 and AWS
+Secrets Manager adapters store complete certificate resources through `CertStore`.
+SQL storage is not bundled.
 
 Custom backends implement `Storage` and `Locker`, then are supplied through
 `ConfigBuilder::storage`. `LockGuard::new` accepts a backend-owned release
@@ -299,7 +304,8 @@ both guarded operations explicitly. Config checks compatibility before CA work.
 Etcd contexts work with clones/decorators of the originating storage handle;
 a separately connected handle or a different backend is rejected. An etcd lock
 combined with an arbitrary S3/secret-store CertStore does **not** provide a
-cross-system transaction. Those adapters remain separate work.
+cross-system transaction. The remote adapters below instead publish immutable
+blob references through the originating coordinator.
 
 Complete certificate reads use `load_many` and value-presence checks use
 `exists_exact_many`; prefix-aware `exists`/`exists_many` retain their existing semantics.
@@ -343,6 +349,65 @@ concurrent snapshot reads, Config obtain/renew publication, private-key archival
 keep-alive, cancellation/runtime loss, leader loss, quorum loss/recovery, password
 authentication, and a separate mutual-TLS server. No CA or production endpoint is
 contacted. The explicit example is `examples/etcd_storage.rs`.
+
+## Remote certificate stores
+
+These adapters are **Unreleased**. Enable `s3-cert-store`, `vault-cert-store` or
+`secrets-manager-cert-store`; defaults remain unchanged. Each reuses
+`RemoteCertStore<B>` and the `ImmutableBlobStore` contract for additional services.
+Construct a blob backend, then call `RemoteCertStore::new(backend,
+coordinator.clone(), namespace)`. Supply that same coordinator to
+`Config::builder().storage(coordinator).cert_store(certificates)`.
+
+A complete certificate, private key and issuer metadata form one bounded,
+content-addressed blob. Only small references live in the coordinator; a cold
+load reads those references and fetches one blob. Guarded publication uploads
+first, then atomically checks the etcd owner and publishes references. A stale
+upload can leave an unused blob but cannot replace the current publication.
+FileStorage/Redis retain their existing weaker coordination guarantees. This
+protocol does not require a transaction spanning the two services.
+
+Use one unique namespace per remote location and identical configuration on all
+nodes. Back up both the coordinator and remote objects. Mixed references,
+corrupt objects, missing referenced blobs and permission failures return errors.
+Legacy administrative `save`/`remove` calls remain unfenced. Private-key archival
+moves a reference without overwriting an existing archive;
+`load_archived_private_key(destination)` resolves it. Removal and archival are
+logical operations: immutable objects, older secrets and failed-upload remnants
+are retained. There is no automatic garbage collector or physical key erasure;
+retention must account for live references, archives and uncertain write outcomes.
+
+| Adapter | Configuration and operational contract |
+| --- | --- |
+| `S3CertStore` / `S3BlobStore` | Existing bucket supporting `If-None-Match: *`; default encoded limit 1 MiB. Configure encryption and access policy on the bucket. Uses bounded GET for existence to distinguish a missing object from a missing bucket. |
+| `VaultCertStore` / `VaultKv2BlobStore` | KV v2, CAS=0, immutable version 1, HTTPS by default; default decoded blob limit 256 KiB. Token requires create/update/read on data paths and read on metadata paths. Disable scheduled version deletion; token renewal belongs to the caller. |
+| `SecretsManagerCertStore` / `SecretsManagerBlobStore` | One secret per blob, pinned version ID, encoded limit 64 KiB including base64 PEM and metadata. Plan secret-count quotas and ongoing storage cost; IAM should deny changes/deletion of retained versions. Optional KMS encryption key; private keys remain exportable, not HSM signing keys. |
+
+AWS adapters accept caller-configured SDK clients. Set credentials, region,
+retry policy and HTTP transport explicitly; `cert_store::remote::aws_http_client()`
+uses the selected Ring/AWS-LC provider. The adapters do not discover ambient
+credentials. S3 and Vault bound downloaded bodies; Secrets Manager checks the
+service's 64 KiB binary limit after the SDK has decoded its JSON response, so
+custom endpoints must be trusted to enforce service-compatible response limits.
+Constructors validate local options, not remote availability or IAM policy.
+
+Runnable configuration examples use etcd for coordination and issue no
+certificates: [`s3_cert_store`](examples/s3_cert_store.rs),
+[`vault_cert_store`](examples/vault_cert_store.rs), and
+[`secrets_manager_cert_store`](examples/secrets_manager_cert_store.rs).
+Compile with the corresponding adapter feature plus `etcd-storage` (requires
+`protoc`). Protocol tests use loopback mocks; explicit Docker tests use isolated
+MinIO, Vault dev mode and LocalStack, never production credentials:
+
+```sh
+docker pull minio/minio:RELEASE.2025-09-07T16-13-09Z
+docker pull hashicorp/vault:1.21.0
+docker pull localstack/localstack:4.14.0
+cargo test --locked --no-default-features \
+  --features ring,file-storage,s3-cert-store,vault-cert-store,secrets-manager-cert-store \
+  --test remote_cert_store --test s3_cert_store --test vault_cert_store \
+  --test secrets_manager_cert_store -- --include-ignored
+```
 
 ## Redis adapter
 
@@ -414,14 +479,14 @@ are not claimed as validated by those tests.
 | Consul KV | `Storage` + session-based `Locker` | Separate adapter; account for session invalidation and lock-delay |
 | DynamoDB | Conditional writes for storage and lease records | Separate adapter; TTL deletion is asynchronous, so expiry must be checked in conditions |
 | redb / RocksDB | Embedded single-node storage | Separate adapter; move blocking work off Tokio and do not imply distributed locking |
-| S3-compatible / secret services | Prefer a separate complete-resource `CertStore` | Separate adapter; retain a suitable shared lock/account/challenge backend |
+| S3 / Vault KV v2 / AWS Secrets Manager | Complete-resource `CertStore` | Implemented; retain shared coordination for references, accounts and challenges |
 
 See [Valkey compatibility](https://valkey.io/topics/migration/),
 [etcd APIs](https://etcd.io/docs/v3.6/learning/api/),
 [Consul sessions](https://developer.hashicorp.com/consul/docs/automate/session),
 and [DynamoDB expiry semantics](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ttl-expired-items.html).
-FileStorage, RedisStorage and EtcdStorage are implemented here; the other rows are
-integration candidates, not enabled feature flags.
+FileStorage, RedisStorage, EtcdStorage and the three remote CertStore adapters
+are implemented here. Valkey, Consul, DynamoDB and embedded KV remain candidates.
 
 ## File storage coordination
 

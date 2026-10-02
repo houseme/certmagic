@@ -16,6 +16,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   reads, caller-configured SDK clients and explicit missing-bucket/error handling.
 - Add optional `vault-cert-store` for Vault KV v2 with CAS-zero writes, immutable
   version checks, HTTPS/token/namespace support and deleted-version detection.
+- Add optional `secrets-manager-cert-store` with one immutable binary secret per
+  blob, pinned version IDs, optional KMS encryption and a 64 KiB encoded limit.
+- Add protocol/failure-path tests, owned MinIO/Vault/LocalStack integration lanes,
+  explicit etcd-backed configuration examples and optional-provider CI coverage.
+  Document reference-only archival, retained historical blobs and cleanup limits.
 
 - Add focused guarded-group benchmarks and publish ABBA samples, same-key
   controls, review findings and verification boundaries.

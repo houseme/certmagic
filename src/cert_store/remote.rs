@@ -601,11 +601,13 @@ impl Storage for ManifestStorage {
 
 #[cfg(feature = "s3-cert-store")]
 use aws_sdk_s3::config::SharedHttpClient;
+#[cfg(all(not(feature = "s3-cert-store"), feature = "secrets-manager-cert-store"))]
+use aws_sdk_secretsmanager::config::SharedHttpClient;
 
 /// Build an AWS SDK HTTP client using this crate's selected crypto provider.
 /// Supply it through the SDK config builder's http_client method. No credential
 /// providers or network operations are invoked here; custom clients are allowed.
-#[cfg(feature = "s3-cert-store")]
+#[cfg(any(feature = "s3-cert-store", feature = "secrets-manager-cert-store"))]
 pub fn aws_http_client() -> SharedHttpClient {
     use aws_smithy_http_client::{Builder, tls};
     #[cfg(feature = "aws-lc-rs")]

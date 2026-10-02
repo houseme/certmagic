@@ -149,6 +149,10 @@ jobs:
           - 'ring,zerossl'
           - 'ring,local-cache'
           - 'ring,remote-cert-store'
+          - 'ring,vault-cert-store'
+          - 'ring,s3-cert-store'
+          - 'ring,secrets-manager-cert-store'
+          - 'aws-lc-rs,s3-cert-store,vault-cert-store,secrets-manager-cert-store'
           - 'ring,redis-storage'
           - 'aws-lc-rs,redis-storage'
           - 'rsa'                   # RSA implies the AWS-LC-RS provider
@@ -246,6 +250,37 @@ jobs:
         run: cargo test --locked --no-default-features --features ring,etcd-storage,local-cache,remote-cert-store --test etcd_storage --test custom_locker -- --include-ignored
       - name: Compile explicit example
         run: cargo check --locked --features etcd-storage --example etcd_storage
+
+  remote-cert-stores:
+    name: Remote certificate stores (isolated services)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: remote-cert-stores
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install protobuf compiler and pinned test images
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          docker pull minio/minio:RELEASE.2025-09-07T16-13-09Z
+          docker pull hashicorp/vault:1.21.0
+          docker pull localstack/localstack:4.14.0
+      - name: Protocol and owned-service tests
+        run: |
+          cargo test --locked --no-default-features \
+            --features ring,file-storage,s3-cert-store,vault-cert-store,secrets-manager-cert-store \
+            --test remote_cert_store --test s3_cert_store --test vault_cert_store \
+            --test secrets_manager_cert_store -- --include-ignored
+      - name: Compile explicit configuration examples
+        run: |
+          cargo check --locked --no-default-features \
+            --features ring,etcd-storage,s3-cert-store,vault-cert-store,secrets-manager-cert-store \
+            --example s3_cert_store --example vault_cert_store --example secrets_manager_cert_store
 
   offline-validation:
     name: Offline validation
@@ -350,7 +385,7 @@ jobs:
 
   package:
     name: Package verification
-    needs: [format, test, clippy, features, shellcheck, offline-validation, shell-smoke, loopback-challenges, pebble-integration, redis-storage, etcd-storage]
+    needs: [format, test, clippy, features, shellcheck, offline-validation, shell-smoke, loopback-challenges, pebble-integration, redis-storage, etcd-storage, remote-cert-stores]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
