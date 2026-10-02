@@ -660,3 +660,94 @@ async fn unreadably_deep_metadata_is_rejected_before_remote_upload() {
     assert_eq!(blobs.state.creates.load(Ordering::SeqCst), 0);
     assert!(coordinator.state.lock().unwrap().values.is_empty());
 }
+
+// Frozen v1 data from the original synthetic-CertificateResource layout.
+// Both readers and writers must remain compatible without re-uploading blobs.
+#[tokio::test]
+async fn v1_layout_and_content_addresses_survive_internal_refactoring() {
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        manifests: BTreeMap<String, String>,
+        blobs: BTreeMap<String, String>,
+    }
+    let fixture: Fixture = serde_json::from_str(include_str!("fixtures/remote-v1.json")).unwrap();
+    let coordinator = Coordinator::new(true);
+    let blobs = Blobs::new(65_536);
+    for (key, value) in &fixture.manifests {
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .values
+            .insert(key.clone(), value.as_bytes().to_vec());
+    }
+    for (key, value) in &fixture.blobs {
+        blobs
+            .state
+            .values
+            .lock()
+            .unwrap()
+            .insert(key.clone(), value.as_bytes().to_vec());
+    }
+    let store = RemoteCertStore::new(blobs.clone(), coordinator.clone(), "legacy-fixture").unwrap();
+    let expected = resource("v1");
+    assert_resource(
+        &store.load("issuer", "Example.COM").await.unwrap().unwrap(),
+        &expected,
+    );
+    let guard = coordinator
+        .lock(&CancellationToken::new(), "publication")
+        .await
+        .unwrap();
+    store
+        .save_with_lock("issuer", "Example.COM", &expected, &guard)
+        .await
+        .unwrap();
+    let objects = blobs.state.values.lock().unwrap();
+    assert_eq!(objects.len(), fixture.blobs.len());
+    for (key, value) in fixture.blobs {
+        assert_eq!(objects[&key], value.as_bytes());
+    }
+    let state = coordinator.state.lock().unwrap();
+    assert_eq!(state.values.len(), fixture.manifests.len());
+    for (key, value) in fixture.manifests {
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&state.values[&key]).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&value).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn oversized_backups_abort_unfenced_publication_without_changing_references() {
+    let coordinator = Coordinator::new(true);
+    let blobs = Blobs::new(65_536);
+    let store = RemoteCertStore::new(blobs.clone(), coordinator.clone(), "tenant").unwrap();
+    store
+        .save("issuer", "example.com", &resource("original"))
+        .await
+        .unwrap();
+    let before = {
+        let mut state = coordinator.state.lock().unwrap();
+        let key = state
+            .values
+            .keys()
+            .find(|key| key.ends_with(".json"))
+            .unwrap()
+            .clone();
+        state.values.insert(key, vec![0; 4097]);
+        state.values.clone()
+    };
+    assert!(
+        store
+            .save("issuer", "example.com", &resource("replacement"))
+            .await
+            .is_err()
+    );
+    assert_eq!(coordinator.state.lock().unwrap().values, before);
+    assert_eq!(
+        blobs.state.values.lock().unwrap().len(),
+        2,
+        "uncertain publication must retain uploaded blobs"
+    );
+}

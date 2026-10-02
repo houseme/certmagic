@@ -451,6 +451,19 @@ pub type KeyValue<'a> = (&'a str, Vec<u8>);
 /// resources when a later write fails; a rollback failure is logged because
 /// the original write error is the actionable result for the caller.
 pub async fn store_tx(storage: &(impl Storage + ?Sized), items: &[KeyValue<'_>]) -> Result<()> {
+    store_tx_bounded(storage, items, usize::MAX).await
+}
+
+// Share compensation logic with bounded reference records without introducing
+// a Storage decorator solely to validate backup values.
+pub(crate) async fn store_tx_bounded(
+    storage: &(impl Storage + ?Sized),
+    items: &[KeyValue<'_>],
+    maximum: usize,
+) -> Result<()> {
+    if items.iter().any(|(_, value)| value.len() > maximum) {
+        return Err(StorageError::Other("transaction value exceeds limit".into()).into());
+    }
     // Snapshot every destination before the first write. Deleting a key on
     // rollback is not sufficient when the transaction overwrites an existing
     // certificate resource: it would turn a transient write failure into data
@@ -459,7 +472,10 @@ pub async fn store_tx(storage: &(impl Storage + ?Sized), items: &[KeyValue<'_>])
     let mut previous = Vec::with_capacity(items.len());
     for (key, _) in items {
         match storage.load(key).await {
-            Ok(value) => previous.push(Some(value)),
+            Ok(value) if value.len() <= maximum => previous.push(Some(value)),
+            Ok(_) => {
+                return Err(StorageError::Other("transaction backup exceeds limit".into()).into());
+            }
             Err(Error::Storage(StorageError::NotFound(_))) => previous.push(None),
             Err(err) => return Err(err),
         }

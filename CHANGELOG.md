@@ -51,6 +51,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Simplify remote certificate publication to direct typed references on the
+  originating coordinator, removing synthetic certificate resources and the
+  forwarding Storage decorator. Preserve v1 paths, object bytes, snapshots,
+  guarded writes, archive isolation and bounded rollback backups.
+- Stream certificate base64 into the bounded wire writer and borrow encoded
+  fields when reading blobs, avoiding payload-sized intermediate strings.
+- Add a v1 compatibility fixture and release ABBA microbenchmarks for remote
+  reference reads, presence checks and idempotent guarded publication.
+
 - Update the cargo-deny license allowlist with additional SPDX identifiers and
   remove the Unicode-DFS-2016 entry.
 - Coordinate LocalCache grouped reads, existence checks, writes and moves through

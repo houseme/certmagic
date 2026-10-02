@@ -156,3 +156,8 @@ required-features = ["vault-cert-store", "etcd-storage"]
 [[example]]
 name = "secrets_manager_cert_store"
 required-features = ["secrets-manager-cert-store", "etcd-storage"]
+
+[[bench]]
+name = "remote_cert_store"
+harness = false
+required-features = ["remote-cert-store"]

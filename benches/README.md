@@ -287,3 +287,75 @@ unchanged. This result does not claim universal optimality, zero coordination
 cost on an in-memory backend, or an equivalent Redis/etcd/TLS throughput gain.
 The earlier pure-memory write tradeoff remains documented above. No new
 application dependency or storage wire-format migration is introduced.
+
+
+## Remote certificate reference review (2026-10-02)
+
+The latest four adapter commits (`dbcf36d..704f1e4`) were reviewed together with
+related Storage, lock and LocalCache contracts. The baseline passed strict
+Clippy and compilation. The unnecessary layering was in remote publication:
+references were serialized as fake certificate resources, passed through
+KeyValueCertStore, then mapped by a private Storage decorator. This repeated
+path sanitization, allocation, serde Value conversion and asynchronous dispatch.
+
+RemoteCertStore now owns its coordinator directly and builds the existing three
+reference paths once. Typed reference metadata replaces synthetic certificate
+resources and Value roundtrips. One grouped authoritative read and one guarded
+coordinator transaction remain; the immutable-blob protocol and each provider's
+conditional write checks remain. Base64 serialization streams into the bounded
+writer, and deserialization borrows unescaped wire fields before decoding.
+The generic compensated transaction and its bounded-backup variant share one
+implementation, preserving the administrative save path's size checks.
+
+The three reference records are retained because private-key archival moves only
+the key reference. Existing v1 data, object addresses and archival behavior need
+no migration. A frozen v1 fixture and oversized-backup regression pass on both
+baseline and candidate. The lock timeout panic suspicion was rejected after
+checking Tokio's actual behavior; no lock implementation change was needed.
+
+### Measurement
+
+```sh
+CERTMAGIC_REMOTE_BENCH_ITERS=10000 CERTMAGIC_BENCH_SAMPLES=5 \
+  cargo bench --locked --no-default-features --features ring,remote-cert-store \
+  --bench remote_cert_store
+```
+
+Both saved binaries use the same driver, lockfile, Rust 1.99.0 and optimized
+profile on macOS/aarch64. Warm both, then run A1–B1–B2–A2 sequentially, with no
+other builds or tests from this task during measurement. Each phase has five
+10,000-operation samples per case, preceded by 500 warm-up operations. Report
+mean phase medians, require absolute A2/A1 drift below 10%, and treat effects
+below 5% as unchanged. Raw data: [remote-references-abba.csv](results/remote-references-abba.csv).
+
+The coordinator is an in-memory three-key snapshot/transaction fixture. The
+blob fixture retains one immutable resource; republishing deliberately takes
+the conflict-and-verify path and keeps the working set bounded. Payload sizes
+below are total raw certificate/key bytes; metadata and base64 increase wire
+size. These measure local processing with copying mocks, not live cloud request
+latency, cloud throughput, handshake performance or new-object upload latency.
+
+| Case | Baseline ns/op | Candidate ns/op | Time change | Baseline drift |
+| --- | ---: | ---: | ---: | ---: |
+| Load, 6 KiB | 9069.70 | 6187.51 | -31.78% | -5.19% |
+| Presence, 6 KiB | 4115.64 | 1524.34 | -62.96% | -2.32% |
+| Republish, 6 KiB | 10379.17 | 7768.06 | -25.16% | -2.64% |
+| Load, 48 KiB | 40369.32 | 36915.72 | -8.56% | +0.96% |
+| Presence, 48 KiB | 4591.18 | 2045.89 | -55.44% | -1.64% |
+| Republish, 48 KiB | 51681.18 | 51158.37 | -1.01% | +0.97% |
+
+All drift gates passed. The large-payload republish result is effectively
+unchanged; other measured paths improved. The design reduces transient payload
+copies but these timings do not quantify peak RSS or allocation counts, and do
+not establish universal optimality across deployments.
+
+### Validation
+
+The full all-features suite passed 315 tests (26 explicitly opt-in cases remained
+ignored in that run). Both baseline and candidate passed all 15 remote-contract
+tests, including frozen v1 data and oversized rollback backups. The real
+three-member etcd publication test passed after refactoring, as did the Vault
+and LocalStack service suites. Stable/nightly all-target/all-feature Clippy and
+strict rustdoc completed successfully; nightly Cargo emitted its existing
+redundant-homepage manifest warning. Formatting, typo and YAML syntax checks
+passed. No production cloud endpoint or CA was contacted.

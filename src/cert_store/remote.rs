@@ -10,14 +10,14 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
-use super::{CertStore, KeyValueCertStore};
+use super::CertStore;
 use crate::error::{Error, Result, StorageError};
 use crate::issuer::CertificateResource;
-use crate::storage::{KeyInfo, KeyValue, LockGuard, Locker, STORAGE_KEYS, Storage};
+use crate::storage::{LockGuard, STORAGE_KEYS, Storage, store_tx_bounded};
 
 const MAX_REFERENCE: usize = 4096;
 
@@ -54,8 +54,8 @@ pub trait ImmutableBlobStore: Send + Sync + fmt::Debug {
 pub struct RemoteCertStore<B> {
     backend: B,
     scope: String,
-    manifests: KeyValueCertStore,
-    references: Arc<ManifestStorage>,
+    coordinator: Arc<dyn Storage>,
+    prefix: String,
 }
 impl<B: ImmutableBlobStore> fmt::Debug for RemoteCertStore<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -73,15 +73,27 @@ struct Reference {
     resource: String,
     digest: String,
 }
+// Matches the original KeyValueCertStore metadata envelope on disk, without
+// constructing a certificate or an intermediate serde_json::Value for refs.
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireResource {
-    format: u8,
-    store: String,
-    resource: String,
+struct ReferenceMetadata<R> {
+    #[serde(default)]
     sans: Vec<String>,
-    certificate: String,
-    private_key: String,
+    issuer_data: R,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireResource<'a> {
+    format: u8,
+    #[serde(borrow)]
+    store: Cow<'a, str>,
+    #[serde(borrow)]
+    resource: Cow<'a, str>,
+    sans: Vec<String>,
+    #[serde(borrow)]
+    certificate: Cow<'a, str>,
+    #[serde(borrow)]
+    private_key: Cow<'a, str>,
     issuer_data: Option<serde_json::Value>,
 }
 #[derive(Serialize)]
@@ -90,10 +102,22 @@ struct WireWrite<'a> {
     store: &'a str,
     resource: &'a str,
     sans: &'a [String],
-    certificate: String,
-    private_key: String,
+    certificate: EncodedBytes<'a>,
+    private_key: EncodedBytes<'a>,
     issuer_data: &'a Option<serde_json::Value>,
 }
+// Stream base64 into the bounded JSON writer instead of allocating PEM-sized
+// intermediate strings. The resulting v1 wire bytes remain identical.
+struct EncodedBytes<'a>(&'a [u8]);
+impl Serialize for EncodedBytes<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(&base64::display::Base64Display::new(self.0, &STANDARD))
+    }
+}
+
 struct LimitedBuffer {
     bytes: Vec<u8>,
     limit: usize,
@@ -112,11 +136,10 @@ impl std::io::Write for LimitedBuffer {
 }
 
 struct ResourceKey {
-    issuer: String,
-    domain: String,
+    paths: [String; 3],
     identity: String,
 }
-fn resource_key(issuer: &str, domain: &str) -> Result<ResourceKey> {
+fn resource_key(prefix: &str, issuer: &str, domain: &str) -> Result<ResourceKey> {
     if issuer.is_empty()
         || issuer.len() > 4096
         || issuer.contains('\0')
@@ -129,9 +152,15 @@ fn resource_key(issuer: &str, domain: &str) -> Result<ResourceKey> {
     let issuer = crate::crypto::sha256_hex(issuer.as_bytes());
     let domain = crate::crypto::sha256_hex(crate::certificate::normalized_name(domain).as_bytes());
     let identity = crate::crypto::sha256_hex(format!("{issuer}/{domain}").as_bytes());
+    // Both components are fixed lowercase SHA-256 hex, already canonical.
+    // Build the existing v1 paths once instead of re-sanitizing each component.
+    let stem = format!("{prefix}/certificates/{issuer}/{domain}/{domain}");
     Ok(ResourceKey {
-        issuer,
-        domain,
+        paths: [
+            format!("{stem}.crt"),
+            format!("{stem}.key"),
+            format!("{stem}.json"),
+        ],
         identity,
     })
 }
@@ -187,15 +216,12 @@ impl<B: ImmutableBlobStore> RemoteCertStore<B> {
             return Err(failure("invalid remote certificate store options"));
         }
         let scope = crate::crypto::sha256_hex(format!("{kind}\0{namespace}").as_bytes());
-        let references = Arc::new(ManifestStorage {
-            inner: coordinator,
-            prefix: format!("remote-cert-manifests/{kind}/{scope}"),
-        });
+        let prefix = format!("remote-cert-manifests/{kind}/{scope}");
         Ok(Arc::new(Self {
             backend,
             scope,
-            manifests: KeyValueCertStore::new(references.clone()),
-            references,
+            coordinator,
+            prefix,
         }))
     }
 
@@ -226,8 +252,8 @@ impl<B: ImmutableBlobStore> RemoteCertStore<B> {
             store: &self.scope,
             resource: &key.identity,
             sans: &resource.sans,
-            certificate: STANDARD.encode(&resource.certificate_pem),
-            private_key: STANDARD.encode(&resource.private_key_pem),
+            certificate: EncodedBytes(&resource.certificate_pem),
+            private_key: EncodedBytes(&resource.private_key_pem),
             issuer_data: &resource.issuer_data,
         };
         let mut encoded = LimitedBuffer {
@@ -265,20 +291,38 @@ impl<B: ImmutableBlobStore> RemoteCertStore<B> {
         Ok(reference)
     }
     async fn reference(&self, key: &ResourceKey) -> Result<Option<Reference>> {
-        let Some(resource) = self.manifests.load(&key.issuer, &key.domain).await? else {
-            return Ok(None);
+        // One grouped call preserves authoritative snapshots through LocalCache
+        // and etcd. Never assemble a resource from individually cached entries.
+        let values = self
+            .coordinator
+            .load_many(&key.paths.each_ref().map(String::as_str))
+            .await?;
+        let [certificate, private_key, metadata]: [Option<Vec<u8>>; 3] = values
+            .try_into()
+            .map_err(|_| failure("invalid remote certificate snapshot"))?;
+        let (certificate, private_key, metadata) = match (certificate, private_key, metadata) {
+            (None, None, None) => return Ok(None),
+            (Some(certificate), Some(private_key), Some(metadata)) => {
+                (certificate, private_key, metadata)
+            }
+            _ => return Err(failure("incomplete remote certificate manifest")),
         };
-        if resource.certificate_pem != resource.private_key_pem || !resource.sans.is_empty() {
+        if [&certificate, &private_key, &metadata]
+            .iter()
+            .any(|value| value.len() > MAX_REFERENCE)
+        {
+            return Err(failure("oversized remote certificate manifest"));
+        }
+        if certificate != private_key {
             return Err(failure("inconsistent remote certificate manifest"));
         }
-        let reference = self.parse_reference(&resource.certificate_pem)?;
-        let metadata: Reference = serde_json::from_value(
-            resource
-                .issuer_data
-                .ok_or_else(|| failure("missing remote certificate reference metadata"))?,
-        )
-        .map_err(|_| failure("invalid remote certificate reference metadata"))?;
-        if metadata != reference || reference.resource != key.identity {
+        let reference = self.parse_reference(&certificate)?;
+        let metadata: ReferenceMetadata<Reference> = serde_json::from_slice(&metadata)
+            .map_err(|_| failure("invalid remote certificate reference metadata"))?;
+        if !metadata.sans.is_empty()
+            || metadata.issuer_data != reference
+            || reference.resource != key.identity
+        {
             return Err(failure("inconsistent remote certificate manifest"));
         }
         Ok(Some(reference))
@@ -302,10 +346,10 @@ impl<B: ImmutableBlobStore> RemoteCertStore<B> {
         Ok(CertificateResource {
             sans: wire.sans,
             certificate_pem: STANDARD
-                .decode(wire.certificate)
+                .decode(wire.certificate.as_bytes())
                 .map_err(|_| failure("invalid remote certificate encoding"))?,
             private_key_pem: STANDARD
-                .decode(wire.private_key)
+                .decode(wire.private_key.as_bytes())
                 .map_err(|_| failure("invalid remote private-key encoding"))?,
             issuer_data: wire.issuer_data,
         })
@@ -320,7 +364,7 @@ impl<B: ImmutableBlobStore> RemoteCertStore<B> {
         if let Some(guard) = guard {
             self.validate_write_guard(guard)?;
         }
-        let key = resource_key(issuer, domain)?;
+        let key = resource_key(&self.prefix, issuer, domain)?;
         let (reference, body) = self.encode(&key, resource)?;
         let object = format!("objects/{}", reference.digest);
         if !self.backend.create(&object, &body).await? {
@@ -340,35 +384,30 @@ impl<B: ImmutableBlobStore> RemoteCertStore<B> {
         }
         let pointer =
             serde_json::to_vec(&reference).map_err(|_| failure("reference encoding failed"))?;
-        let manifest = CertificateResource {
+        let metadata = serde_json::to_vec(&ReferenceMetadata {
             sans: Vec::new(),
-            certificate_pem: pointer.clone(),
-            private_key_pem: pointer,
-            issuer_data: Some(
-                serde_json::to_value(reference)
-                    .map_err(|_| failure("reference encoding failed"))?,
-            ),
-        };
+            issuer_data: &reference,
+        })
+        .map_err(|_| failure("reference metadata encoding failed"))?;
+        let [certificate, private_key, metadata_key] = &key.paths;
+        let items = [
+            (certificate.as_str(), pointer.clone()),
+            (private_key.as_str(), pointer),
+            (metadata_key.as_str(), metadata),
+        ];
         match guard {
-            Some(guard) => {
-                self.manifests
-                    .save_with_lock(&key.issuer, &key.domain, &manifest, guard)
-                    .await
-            }
-            None => {
-                self.manifests
-                    .save(&key.issuer, &key.domain, &manifest)
-                    .await
-            }
+            Some(guard) => self.coordinator.store_tx_with_lock(&items, guard).await,
+            None => store_tx_bounded(self.coordinator.as_ref(), &items, MAX_REFERENCE).await,
         }
     }
     fn archive_key(&self, destination: &str) -> Result<String> {
         if destination.is_empty() || destination.len() > 4096 || destination.contains('\0') {
             return Err(failure("invalid private-key archive identity"));
         }
-        let canonical = self.references.inner.canonical_key(destination)?;
+        let canonical = self.coordinator.canonical_key(destination)?;
         Ok(format!(
-            "archives/{}",
+            "{}/archives/{}",
+            self.prefix,
             crate::crypto::sha256_hex(canonical.as_bytes())
         ))
     }
@@ -382,27 +421,23 @@ impl<B: ImmutableBlobStore> RemoteCertStore<B> {
         if let Some(guard) = guard {
             self.validate_write_guard(guard)?;
         }
-        let key = resource_key(issuer, domain)?;
+        let key = resource_key(&self.prefix, issuer, domain)?;
         let logical_source =
             STORAGE_KEYS.site_private_key(issuer, &crate::certificate::normalized_name(domain));
-        let source_alias = self.references.inner.canonical_key(&logical_source)?;
-        let target_alias = self.references.inner.canonical_key(destination)?;
+        let source_alias = self.coordinator.canonical_key(&logical_source)?;
+        let target_alias = self.coordinator.canonical_key(destination)?;
         let target = if source_alias == target_alias {
-            STORAGE_KEYS.site_private_key(&key.issuer, &key.domain)
+            key.paths[1].clone()
         } else {
             self.archive_key(destination)?
         };
         match guard {
             Some(guard) => {
-                self.manifests
-                    .move_private_key_with_lock(&key.issuer, &key.domain, &target, guard)
+                self.coordinator
+                    .move_with_lock(&key.paths[1], &target, guard)
                     .await
             }
-            None => {
-                self.manifests
-                    .move_private_key(&key.issuer, &key.domain, &target)
-                    .await
-            }
+            None => self.coordinator.move_key(&key.paths[1], &target).await,
         }
     }
     /// Resolve a logical archive destination and return only its private key.
@@ -410,7 +445,7 @@ impl<B: ImmutableBlobStore> RemoteCertStore<B> {
     pub async fn load_archived_private_key(&self, destination: &str) -> Result<Option<Vec<u8>>> {
         let key = self.archive_key(destination)?;
         // Preserve the coordinator's authoritative read path through decorators.
-        let mut values = self.references.load_many(&[&key]).await?;
+        let mut values = self.coordinator.load_many(&[&key]).await?;
         if values.len() != 1 {
             return Err(failure("invalid private-key archive snapshot"));
         }
@@ -425,10 +460,10 @@ impl<B: ImmutableBlobStore> RemoteCertStore<B> {
 #[async_trait]
 impl<B: ImmutableBlobStore> CertStore for RemoteCertStore<B> {
     fn validate_write_guard(&self, guard: &LockGuard) -> Result<()> {
-        self.references.validate_write_guard(guard)
+        self.coordinator.validate_write_guard(guard)
     }
     async fn load(&self, issuer: &str, domain: &str) -> Result<Option<CertificateResource>> {
-        let key = resource_key(issuer, domain)?;
+        let key = resource_key(&self.prefix, issuer, domain)?;
         match self.reference(&key).await? {
             Some(reference) => self.read_blob(&reference).await.map(Some),
             None => Ok(None),
@@ -447,7 +482,7 @@ impl<B: ImmutableBlobStore> CertStore for RemoteCertStore<B> {
         self.publish(issuer, domain, resource, Some(guard)).await
     }
     async fn has(&self, issuer: &str, domain: &str) -> Result<bool> {
-        let key = resource_key(issuer, domain)?;
+        let key = resource_key(&self.prefix, issuer, domain)?;
         let Some(reference) = self.reference(&key).await? else {
             return Ok(false);
         };
@@ -461,8 +496,11 @@ impl<B: ImmutableBlobStore> CertStore for RemoteCertStore<B> {
         Ok(true)
     }
     async fn remove(&self, issuer: &str, domain: &str) -> Result<()> {
-        let key = resource_key(issuer, domain)?;
-        self.manifests.remove(&key.issuer, &key.domain).await
+        let key = resource_key(&self.prefix, issuer, domain)?;
+        for path in &key.paths {
+            self.coordinator.delete(path).await?;
+        }
+        Ok(())
     }
     async fn move_private_key(&self, issuer: &str, domain: &str, destination: &str) -> Result<()> {
         self.archive(issuer, domain, destination, None).await
@@ -475,127 +513,6 @@ impl<B: ImmutableBlobStore> CertStore for RemoteCertStore<B> {
         guard: &LockGuard,
     ) -> Result<()> {
         self.archive(issuer, domain, destination, Some(guard)).await
-    }
-}
-
-// Private so callers cannot mistake reference records for PEM resources.
-struct ManifestStorage {
-    inner: Arc<dyn Storage>,
-    prefix: String,
-}
-impl fmt::Debug for ManifestStorage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ManifestStorage").finish_non_exhaustive()
-    }
-}
-impl ManifestStorage {
-    fn map(&self, key: &str) -> String {
-        if key.is_empty() {
-            self.prefix.clone()
-        } else {
-            format!("{}/{key}", self.prefix)
-        }
-    }
-    fn keys(&self, keys: &[&str]) -> Vec<String> {
-        keys.iter().map(|key| self.map(key)).collect()
-    }
-    fn bound(value: Vec<u8>) -> Result<Vec<u8>> {
-        if value.len() > MAX_REFERENCE {
-            Err(failure("oversized remote certificate manifest"))
-        } else {
-            Ok(value)
-        }
-    }
-}
-#[async_trait]
-impl Locker for ManifestStorage {
-    async fn lock(&self, ct: &CancellationToken, name: &str) -> Result<LockGuard> {
-        self.inner.lock(ct, name).await
-    }
-    async fn unlock(&self, name: &str) -> Result<()> {
-        self.inner.unlock(name).await
-    }
-}
-#[async_trait]
-impl Storage for ManifestStorage {
-    fn canonical_key<'a>(&self, key: &'a str) -> Result<std::borrow::Cow<'a, str>> {
-        self.inner.canonical_key(key)
-    }
-    fn validate_write_guard(&self, guard: &LockGuard) -> Result<()> {
-        self.inner.validate_write_guard(guard)
-    }
-    async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
-        if value.len() > MAX_REFERENCE {
-            return Err(failure("oversized remote certificate manifest"));
-        }
-        self.inner.store(&self.map(key), value).await
-    }
-    async fn load(&self, key: &str) -> Result<Vec<u8>> {
-        Self::bound(self.inner.load(&self.map(key)).await?)
-    }
-    async fn load_many(&self, keys: &[&str]) -> Result<Vec<Option<Vec<u8>>>> {
-        let keys = self.keys(keys);
-        let refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
-        self.inner
-            .load_many(&refs)
-            .await?
-            .into_iter()
-            .map(|v| v.map(Self::bound).transpose())
-            .collect()
-    }
-    async fn store_tx_with_lock(&self, items: &[KeyValue<'_>], guard: &LockGuard) -> Result<()> {
-        if items.iter().any(|(_, v)| v.len() > MAX_REFERENCE) {
-            return Err(failure("oversized remote certificate manifest"));
-        }
-        let keys = items
-            .iter()
-            .map(|(key, _)| self.map(key))
-            .collect::<Vec<_>>();
-        let mapped = keys
-            .iter()
-            .zip(items)
-            .map(|(key, (_, value))| (key.as_str(), value.clone()))
-            .collect::<Vec<_>>();
-        self.inner.store_tx_with_lock(&mapped, guard).await
-    }
-    async fn move_key(&self, source: &str, destination: &str) -> Result<()> {
-        self.inner
-            .move_key(&self.map(source), &self.map(destination))
-            .await
-    }
-    async fn move_with_lock(
-        &self,
-        source: &str,
-        destination: &str,
-        guard: &LockGuard,
-    ) -> Result<()> {
-        self.inner
-            .move_with_lock(&self.map(source), &self.map(destination), guard)
-            .await
-    }
-    async fn delete(&self, key: &str) -> Result<()> {
-        self.inner.delete(&self.map(key)).await
-    }
-    async fn exists(&self, key: &str) -> Result<bool> {
-        self.inner.exists(&self.map(key)).await
-    }
-    async fn list(&self, path: &str, recursive: bool) -> Result<Vec<String>> {
-        let prefix = format!("{}/", self.prefix);
-        self.inner
-            .list(&self.map(path), recursive)
-            .await?
-            .into_iter()
-            .map(|key| {
-                key.strip_prefix(&prefix)
-                    .map(str::to_owned)
-                    .ok_or_else(|| failure("invalid manifest listing"))
-            })
-            .collect()
-    }
-    async fn stat(&self, key: &str) -> Result<KeyInfo> {
-        let mut info = self.inner.stat(&self.map(key)).await?;
-        info.key = key.to_owned();
-        Ok(info)
     }
 }
 
