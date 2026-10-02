@@ -111,6 +111,8 @@ pub use acme::acme_issuer::ChainPreference;
 pub use cert_store::remote::{ImmutableBlobStore, RemoteCertStore};
 #[cfg(feature = "s3-cert-store")]
 pub use cert_store::s3::{S3BlobStore, S3BlobStoreOptions, S3CertStore};
+#[cfg(feature = "vault-cert-store")]
+pub use cert_store::vault::{VaultCertStore, VaultKv2BlobStore, VaultKv2BlobStoreOptions};
 pub use cert_store::{CertStore, KeyValueCertStore};
 pub use certificate::{
     Certificate, RenewalInfo, RenewalWindow, cert_needs_renewal, currently_in_renewal_window,

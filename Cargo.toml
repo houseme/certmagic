@@ -105,6 +105,7 @@ redis-storage = ["dep:redis"]
 etcd-storage = ["dep:etcd-client"]
 remote-cert-store = []
 s3-cert-store = ["remote-cert-store", "dep:aws-sdk-s3", "dep:aws-smithy-http-client"]
+vault-cert-store = ["remote-cert-store"]
 http-01 = []
 dns-01 = ["dep:hickory-resolver"]
 ocsp = []
@@ -145,3 +146,7 @@ required-features = ["etcd-storage"]
 [[example]]
 name = "s3_cert_store"
 required-features = ["s3-cert-store", "etcd-storage"]
+
+[[example]]
+name = "vault_cert_store"
+required-features = ["vault-cert-store", "etcd-storage"]

@@ -9,6 +9,8 @@
 pub mod remote;
 #[cfg(feature = "s3-cert-store")]
 pub mod s3;
+#[cfg(feature = "vault-cert-store")]
+pub mod vault;
 
 use std::sync::Arc;
 

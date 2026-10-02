@@ -14,6 +14,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   coordinator's fencing; interrupted uploads never trigger unsafe blob cleanup.
 - Add optional `s3-cert-store` with conditional object creation, bounded streamed
   reads, caller-configured SDK clients and explicit missing-bucket/error handling.
+- Add optional `vault-cert-store` for Vault KV v2 with CAS-zero writes, immutable
+  version checks, HTTPS/token/namespace support and deleted-version detection.
 
 - Add focused guarded-group benchmarks and publish ABBA samples, same-key
   controls, review findings and verification boundaries.
