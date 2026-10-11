@@ -8,6 +8,11 @@
 //! responses, coordinates with other instances through shared storage, and can
 //! even obtain certificates on-demand during the TLS handshake.
 //!
+//! Version 0.2 adds optional Redis/etcd coordination and S3, Vault KV v2 and
+//! AWS Secrets Manager certificate stores. Select their Cargo features explicitly;
+//! builds with `etcd-storage` require `protoc`. See the README upgrade notes
+//! before switching a shared FileStorage deployment from 0.1 to 0.2.
+//!
 //! ## High-level API
 //!
 //! ```no_run

@@ -65,7 +65,7 @@ Rust API (async traits, typed events, `thiserror`, `Send + Sync` everywhere).
 
 ```toml
 [dependencies]
-certmagic = "0.1"
+certmagic = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -76,7 +76,7 @@ explicitly:
 
 ```toml
 [dependencies]
-certmagic = { version = "0.1", default-features = false, features = [
+certmagic = { version = "0.2", default-features = false, features = [
   "ring", "file-storage", "http-01", "dns-01", "ocsp",
 ] }
 ```
@@ -92,6 +92,32 @@ Deployments that only issue ECDSA or Ed25519 certificates should leave it off
 to keep the dependency tree smaller and avoid RSA-specific timing-sidechannel
 risk. RustSec `RUSTSEC-2023-0071` remains explicitly tracked because the
 upstream project has not published a fixed release yet.
+
+## Upgrading from 0.1 to 0.2
+
+Version 0.2.0 adds optional Redis/etcd coordination and S3, Vault KV v2 and
+AWS Secrets Manager certificate stores. See the [0.2.0 changelog](CHANGELOG.md#020---2026-10-11)
+and the backend sections below for configuration and validation limits.
+
+- **FileStorage coordination:** stop all cooperating instances before upgrading,
+  then restart them together. The new lock protocol requires OS file locks on
+  the shared filesystem; preserve `locks/*.guard` sidecars while nodes run.
+  Existing certificate, key, metadata and account paths remain compatible.
+- **Custom backends:** implement `move_key` for no-clobber private-key archival.
+  Implement `canonical_key` when aliases exist. A backend accepting write fences
+  must atomically implement guarded writes and moves; defaults reject unsupported
+  fences before CA work. Pair manual `track_lock` calls with `untrack_lock`.
+- **Remote certificate stores:** pass the same coordinator instance to Config
+  and RemoteCertStore. Etcd validates ownership during reference publication;
+  FileStorage/Redis retain their documented coordination limits. Back up both
+  references and blobs, and define retention for immutable history and archives.
+- **Crypto and builds:** RSA key generation is opt-in (`rsa`); default features
+  use AWS-LC. Choose `ring` explicitly when disabling defaults. Etcd builds need
+  `protoc`, including `--all-features` and etcd-backed remote-store examples.
+- **HTTP and DNS:** the HTTP/1.1 convenience wrapper accepts Content-Length
+  bodies up to 1 MiB with a 30-second read deadline and rejects transfer encoding.
+  Explicit DNS resolvers accept IPs (port 53) or socket addresses with custom
+  ports; hostname resolver entries are rejected before lookup.
 
 ## Quick start
 
@@ -270,7 +296,7 @@ Reproducible local performance measurements and their limits are documented in
 
 ## Etcd adapter and guarded publication
 
-Etcd support is **Unreleased**, not part of the published 0.1.0. Enable
+Etcd support is available in **0.2.0**. Enable
 `etcd-storage`; builds enabling this feature (including `--all-features`) need
 `protoc` on PATH. The optional client uses the crate's selected Ring/AWS-LC TLS
 provider; default builds do not pull in the etcd/gRPC dependency graph.
@@ -352,7 +378,7 @@ contacted. The explicit example is `examples/etcd_storage.rs`.
 
 ## Remote certificate stores
 
-These adapters are **Unreleased**. Enable `s3-cert-store`, `vault-cert-store` or
+These adapters are available in **0.2.0**. Enable `s3-cert-store`, `vault-cert-store` or
 `secrets-manager-cert-store`; defaults remain unchanged. Each reuses
 `RemoteCertStore<B>` and the `ImmutableBlobStore` contract for additional services.
 Construct a blob backend, then call `RemoteCertStore::new(backend,
@@ -414,12 +440,10 @@ cargo test --locked --no-default-features \
 
 ## Redis adapter
 
-Redis support is currently **Unreleased**, not part of the published 0.1.0.
-Build this repository checkout with `--features redis-storage`; a local consumer
-can use a path dependency until the next release:
+Redis support is available in **0.2.0**. Enable `redis-storage` explicitly:
 
 ```toml
-certmagic = { path = "../certmagic", features = ["redis-storage"] }
+certmagic = { version = "0.2", features = ["redis-storage"] }
 ```
 
 ```rust,no_run

@@ -106,6 +106,11 @@ jobs:
       - name: All features
         if: runner.os == 'Linux' && matrix.toolchain == 'stable'
         run: cargo test --locked --all-features --no-fail-fast
+      - name: Full API documentation
+        if: runner.os == 'Linux' && matrix.toolchain == 'stable'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --all-features --no-deps
 
   clippy:
     name: Clippy (${{ matrix.toolchain }})

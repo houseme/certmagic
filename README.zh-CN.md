@@ -43,7 +43,7 @@ CertMagic 为你托管 TLS 证书：从 ACME CA（Let's Encrypt、ZeroSSL 等）
 
 ```toml
 [dependencies]
-certmagic = "0.1"
+certmagic = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -52,7 +52,7 @@ tokio = { version = "1", features = ["full"] }
 
 ```toml
 [dependencies]
-certmagic = { version = "0.1", default-features = false, features = [
+certmagic = { version = "0.2", default-features = false, features = [
   "ring", "file-storage", "http-01", "dns-01", "ocsp",
 ] }
 ```
@@ -63,6 +63,28 @@ certmagic = { version = "0.1", default-features = false, features = [
 只签发 ECDSA 或 Ed25519 证书的部署应保持关闭，以缩小依赖树并避免 RSA
 路径的 timing side-channel 风险。RustSec `RUSTSEC-2023-0071` 仍被显式跟踪，
 因为上游尚未发布修复版本。
+
+## 从 0.1 升级到 0.2
+
+0.2.0 增加可选 Redis/etcd 协调后端，以及 S3、Vault KV v2 和 AWS Secrets Manager
+证书存储。完整变更见 [0.2.0 changelog](CHANGELOG.md#020---2026-10-11)，配置与验证范围
+见下方对应后端说明。
+
+- **FileStorage 协调**：升级前停止所有协作实例，再以新版本一起启动。新锁协议要求
+  共享文件系统支持操作系统文件锁；实例运行时保留 `locks/*.guard` 辅助文件。
+  已有证书、私钥、元数据和账户存储路径兼容。
+- **自定义后端**：私钥归档需实现不覆盖目标的 `move_key`；存在键别名时实现
+  `canonical_key`。接受写入 fence 的后端必须原子实现受保护写入和移动；默认实现
+  在联系 CA 前拒绝不支持的 fence。手动 `track_lock` 必须配对 `untrack_lock`。
+- **远程证书存储**：Config 与 RemoteCertStore 使用同一个协调存储实例。
+  etcd 在发布引用时校验所有权；FileStorage/Redis 的协调边界见文档。
+  同时备份引用和对象，为不可变历史数据与归档制定保留策略。
+- **加密与构建**：RSA 密钥生成为 opt-in（`rsa`），默认使用 AWS-LC；关闭默认
+  feature 时需显式选择 `ring`。etcd、`--all-features` 及采用 etcd 的远程存储
+  示例构建需要 `protoc`。
+- **HTTP 与 DNS**：HTTP/1.1 包装器接受不超过 1 MiB 的 Content-Length 请求体，
+  读取总超时 30 秒，拒绝 transfer encoding。显式 DNS 解析器接受 IP（默认 53 端口）
+  或含自定义端口的 socket address；主机名形式的解析器条目会在查询前被拒绝。
 
 ## 快速开始
 
@@ -216,7 +238,7 @@ Redis 异步复制后的故障切换不能自动保证锁互斥，持久化策�
 
 ## Etcd 适配器与写入侧保护
 
-此功能属于 **Unreleased**，不包含在已发布的 0.1.0 中。启用 `etcd-storage`；
+此功能包含在 **0.2.0** 中。启用 `etcd-storage`；
 构建此功能（包括 `--all-features`）需安装 `protoc`。默认构建不引入 etcd/gRPC 依赖；
 TLS 使用所选择的 Ring 或 AWS-LC provider。
 
@@ -262,8 +284,11 @@ cargo test --locked --no-default-features --features ring,etcd-storage,local-cac
 
 ## Redis 适配器
 
-该能力目前属于 **Unreleased**，已发布的 0.1.0 不包含此 feature；请在当前仓库源码
-或 path 依赖中使用，等待后续版本发布。
+该能力包含在 **0.2.0** 中，需显式启用：
+
+```toml
+certmagic = { version = "0.2", features = ["redis-storage"] }
+```
 
 启用 `features = ["redis-storage"]`，通过
 `RedisStorage::connect(url, RedisStorageOptions { namespace: "my-service".into(), ..Default::default() }).await?`
@@ -309,7 +334,7 @@ Valkey、Consul、DynamoDB 与嵌入式 KV 仍是候选方案。
 
 ## S3 与密钥服务证书存储
 
-本轮功能属于 **Unreleased**，不包含在已发布的 0.1.0 中。分别启用
+这些适配器包含在 **0.2.0** 中。分别启用
 `s3-cert-store`、`vault-cert-store`、`secrets-manager-cert-store`；默认功能不变。
 三者复用 `RemoteCertStore<B>`，其他服务可实现 `ImmutableBlobStore`。
 创建对象后端后调用 `RemoteCertStore::new(backend, coordinator.clone(), namespace)`，

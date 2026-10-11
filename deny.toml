@@ -35,7 +35,7 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 version = 2
 # Warn on yanked versions; RustSec advisories fail by default.
 yanked = "warn"
-# RustCrypto RSA 0.10.0-rc.18 is still affected by Marvin timing side
+# RustCrypto RSA 0.10.0-rc.19 is still affected by Marvin timing side
 # channels and upstream has not published a fixed release. RSA is opt-in in
 # this crate; keep the exception explicit until RustCrypto ships a fix.
 ignore = ["RUSTSEC-2023-0071"]

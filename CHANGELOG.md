@@ -6,7 +6,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-11
+
+Add shared storage and remote certificate backends, guarded multi-node
+publication, cache/coordination performance improvements, and lifecycle fixes.
+See the README upgrade notes for FileStorage coordination and custom-backend
+requirements when migrating from 0.1.0.
+
 ### Added
+
+- Build the published API documentation with all optional backends enabled on
+  docs.rs and validate the full API documentation in the stable Linux CI lane.
 
 - Add optional `remote-cert-store` with immutable, content-addressed complete
   certificate blobs, bounded encoding and coordinated reference publication.
@@ -26,7 +36,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   controls, review findings and verification boundaries.
 - Add explicit exact-value existence checks and non-overwriting exact-key moves.
   Custom storage backends without move support fail before mutating either key.
-- Add optional `etcd-storage` using etcd-client 0.20 with namespaced binary
+- Add optional `etcd-storage` using etcd-client 0.21 with namespaced binary
   records, paginated revision snapshots, renewable leases, multi-endpoint
   connections, password authentication and TLS/mutual TLS.
 - Add three-node etcd fault/recovery and mutual-TLS integration tests, an explicit
@@ -107,6 +117,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   key-value certificate store while retaining incomplete-resource detection.
 
 ### Fixed
+
+- Preserve explicit DNS resolver ports for UDP and TCP propagation checks,
+  accept IPv4/IPv6 addresses and socket addresses, and reject invalid resolver
+  entries before lookup.
 
 - Build the isolated MinIO test image from a fixed official source commit,
   replacing the unavailable community image that prevented CI service tests
@@ -294,5 +308,6 @@ local/external validation lanes.
 - Complete API mapping and deviation records.
 - Bilingual README files and external-validation evidence procedures.
 
-[Unreleased]: https://github.com/houseme/certmagic/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/houseme/certmagic/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/houseme/certmagic/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/houseme/certmagic/releases/tag/v0.1.0
