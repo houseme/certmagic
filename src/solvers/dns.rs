@@ -42,7 +42,8 @@ pub trait DnsProvider: Send + Sync + std::fmt::Debug {
 /// touch the network, can inject an implementation with
 /// [`Dns01Solver::with_resolver`].  An empty `resolvers` slice means the
 /// implementation should use its authoritative-name-server path; non-empty
-/// entries are explicit `host:port` recursive resolvers.
+/// entries are explicit IP addresses (port 53) or IP socket addresses with
+/// an explicit port, such as `127.0.0.1:5300` or `[::1]:5300`.
 #[async_trait]
 pub trait DnsResolver: Send + Sync + std::fmt::Debug {
     /// Find the closest SOA apex for `fqdn`.
