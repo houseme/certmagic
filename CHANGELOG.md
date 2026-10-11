@@ -51,6 +51,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Update Tokio to 1.53.2, tokio-util to 0.7.20, etcd-client to 0.21.0,
+  RSA to 0.10.0-rc.19 and serde_json to 1.0.152; align the S3 SDK
+  requirement with the locked 1.152.0 release and refresh transitive dependencies.
+
 - Simplify remote certificate publication to direct typed references on the
   originating coordinator, removing synthetic certificate resources and the
   forwarding Storage decorator. Preserve v1 paths, object bytes, snapshots,

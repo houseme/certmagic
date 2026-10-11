@@ -13,8 +13,8 @@ exclude = ["docs/", ".github/"]
 
 [dependencies]
 # async runtime
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "fs", "io-util", "signal"] }
-tokio-util = { version = "0.7.19", features = ["rt"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "time", "sync", "fs", "io-util", "signal"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
 futures = "0.3.34"
 
 # TLS
@@ -28,14 +28,14 @@ x509-parser = "0.18.1"
 ring = { version = "0.17.14", optional = true }
 aws-lc-rs = { version = "1.18.1", optional = true }
 p521 = { version = "0.14.0", features = ["ecdsa"] }
-rsa = { version = "0.10.0-rc.18", optional = true, features = ["sha2", "getrandom"] }
+rsa = { version = "0.10.0-rc.19", optional = true, features = ["sha2", "getrandom"] }
 
 # HTTP
 reqwest = { version = "0.13.5", default-features = false, features = ["form", "http2", "json"] }
 
 # serialization / errors / logging
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.152"
 thiserror = "2.0.21"
 tracing = "0.1.44"
 async-trait = "0.1.92"
@@ -52,15 +52,15 @@ url = "2.5.8"
 hickory-resolver = { version = "0.26.3", optional = true }
 redis = { version = "1.7.1", optional = true, default-features = false, features = ["tokio-rustls-comp", "tls-rustls-webpki-roots", "connection-manager"] }
 
-etcd-client = { version = "0.20.0", optional = true, default-features = false, features = ["tls-webpki-roots"] }
+etcd-client = { version = "0.21.0", optional = true, default-features = false, features = ["tls-webpki-roots"] }
 
-aws-sdk-s3 = { version = "1.150.0", optional = true, default-features = false, features = ["rt-tokio"] }
+aws-sdk-s3 = { version = "1.152.0", optional = true, default-features = false, features = ["rt-tokio"] }
 aws-sdk-secretsmanager = { version = "1.120.0", optional = true, default-features = false, features = ["rt-tokio"] }
 aws-smithy-http-client = { version = "1.5.0", optional = true, default-features = false, features = ["rt-tokio"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", features = ["test-util"] }
+tokio = { version = "1.53.2", features = ["test-util"] }
 
 [features]
 # Production-oriented default: AWS-LC-RS is the rustls/reqwest/rcgen
