@@ -214,18 +214,14 @@ pub async fn txt_contains_with_resolvers(
     }
     #[cfg(feature = "dns-01")]
     {
-        use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+        use hickory_resolver::config::{ResolverConfig, ResolverOpts};
         use hickory_resolver::net::runtime::TokioRuntimeProvider;
         use hickory_resolver::proto::rr::{RData, RecordType};
 
         let servers: Vec<_> = resolvers
             .iter()
-            .filter_map(|resolver| resolver.parse().ok())
-            .map(NameServerConfig::udp_and_tcp)
-            .collect();
-        if servers.is_empty() {
-            return Ok(false);
-        }
+            .map(|resolver| explicit_nameserver_config(resolver))
+            .collect::<Result<_>>()?;
         let config = ResolverConfig::from_parts(None, vec![], servers);
         let resolver = hickory_resolver::Resolver::builder_with_config(
             config,
@@ -255,6 +251,34 @@ pub async fn txt_contains_with_resolvers(
         let _ = (name, value, resolvers);
         Err(Error::Dns(DnsError::Disabled))
     }
+}
+
+#[cfg(feature = "dns-01")]
+fn explicit_nameserver_config(
+    resolver: &str,
+) -> Result<hickory_resolver::config::NameServerConfig> {
+    use std::net::{IpAddr, SocketAddr};
+
+    let invalid = || {
+        Error::Dns(DnsError::Query(
+            "invalid explicit DNS resolver address".into(),
+        ))
+    };
+    let resolver = resolver.trim();
+    let address = resolver
+        .parse::<SocketAddr>()
+        .or_else(|_| resolver.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
+        .map_err(|_| invalid())?;
+    if address.port() == 0
+        || matches!(address, SocketAddr::V6(address) if address.scope_id() != 0 || address.flowinfo() != 0)
+    {
+        return Err(invalid());
+    }
+    let mut config = hickory_resolver::config::NameServerConfig::udp_and_tcp(address.ip());
+    for connection in &mut config.connections {
+        connection.port = address.port();
+    }
+    Ok(config)
 }
 
 #[cfg(feature = "dns-01")]
@@ -292,6 +316,93 @@ mod tests {
     fn explicit_recursive_nameservers_are_normalized() {
         let input = vec!["8.8.8.8.".to_owned(), " 1.1.1.1 ".to_owned()];
         assert_eq!(recursive_nameservers(&input), vec!["8.8.8.8", "1.1.1.1"]);
+    }
+
+    #[cfg(feature = "dns-01")]
+    #[test]
+    fn explicit_resolver_addresses_preserve_udp_and_tcp_ports() {
+        for (input, ip, port) in [
+            ("127.0.0.1", "127.0.0.1", 53),
+            ("127.0.0.1:5300", "127.0.0.1", 5300),
+            ("::1", "::1", 53),
+            ("[::1]:5301", "::1", 5301),
+        ] {
+            let config = explicit_nameserver_config(input).unwrap();
+            assert_eq!(config.ip.to_string(), ip);
+            assert_eq!(config.connections.len(), 2);
+            assert!(
+                config
+                    .connections
+                    .iter()
+                    .all(|connection| connection.port == port),
+                "DNS_RESOLVER_INVARIANT UDP and TCP preserve explicit port"
+            );
+        }
+    }
+
+    #[cfg(feature = "dns-01")]
+    #[tokio::test]
+    async fn explicit_resolver_invalid_entries_fail_before_lookup() {
+        for invalid in ["", "resolver.invalid:53", "127.0.0.1:0", "[fe80::1%4]:53"] {
+            let result = txt_contains_with_resolvers(
+                "_acme-challenge.example.com",
+                "owned-challenge",
+                &["127.0.0.1:5300".to_owned(), invalid.to_owned()],
+            )
+            .await;
+            assert!(
+                matches!(result, Err(Error::Dns(DnsError::Query(message))) if message == "invalid explicit DNS resolver address"),
+                "DNS_RESOLVER_INVARIANT invalid explicit address cannot be silently dropped"
+            );
+        }
+    }
+
+    #[cfg(feature = "dns-01")]
+    #[tokio::test]
+    async fn explicit_resolver_socket_port_sends_real_txt_query() {
+        use hickory_resolver::proto::{
+            op::Message,
+            rr::{RData, Record, rdata::TXT},
+        };
+        use tokio::net::UdpSocket;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut buffer = [0u8; 4096];
+            let (size, peer) = socket.recv_from(&mut buffer).await.unwrap();
+            let request = Message::from_vec(&buffer[..size]).unwrap();
+            let mut response = Message::response(request.id, request.op_code);
+            response.metadata.recursion_desired = request.recursion_desired;
+            response.metadata.recursion_available = true;
+            for query in &request.queries {
+                response.add_query(query.clone());
+                response.add_answer(Record::from_rdata(
+                    query.name().clone(),
+                    60,
+                    RData::TXT(TXT::new(vec!["owned-challenge".to_owned()])),
+                ));
+            }
+            socket
+                .send_to(&response.to_vec().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            txt_contains_with_resolvers(
+                "_acme-challenge.example.com",
+                "owned-challenge",
+                &[address.to_string()],
+            ),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(result, Ok(Ok(true))),
+            "DNS_RESOLVER_INVARIANT explicit socket port reaches TXT server"
+        );
     }
 
     #[tokio::test]
