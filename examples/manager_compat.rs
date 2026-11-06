@@ -40,6 +40,25 @@ fn maintenance_signatures(manager: &CertManager) {
     let _shutdown = stop_maintenance(manager);
 }
 
+async fn mutual_tls_signatures(manager: &CertManager, roots: rustls::RootCertStore) -> Result<()> {
+    let _identity = manager.client_identity("client.example.com").await?;
+    let _config = manager
+        .client_config_with_roots("client.example.com", roots)
+        .await?;
+    Ok(())
+}
+
+fn bounded_listener_signature(
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> std::io::Result<certmagic::BoundTlsListener> {
+    certmagic::BoundTlsListener::with_limits(
+        listener,
+        acceptor,
+        certmagic::TlsListenerLimits::default(),
+    )
+}
+
 fn main() {
     // Keep this binary side-effect free. `cargo run --example manager_compat`
     // should never create storage or spawn a maintenance task.
@@ -48,5 +67,7 @@ fn main() {
         manage_signature,
         background_manage_signature,
         maintenance_signatures,
+        mutual_tls_signatures,
+        bounded_listener_signature,
     );
 }

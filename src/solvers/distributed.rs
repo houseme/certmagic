@@ -27,12 +27,12 @@ pub fn challenge_tokens_key(issuer_key: &str, identifier: &str) -> String {
     format!(
         "{}/{}.json",
         challenge_tokens_prefix(issuer_key),
-        STORAGE_KEYS.safe(identifier)
+        crate::crypto::sha256_hex(crate::certificate::normalized_name(identifier).as_bytes())
     )
 }
 
 /// The serialized form stored in shared storage.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishedChallenge {
     /// Challenge type.
     pub kind: String,
@@ -81,21 +81,46 @@ pub async fn load_published(
     identifier: &str,
 ) -> Result<Option<crate::solvers::SolvableChallenge>> {
     for issuer_key in issuer_keys {
-        let key = challenge_tokens_key(issuer_key, identifier);
-        match storage.load(&key).await {
-            Ok(data) => {
-                if data.is_empty() {
-                    continue;
+        let canonical = challenge_tokens_key(issuer_key, identifier);
+        let legacy = format!(
+            "{}/{}.json",
+            challenge_tokens_prefix(issuer_key),
+            STORAGE_KEYS.safe(identifier)
+        );
+        let keys = [
+            Some(canonical.clone()),
+            (legacy.split('/').all(|part| part.len() <= 240)).then_some(legacy),
+        ];
+        for key in keys.into_iter().flatten() {
+            match storage.load(&key).await {
+                Ok(bytes) => {
+                    let value: serde_json::Value = serde_json::from_slice(&bytes)
+                        .map_err(|_| Error::Internal("invalid challenge publication".into()))?;
+                    if key == canonical && value["version"] == 1 && value["retired"] == true {
+                        if value["identifier"].as_str()
+                            != Some(crate::certificate::normalized_name(identifier).as_str())
+                        {
+                            return Err(Error::Internal(
+                                "challenge retirement identity mismatch".into(),
+                            ));
+                        }
+                        break;
+                    }
+                    let published: PublishedChallenge =
+                        serde_json::from_slice(&bytes).map_err(|_| {
+                            Error::Storage(crate::error::StorageError::Other(
+                                "invalid challenge publication".into(),
+                            ))
+                        })?;
+                    if crate::certificate::normalized_name(&published.identifier)
+                        == crate::certificate::normalized_name(identifier)
+                    {
+                        return Ok(Some(published.into()));
+                    }
                 }
-                let published: PublishedChallenge = serde_json::from_slice(&data).map_err(|e| {
-                    Error::Storage(crate::error::StorageError::Other(format!(
-                        "challenge token decode: {e}"
-                    )))
-                })?;
-                return Ok(Some(published.into()));
+                Err(Error::Storage(crate::error::StorageError::NotFound(_))) => {}
+                Err(error) => return Err(error),
             }
-            Err(Error::Storage(crate::error::StorageError::NotFound(_))) => continue,
-            Err(err) => return Err(err),
         }
     }
     Ok(None)
@@ -125,10 +150,19 @@ impl Solver for DistributedSolver {
         let data = serde_json::to_vec(&PublishedChallenge::from(chal)).map_err(|e| {
             Error::Storage(crate::error::StorageError::Other(format!("encode: {e}")))
         })?;
-        self.storage.store(&key, &data).await?;
+        let guard = crate::storage::acquire_lock(
+            ct,
+            &self.storage,
+            &format!("challenge_{}", crate::crypto::sha256_hex(key.as_bytes())),
+        )
+        .await?;
+        self.storage
+            .store_tx_with_lock(&[(&key, data)], &guard)
+            .await?;
+        guard.release_and_wait().await?;
         if let Err(err) = self.inner.present(ct, chal).await {
             // Best-effort: don't leave the publication dangling.
-            let _ = self.storage.delete(&key).await;
+            self.cleanup(chal).await;
             return Err(err);
         }
         Ok(())
@@ -143,10 +177,46 @@ impl Solver for DistributedSolver {
     }
 
     async fn cleanup(&self, chal: &crate::solvers::SolvableChallenge) {
-        // Remove the shared publication first, then the local answer.
         let key = challenge_tokens_key(&self.issuer_key, &chal.identifier);
-        if let Err(err) = self.storage.delete(&key).await {
-            tracing::warn!(key = %key, error = %err, "distributed challenge cleanup failed");
+        let cleanup = async {
+            let guard = crate::storage::acquire_lock(
+                &CancellationToken::new(),
+                &self.storage,
+                &format!("challenge_{}", crate::crypto::sha256_hex(key.as_bytes())),
+            )
+            .await?;
+            match self.storage.load(&key).await {
+                Ok(bytes) => {
+                    let value: serde_json::Value = serde_json::from_slice(&bytes)
+                        .map_err(|_| Error::Internal("invalid challenge publication".into()))?;
+                    if value["version"] == 1 && value["retired"] == true {
+                        return Ok(());
+                    }
+                    let current: PublishedChallenge = serde_json::from_slice(&bytes)
+                        .map_err(|_| Error::Internal("invalid challenge publication".into()))?;
+                    if current == PublishedChallenge::from(chal) {
+                        let receipt = serde_json::to_vec(&serde_json::json!({
+                            "version": 1,
+                            "retired": true,
+                            "identifier": crate::certificate::normalized_name(&chal.identifier),
+                        }))
+                        .map_err(|_| {
+                            Error::Internal("challenge retirement encoding failed".into())
+                        })?;
+                        self.storage
+                            .store_tx_with_lock(&[(&key, receipt)], &guard)
+                            .await?;
+                    }
+                }
+                Err(Error::Storage(crate::error::StorageError::NotFound(_))) => {}
+                Err(error) => return Err(error),
+            }
+            Ok::<_, Error>(())
+        };
+        if let Ok(Err(error)) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), cleanup).await
+        {
+            tracing::warn!(%error, "challenge retirement failed");
         }
         self.inner.cleanup(chal).await;
     }
@@ -170,11 +240,14 @@ mod tests {
     fn key_layout_is_stable() {
         assert_eq!(
             challenge_tokens_key("acme-v02", "example.com"),
-            "certificates/acme-v02/challenge_tokens/example.com.json"
+            format!(
+                "certificates/acme-v02/challenge_tokens/{}.json",
+                crate::crypto::sha256_hex(b"example.com")
+            )
         );
-        assert_eq!(
+        assert_ne!(
             challenge_tokens_key("acme-v02", "*.example.com"),
-            "certificates/acme-v02/challenge_tokens/wildcard_.example.com.json"
+            challenge_tokens_key("acme-v02", "wildcard_.example.com")
         );
     }
 
@@ -216,6 +289,19 @@ mod tests {
         .unwrap();
         assert_eq!(loaded.unwrap().key_authorization, "tok.thumb");
 
+        let legacy_key = format!(
+            "{}/{}.json",
+            challenge_tokens_prefix("acme-v02"),
+            STORAGE_KEYS.safe(&chal.identifier)
+        );
+        storage
+            .store(
+                &legacy_key,
+                &serde_json::to_vec(&PublishedChallenge::from(&chal)).unwrap(),
+            )
+            .await
+            .unwrap();
+        solver.cleanup(&chal).await;
         solver.cleanup(&chal).await;
         let gone = load_published(
             solver.storage.as_ref(),
@@ -225,5 +311,17 @@ mod tests {
         .await
         .unwrap();
         assert!(gone.is_none());
+
+        let mut replacement = chal.clone();
+        replacement.token = "next".into();
+        replacement.key_authorization = "next.thumb".into();
+        solver.present(&ct, &replacement).await.unwrap();
+        solver.cleanup(&chal).await;
+        let current = load_published(storage.as_ref(), &["acme-v02".into()], "example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.key_authorization, replacement.key_authorization);
+        solver.cleanup(&replacement).await;
     }
 }

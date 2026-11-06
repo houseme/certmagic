@@ -44,7 +44,14 @@ impl MockServer {
             let mut poll_count = 0;
             for _ in 0..expected_requests {
                 let (mut stream, _) = listener.accept().await.expect("accept mock request");
-                let (method, target) = read_request(&mut stream).await;
+                let (method, target, body) = read_request(&mut stream).await;
+                if target.starts_with("/certificates/mock-cert-1/challenges") {
+                    assert!(
+                        url::form_urlencoded::parse(body.as_bytes())
+                            .any(|(key, value)| key == "validation_email"
+                                && value == "admin@example.test")
+                    );
+                }
                 paths.push(target.clone());
                 let response = response_for(mode, &method, &target, &mut poll_count);
                 stream
@@ -65,7 +72,7 @@ impl MockServer {
     }
 }
 
-async fn read_request(stream: &mut TcpStream) -> (String, String) {
+async fn read_request(stream: &mut TcpStream) -> (String, String, String) {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 4096];
     let header_end = loop {
@@ -105,7 +112,11 @@ async fn read_request(stream: &mut TcpStream) -> (String, String) {
     let mut fields = request_line.split_whitespace();
     let method = fields.next().expect("mock request method").to_owned();
     let target = fields.next().expect("mock request target").to_owned();
-    (method, target)
+    (
+        method,
+        target,
+        String::from_utf8(buffer[header_end..header_end + content_length].to_vec()).unwrap(),
+    )
 }
 
 fn response_for(mode: MockMode, method: &str, target: &str, poll_count: &mut usize) -> String {
@@ -116,7 +127,7 @@ fn response_for(mode: MockMode, method: &str, target: &str, poll_count: &mut usi
             r#"{"error":{"code":"invalid_csr"}}"#.to_owned(),
         ),
         MockMode::Lifecycle => match (method, path) {
-            ("POST", "/certificates") => ("201 Created", r#"{"id":"mock-cert-1"}"#.into()),
+            ("POST", "/certificates") => ("201 Created", r#"{"id":"mock-cert-1","validation":{"email_validation":{"example.test":["admin@example.test"]}}}"#.into()),
             ("POST", "/certificates/mock-cert-1/challenges") => {
                 ("200 OK", r#"{"success":true}"#.into())
             }
@@ -176,6 +187,8 @@ async fn rest_issuer_completes_lifecycle_without_persisting_secrets() {
     let mock = MockServer::start(MockMode::Lifecycle).await;
     let temporary_storage = tempfile::tempdir().expect("create temporary storage");
     let issuer = ZeroSslApiIssuer::new(API_KEY)
+        .with_validation_email("EXAMPLE.TEST.", "admin@example.test")
+        .unwrap()
         .with_api_base_url(&mock.base_url)
         .expect("configure mock API URL")
         .with_poll_interval(Duration::ZERO);

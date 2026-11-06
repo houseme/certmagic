@@ -15,14 +15,10 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
-#[cfg(feature = "ocsp")]
-use tokio_util::sync::CancellationToken;
 
 use crate::cache::{
     Cache, CacheOptions, DEFAULT_OCSP_CHECK_INTERVAL, DEFAULT_RENEW_CHECK_INTERVAL,
 };
-#[cfg(feature = "ocsp")]
-use crate::config::Config;
 use crate::config::{ConfigOptions, OcspConfig};
 use crate::storage::Storage;
 
@@ -133,37 +129,23 @@ const MAX_PANIC_RESTARTS: u32 = 10;
 pub(crate) fn spawn_maintainer(cache: Arc<Cache>, generation: u64) -> JoinHandle<()> {
     let weak_cache = Arc::downgrade(&cache);
     let stop = cache.stop_token();
+    let intervals = cache.interval_updates();
     // Do not move `cache` into the task. The cache owns this JoinHandle, and
     // moving an Arc back into the task would create a self-retaining cycle
     // when callers drop their last cache reference without stopping it.
     drop(cache);
+    // Runtime shutdown may drop the task before its first poll. Completion
+    // must be owned by the future already so shutdown observers still wake.
+    let completion = MaintenanceCompletionGuard {
+        cache: weak_cache.clone(),
+        generation,
+    };
     tokio::spawn(async move {
-        let completion = MaintenanceCompletionGuard {
-            cache: weak_cache.clone(),
-            generation,
-        };
+        let _completion = completion;
         let mut panic_count: u32 = 0;
         loop {
-            let Some(cache) = weak_cache.upgrade() else {
-                return;
-            };
-            let renew_interval = cache
-                .options()
-                .renew_check_interval
-                .unwrap_or(DEFAULT_RENEW_CHECK_INTERVAL);
-            let ocsp_interval = cache
-                .options()
-                .ocsp_check_interval
-                .unwrap_or(DEFAULT_OCSP_CHECK_INTERVAL);
-            drop(cache);
-
-            let result = run_maintenance_loop(
-                weak_cache.clone(),
-                stop.clone(),
-                renew_interval,
-                ocsp_interval,
-            )
-            .await;
+            let result =
+                run_maintenance_loop(weak_cache.clone(), stop.clone(), intervals.clone()).await;
             match result {
                 LoopExit::Stopped | LoopExit::Dropped => break,
                 LoopExit::Panicked => {
@@ -176,7 +158,6 @@ pub(crate) fn spawn_maintainer(cache: Arc<Cache>, generation: u64) -> JoinHandle
                 }
             }
         }
-        drop(completion);
     })
 }
 
@@ -250,39 +231,74 @@ enum LoopExit {
 async fn run_maintenance_loop(
     cache: Weak<Cache>,
     stop: tokio_util::sync::CancellationToken,
-    renew_interval: Duration,
-    ocsp_interval: Duration,
+    mut intervals: tokio::sync::watch::Receiver<(Duration, Duration)>,
 ) -> LoopExit {
+    let (mut renew_interval, mut ocsp_interval) = *intervals.borrow_and_update();
     let mut renew_ticker = tokio::time::interval(renew_interval);
     renew_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ocsp_ticker = tokio::time::interval(ocsp_interval);
     ocsp_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
+        let Some(current) = cache.upgrade() else {
+            return LoopExit::Dropped;
+        };
+        let wakeup = current.wakeups();
+        let delay = current.maintenance_delay();
+        drop(current);
+        let sleep = tokio::time::sleep(delay.unwrap_or(Duration::from_secs(86400)));
         let tick = tokio::select! {
+            biased;
             () = stop.cancelled() => return LoopExit::Stopped,
+            changed = intervals.changed() => {
+                if changed.is_err() { return LoopExit::Dropped; }
+                let (renew, ocsp) = *intervals.borrow_and_update();
+                let now = tokio::time::Instant::now();
+                if renew != renew_interval {
+                    renew_interval = renew;
+                    renew_ticker = tokio::time::interval_at(now + renew, renew);
+                    renew_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                }
+                if ocsp != ocsp_interval {
+                    ocsp_interval = ocsp;
+                    ocsp_ticker = tokio::time::interval_at(now + ocsp, ocsp);
+                    ocsp_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                }
+                continue;
+            }
+            () = wakeup.notified() => continue,
+            () = sleep, if delay.is_some() => Tick::Deadline,
             _ = renew_ticker.tick() => Tick::Renew,
             _ = ocsp_ticker.tick() => Tick::Ocsp,
         };
 
-        // Panics inside a sweep abort the task (JoinError::is_panic) and the
-        // outer runner restarts the loop.
+        // Keep the sweep in the owned task so shutdown drops blocked callbacks
+        // and I/O. Catch unwind without spawning a detached child task.
         let Some(cache_ref) = cache.upgrade() else {
             return LoopExit::Dropped;
         };
-        let outcome = tokio::spawn(async move {
+        let sweep = async move {
             match tick {
                 Tick::Renew => {
                     tracing::trace!("renewal sweep starting");
-                    crate::maintain::renew_managed_certificates(&cache_ref).await;
+                    enqueue_renewals(&cache_ref, true);
                 }
                 Tick::Ocsp => {
                     tracing::trace!("OCSP sweep starting");
-                    crate::maintain::update_ocsp_staples(&cache_ref).await;
+                    enqueue_ocsp(&cache_ref);
+                }
+                Tick::Deadline => {
+                    enqueue_ocsp(&cache_ref);
+                    enqueue_renewals(&cache_ref, false);
                 }
             }
-        })
-        .await;
+        };
+        use futures::FutureExt;
+        let outcome = tokio::select! {
+            biased;
+            () = stop.cancelled() => return LoopExit::Stopped,
+            outcome = std::panic::AssertUnwindSafe(sweep).catch_unwind() => outcome,
+        };
 
         if outcome.is_err() {
             return LoopExit::Panicked;
@@ -293,158 +309,200 @@ async fn run_maintenance_loop(
 enum Tick {
     Renew,
     Ocsp,
+    Deadline,
 }
 
 /// Scan the cache and renew certificates inside their renewal window
 ///. Forced renewal is driven by an OCSP
 /// revoked status; ARI-window jitter follows `currentlyInRenewalWindow`.
 pub(crate) async fn renew_managed_certificates(cache: &Cache) {
-    let certs = cache.all_certs();
-    for cert in certs {
-        if !cert.managed() {
-            continue;
-        }
-        let Ok(cfg) = cache.config_for(&cert).await else {
-            continue;
-        };
-        if !cfg.cert_needs_renewal(&cert) {
-            continue;
-        }
-        let Some(name) = cert.names.first().cloned() else {
+    enqueue_renewals(cache, true);
+}
+
+fn enqueue_renewals(cache: &Cache, periodic: bool) {
+    for cert in cache.all_certs().into_iter().filter(|cert| cert.managed()) {
+        let Some(mut claim) = cache.claim_renewal(&cert, periodic) else {
             continue;
         };
-        let ct = tokio_util::sync::CancellationToken::new();
-        let name2 = name.clone();
-        let submitted =
-            crate::runtime::global_job_manager().submit(&format!("renew_{name}"), move || {
-                let cfg = cfg.clone();
-                let name = name2.clone();
-                let ct = ct.clone();
-                Box::pin(async move { cfg.renew_cert(&ct, &name, false, false).await })
-            });
-        if let Ok(false) = submitted {
-            tracing::trace!(domain = %name, "renewal already queued");
+        let weak = Arc::downgrade(&cache.owned());
+        let observed = cert.clone();
+        let key = format!("{}/{}", cert.issuer_key, cert.leaf_hash());
+        let submitted = cache.renew_jobs.submit(&key, move || {
+            Box::pin(async move {
+                claim.started = true;
+                let Some(cache) = weak.upgrade() else {
+                    return Ok(());
+                };
+                let ct = cache.stop_token();
+                let mut attempted = false;
+                let operation = async {
+                    let cfg = cache.config_for(&cert).await?;
+                    if cert.quarantined && !cfg.options.ocsp.replace_revoked {
+                        return Ok(());
+                    }
+                    let compromised = match cfg.ensure_not_revoked(&cert).await {
+                        Err(crate::error::Error::Certificate(
+                            crate::error::CertificateError::Revoked,
+                        )) => {
+                            cache.quarantine_leaf(&cert);
+                            true
+                        }
+                        Err(error) => return Err(error),
+                        Ok(()) => cert.quarantined,
+                    };
+                    if compromised && !cfg.options.ocsp.replace_revoked {
+                        return Ok(());
+                    }
+                    cfg.schedule_ari_refresh(&cert);
+                    if !compromised && !cfg.cert_needs_renewal(&cert) {
+                        return Ok(());
+                    }
+                    attempted = true;
+                    let name = cert
+                        .resource_name
+                        .as_deref()
+                        .or_else(|| cert.names.first().map(String::as_str))
+                        .ok_or(crate::error::Error::Certificate(
+                            crate::error::CertificateError::NoNames,
+                        ))?;
+                    cfg.renew_in_maintenance(&ct, name, compromised, &cert)
+                        .await
+                };
+                let result = tokio::time::timeout(Duration::from_secs(180), operation)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(crate::error::Error::Internal(
+                            "maintenance preflight/renewal timed out".into(),
+                        ))
+                    });
+                claim.finish(result.as_ref().err(), attempted || result.is_err());
+                result
+            })
+        });
+        if submitted.is_err() {
+            cache.defer_renewal(&observed);
         }
     }
 }
 
 /// Refresh OCSP staples that have passed their freshness midpoint
 ///.
-#[cfg_attr(not(feature = "ocsp"), allow(unused_variables))]
 pub(crate) async fn update_ocsp_staples(cache: &Cache) {
-    #[cfg(feature = "ocsp")]
-    {
-        use crate::events::{CertOcspRevokedData, EventKind};
+    let jobs = enqueue_ocsp(cache);
+    for job in jobs {
+        cache.ocsp_jobs.wait(&job).await;
+    }
+}
 
-        let certs = cache.all_certs();
-        let mut updates: Vec<(
-            crate::certificate::Certificate,
-            crate::certificate::Certificate,
-        )> = Vec::new();
-        let mut revoked: Vec<(Arc<Config>, Vec<String>, bool)> = Vec::new();
+#[cfg(not(feature = "ocsp"))]
+fn enqueue_ocsp(_cache: &Cache) -> Vec<String> {
+    Vec::new()
+}
 
-        // Two-phase: collect + refresh OUTSIDE the cache lock, write back
-        // under a short lock via replace_certificate.
-        for cert in &certs {
-            let Ok(cfg) = cache.config_for(cert).await else {
-                continue;
-            };
-            if cfg.options.ocsp.disable_stapling {
-                continue;
-            }
-            let stale = cert.ocsp.as_ref().is_none_or(|r| {
-                !crate::ocsp::is_fresh(
-                    r.this_update,
-                    r.next_update.unwrap_or(r.this_update),
-                    time::OffsetDateTime::now_utc(),
-                    r.responder_not_after,
-                )
-            });
-            if !stale {
-                continue;
-            }
-            let mut fresh = cert.clone();
-            let storage = cfg.ground_truth_storage();
-            let ct = tokio_util::sync::CancellationToken::new();
-            let transport = match crate::acme::transport::ReqwestTransport::new(
-                std::time::Duration::from_secs(30),
-                concat!("certmagic-rs/", env!("CARGO_PKG_VERSION")),
-            ) {
-                Ok(t) => {
-                    let t: Arc<dyn crate::acme::transport::Transport> = Arc::new(t);
-                    t
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "transport build failed");
-                    continue;
-                }
-            };
-            match crate::ocsp::staple_ocsp(
-                &ct,
-                &storage,
-                &cfg.options.ocsp,
-                &mut fresh,
-                transport.as_ref(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    if let Some(resp) = &fresh.ocsp
-                        && resp.status == crate::ocsp::OcspCertStatus::Revoked
-                    {
-                        revoked.push((
-                            Arc::clone(&cfg),
-                            fresh.names.clone(),
-                            cfg.options.ocsp.replace_revoked,
-                        ));
+#[cfg(feature = "ocsp")]
+fn enqueue_ocsp(cache: &Cache) -> Vec<String> {
+    let mut jobs = Vec::new();
+    for cert in cache.due_ocsp() {
+        let hash = cert.hash().to_owned();
+        let job = format!("ocsp_{hash}");
+        cache.defer_ocsp(&hash, Duration::from_secs(30));
+        let weak = Arc::downgrade(&cache.owned());
+        let submitted = cache.ocsp_jobs.submit(&job, move || {
+            Box::pin(async move {
+                let Some(cache) = weak.upgrade() else {
+                    return Ok(());
+                };
+                let ct = cache.stop_token();
+                let operation = async {
+                    let cfg = cache.config_for(&cert).await?;
+                    if cfg.options.ocsp.disable_stapling {
+                        cache.defer_ocsp(cert.hash(), Duration::from_secs(3600));
+                        return Ok(());
                     }
-                    updates.push((cert.clone(), fresh));
-                }
-                Err(err) => {
-                    tracing::warn!(names = ?cert.names, error = %err, "OCSP refresh failed");
-                }
-            }
-        }
-
-        for (old, new) in updates {
-            cache.update_metadata(old.hash(), |cached| {
-                cached.ocsp = new.ocsp;
-                cached.ocsp_staple = new.ocsp_staple;
-            });
-        }
-        for (cfg, names, replace_revoked) in revoked {
-            let ct = tokio_util::sync::CancellationToken::new();
-            let _ = crate::events::emit(
-                cfg.options.on_event.as_ref(),
-                cfg.options.should_emit.as_ref(),
-                &ct,
-                EventKind::CertOcspRevoked(CertOcspRevokedData {
-                    subjects: names.clone(),
-                    certificate_hash: String::new(),
-                    reason: None,
-                    revoked_at: None,
-                }),
-            )
-            .await;
-            if !replace_revoked {
-                continue;
-            }
-            // A revoked staple must not remain in service when replacement is
-            // enabled. Queue a forced renewal per subject through the same
-            // deduplicating job manager used by the regular renewal sweep.
-            for name in names {
-                let cfg = Arc::clone(&cfg);
-                let ct = CancellationToken::new();
-                let job_name = format!("force_renew_{name}");
-                let name_for_job = name.clone();
-                let _ = crate::runtime::global_job_manager().submit(&job_name, move || {
-                    let cfg = Arc::clone(&cfg);
-                    let ct = ct.clone();
-                    Box::pin(
-                        async move { cfg.renew_cert_compromised(&ct, &name_for_job, false).await },
+                    let transport = crate::acme::transport::ReqwestTransport::new(
+                        Duration::from_secs(30),
+                        crate::user_agent(),
+                    )?;
+                    let mut fresh = cert.clone();
+                    let refreshed = crate::ocsp::staple_ocsp(
+                        &ct,
+                        &cfg.ground_truth_storage(),
+                        &cfg.options.ocsp,
+                        &mut fresh,
+                        &transport,
                     )
-                });
-            }
+                    .await;
+                    let progressed = refreshed.is_ok() && fresh.ocsp_staple != cert.ocsp_staple;
+                    cache.update_metadata(cert.hash(), |cached| {
+                        let revoked = fresh.ocsp.as_ref().is_some_and(|response| {
+                            response.status == crate::ocsp::OcspCertStatus::Revoked
+                        });
+                        if !revoked && cached.ocsp.as_ref().map(|response| &response.raw)
+                            != cert.ocsp.as_ref().map(|response| &response.raw)
+                        {
+                            return;
+                        }
+                        if refreshed.is_ok() {
+                            cached.ocsp = fresh.ocsp.clone();
+                            cached.ocsp_staple = fresh.ocsp_staple.clone();
+                        }
+                        cached.ocsp_failures = if progressed {
+                            0
+                        } else {
+                            cached.ocsp_failures.saturating_add(1)
+                        };
+                        let delay =
+                            (60_i64 << cached.ocsp_failures.saturating_sub(1).min(3)).min(300);
+                        cached.ocsp_retry_at =
+                            Some(time::OffsetDateTime::now_utc() + time::Duration::seconds(delay));
+                    });
+                    if fresh.ocsp.as_ref().is_some_and(|response| {
+                        response.status == crate::ocsp::OcspCertStatus::Revoked
+                    }) {
+                        if let Err(error) = cfg.record_revocation(&ct, &fresh).await {
+                            tracing::warn!(%error, "revocation persistence failed; leaf remains quarantined");
+                        }
+                        let _ = crate::events::emit(
+                            cfg.options.on_event.as_ref(),
+                            cfg.options.should_emit.as_ref(),
+                            &ct,
+                            crate::events::EventKind::CertOcspRevoked(
+                                crate::events::CertOcspRevokedData {
+                                    subjects: fresh.names.clone(),
+                                    certificate_hash: fresh.hash().into(),
+                                    reason: fresh
+                                        .ocsp
+                                        .as_ref()
+                                        .and_then(|response| response.revocation_reason),
+                                    revoked_at: fresh
+                                        .ocsp
+                                        .as_ref()
+                                        .and_then(|response| response.revoked_at),
+                                },
+                            ),
+                        )
+                        .await;
+                        if cfg.options.ocsp.replace_revoked {
+                            enqueue_renewals(&cache, false);
+                        }
+                    }
+                    refreshed
+                };
+                match tokio::time::timeout(Duration::from_secs(30), operation).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        cache.defer_ocsp(cert.hash(), Duration::from_secs(60));
+                        Err(crate::error::Error::Internal(
+                            "OCSP maintenance timed out".into(),
+                        ))
+                    }
+                }
+            })
+        });
+        match submitted {
+            Ok(_) => jobs.push(job),
+            Err(_) => cache.defer_ocsp(&hash, Duration::from_secs(1)),
         }
     }
+    jobs
 }

@@ -768,6 +768,8 @@ pub struct Config {
     pub options: Arc<ConfigOptions>,
     pub(crate) cert_cache: Arc<Cache>,
     pub(crate) cert_store: Arc<dyn crate::cert_store::CertStore>,
+    pub(crate) job_namespace: u64,
+    pub(crate) ocsp_preparation: Arc<crate::ocsp::Preparation>,
     /// Handshake-time load coordination.
     pub(crate) load_flights: Arc<crate::singleflight::SingleFlight<crate::handshake::FlightCert>>,
     /// Handshake-time obtain coordination; followers only share completion
@@ -782,6 +784,8 @@ pub(crate) struct CachedConfig {
     options: Arc<ConfigOptions>,
     cache: std::sync::Weak<Cache>,
     cert_store: Arc<dyn crate::cert_store::CertStore>,
+    job_namespace: u64,
+    ocsp_preparation: Arc<crate::ocsp::Preparation>,
     load_flights: Arc<crate::singleflight::SingleFlight<crate::handshake::FlightCert>>,
     obtain_flights: Arc<crate::singleflight::SingleFlight<Result<(), Arc<Error>>>>,
 }
@@ -792,6 +796,8 @@ impl CachedConfig {
             options: Arc::clone(&config.options),
             cache: Arc::downgrade(&config.cert_cache),
             cert_store: Arc::clone(&config.cert_store),
+            job_namespace: config.job_namespace,
+            ocsp_preparation: Arc::clone(&config.ocsp_preparation),
             load_flights: Arc::clone(&config.load_flights),
             obtain_flights: Arc::clone(&config.obtain_flights),
         }
@@ -802,6 +808,8 @@ impl CachedConfig {
             options: Arc::clone(&self.options),
             cert_cache: self.cache.upgrade()?,
             cert_store: Arc::clone(&self.cert_store),
+            job_namespace: self.job_namespace,
+            ocsp_preparation: Arc::clone(&self.ocsp_preparation),
             load_flights: Arc::clone(&self.load_flights),
             obtain_flights: Arc::clone(&self.obtain_flights),
         }))
@@ -890,10 +898,14 @@ impl Config {
                 }
             }
         }
+        static NEXT_JOB_NAMESPACE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
         let cfg = Arc::new(Self {
             options: Arc::new(options),
             cert_cache,
             cert_store,
+            job_namespace: NEXT_JOB_NAMESPACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ocsp_preparation: Arc::new(crate::ocsp::Preparation::default()),
             load_flights: Arc::new(crate::singleflight::SingleFlight::default()),
             obtain_flights: Arc::new(crate::singleflight::SingleFlight::default()),
         });
@@ -1111,21 +1123,24 @@ impl Config {
         domain_names: &[String],
         async_mode: bool,
     ) -> Result<()> {
+        let mut subjects = Vec::with_capacity(domain_names.len());
+        for name in domain_names {
+            subjects.push(self.transform_subject(ct, name).await);
+        }
         // Fill the on-demand allowlist from managed names.
         if let Some(on_demand) = &self.options.on_demand {
             let mut allowlist = on_demand
                 .allowlist
                 .write()
                 .map_err(|_| Error::Internal("allowlist poisoned".into()))?;
-            if allowlist.is_none() {
-                *allowlist = Some(domain_names.iter().map(|n| normalized_name(n)).collect());
-            }
+            allowlist
+                .get_or_insert_with(HashSet::new)
+                .extend(subjects.iter().cloned());
         }
 
-        for domain_name in domain_names {
-            let name = normalized_name(domain_name);
+        for name in subjects {
             if async_mode {
-                let job = format!("manage_{name}");
+                let job = format!("config_{}/manage_{name}", self.job_namespace);
                 let this = self.clone();
                 let ct2 = ct.clone();
                 let name2 = name.clone();
@@ -1135,14 +1150,14 @@ impl Config {
                         // `ManageAsync`: obtaining/renewing is
                         // non-interactive and therefore uses the retry
                         // budget, rather than the foreground one-shot path.
-                        if let Err(err) = this.manage_one_inner(&ct2, &name2, false).await {
+                        if let Err(err) = do_with_retry(&ct2, |_| this.manage_one_subject(&ct2, &name2, false)).await {
                             tracing::error!(domain = %name2, error = %err, "async management failed");
                         }
                         Ok(())
                     })
                 })?;
             } else {
-                self.manage_one(ct, &name).await?;
+                self.manage_one_subject(ct, &name, true).await?;
             }
         }
         Ok(())
@@ -1158,6 +1173,16 @@ impl Config {
     /// `ManageAsync` must use `interactive = false` so transient issuer and
     /// storage failures are retried by [`crate::runtime::do_with_retry`].
     async fn manage_one_inner(
+        &self,
+        ct: &CancellationToken,
+        domain_name: &str,
+        interactive: bool,
+    ) -> Result<()> {
+        let name = self.transform_subject(ct, domain_name).await;
+        self.manage_one_subject(ct, &name, interactive).await
+    }
+
+    pub(crate) async fn manage_one_subject(
         &self,
         ct: &CancellationToken,
         domain_name: &str,
@@ -1182,14 +1207,67 @@ impl Config {
             return Ok(());
         }
 
+        if let Some(cert) = self.cert_cache.first_matching_where(&name, |cert| {
+            cert.managed()
+                && cert.valid_at(time::OffsetDateTime::now_utc())
+                && (!cert.must_staple || cert.current_ocsp_staple().is_some())
+        }) {
+            self.ensure_not_revoked(&cert).await?;
+            if self.cert_needs_renewal(&cert) {
+                self.renew_subject_inner(
+                    ct,
+                    cert.resource_name.as_deref().unwrap_or(&name),
+                    RenewOptions {
+                        interactive,
+                        retry: !interactive,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+
         // Load from storage into the cache; obtain when absent.
         match self.cache_managed_certificate(ct, &name).await {
             Ok(_) => {}
             Err(Error::Storage(StorageError::NotFound(_))) => {
                 // Pass the caller's spelling through so the subject
                 // transformer is applied exactly once inside obtain_cert.
-                self.obtain_cert(ct, domain_name, interactive).await?;
+                self.obtain_subject(ct, domain_name, interactive).await?;
                 // Newly stored: load it into the cache now.
+                self.cache_managed_certificate(ct, &name).await?;
+            }
+            Err(error @ Error::Ocsp(_)) => {
+                let (_, _, stored) = self.load_cert_resource_any_issuer(&name).await?;
+                if !self.cert_needs_renewal(&stored) {
+                    return Err(error);
+                }
+                self.renew_subject_inner(
+                    ct,
+                    domain_name,
+                    RenewOptions {
+                        force: true,
+                        interactive,
+                        retry: !interactive,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                self.cache_managed_certificate(ct, &name).await?;
+            }
+            Err(Error::Certificate(_)) => {
+                self.renew_subject_inner(
+                    ct,
+                    domain_name,
+                    RenewOptions {
+                        force: true,
+                        interactive,
+                        retry: !interactive,
+                        ..Default::default()
+                    },
+                )
+                .await?;
                 self.cache_managed_certificate(ct, &name).await?;
             }
             Err(err) => return Err(err),
@@ -1200,10 +1278,19 @@ impl Config {
             .cert_cache
             .get_all_matching_certs(&name)
             .into_iter()
-            .find(|c| c.names.contains(&name) && c.managed())
+            .find(|c| c.covers_name(&name) && c.managed())
             && self.cert_needs_renewal(&cert)
         {
-            self.renew_cert(ct, domain_name, false, interactive).await?;
+            self.renew_subject_inner(
+                ct,
+                domain_name,
+                RenewOptions {
+                    interactive,
+                    retry: !interactive,
+                    ..Default::default()
+                },
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1244,6 +1331,16 @@ impl Config {
         interactive: bool,
     ) -> Result<String> {
         let name = self.transform_subject(ct, name).await;
+        self.obtain_subject(ct, &name, interactive).await
+    }
+
+    async fn obtain_subject(
+        &self,
+        ct: &CancellationToken,
+        name: &str,
+        interactive: bool,
+    ) -> Result<String> {
+        let name = normalized_name(name);
         if !subject_qualifies_for_cert(&name) {
             return Err(Error::Certificate(
                 crate::error::CertificateError::NotAllowed(name),
@@ -1368,10 +1465,41 @@ impl Config {
         name: &str,
         attempt: u32,
         interactive: bool,
-        replaces: Option<&str>,
+        replaces: Option<(&str, &str)>,
     ) -> Result<IssuedWithKey> {
+        let identifiers = vec![match name.parse() {
+            Ok(ip) => crate::acme::order::Identifier::Ip(ip),
+            Err(_) => crate::acme::order::Identifier::Dns(name.to_owned()),
+        }];
+        self.issue_identifiers(
+            ct,
+            IssueContext {
+                name,
+                identifiers: &identifiers,
+                attempt,
+                interactive,
+                replaces,
+                reuse_key: self.options.reuse_private_keys,
+            },
+        )
+        .await
+    }
+
+    async fn issue_identifiers(
+        &self,
+        ct: &CancellationToken,
+        ctx: IssueContext<'_>,
+    ) -> Result<IssuedWithKey> {
+        let IssueContext {
+            name,
+            identifiers,
+            attempt,
+            interactive,
+            replaces,
+            reuse_key,
+        } = ctx;
         // Private key: reuse stored when configured.
-        let key_pem = if self.options.reuse_private_keys {
+        let key_pem = if reuse_key {
             self.load_existing_private_key(name).await
         } else {
             None
@@ -1384,24 +1512,33 @@ impl Config {
                 pem.clone()
             }
             None => {
-                let key_der = self.key_source().generate_key()?;
+                let key_der = crate::crypto::generate_key_async(self.key_source(), ct).await?;
                 pem_encode_private_key(&key_der)?
             }
         };
 
         let kp = key_pair_from_pkcs8(pem_decode_private_key(&key_pem)?.secret_der())?;
-        let csr_der = crate::crypto::generate_csr(
-            &kp,
-            &crate::crypto::CsrOptions {
-                dns_names: vec![name.to_owned()],
-                ip_addresses: vec![],
-                must_staple: self.options.must_staple,
-            },
-        )?;
+        let mut csr_options = crate::crypto::CsrOptions {
+            must_staple: self.options.must_staple,
+            ..Default::default()
+        };
+        for identifier in identifiers {
+            match identifier {
+                crate::acme::order::Identifier::Dns(name) => {
+                    csr_options.dns_names.push(name.clone())
+                }
+                crate::acme::order::Identifier::Ip(ip) => csr_options.ip_addresses.push(*ip),
+            }
+        }
+        let subjects: Vec<_> = identifiers
+            .iter()
+            .map(crate::acme::order::Identifier::value)
+            .collect();
+        let csr_der = crate::crypto::generate_csr(&kp, &csr_options)?;
         let csr = crate::issuer::Csr {
             der: csr_der,
-            dns_names: vec![name.to_owned()],
-            ip_addresses: vec![],
+            dns_names: csr_options.dns_names,
+            ip_addresses: csr_options.ip_addresses,
         };
 
         // Issuer order.
@@ -1418,16 +1555,36 @@ impl Config {
 
         let mut last_err: Option<Error> = None;
         for issuer in &issuers {
-            if let Err(err) = issuer.pre_check(ct, &[name.to_owned()], interactive).await {
+            if let Err(err) = issuer.pre_check(ct, &subjects, interactive).await {
                 tracing::warn!(issuer = %issuer.issuer_key(), error = %err, "issuer pre-check failed");
                 last_err = Some(err);
                 continue;
             }
+            let issuer_replaces =
+                replaces.and_then(|(source, id)| (source == issuer.issuer_key()).then_some(id));
             match issuer
-                .issue_with_replaces(ct, &csr, attempt, replaces)
+                .issue_with_replaces(ct, &csr, attempt, issuer_replaces)
                 .await
             {
                 Ok(issued) => {
+                    let validation = async {
+                        let mut cert = make_certificate(&issued.certificate, &key_pem)?;
+                        if !cert.valid_at(time::OffsetDateTime::now_utc())
+                            || !cert.covers(identifiers)
+                        {
+                            return Err(Error::Certificate(crate::error::CertificateError::Parse(
+                                "issuer returned time-invalid or incomplete SAN coverage".into(),
+                            )));
+                        }
+                        cert.issuer_key = issuer.issuer_key();
+                        self.ensure_not_revoked(&cert).await?;
+                        self.prepare_certificate(ct, &mut cert).await
+                    }
+                    .await;
+                    if let Err(error) = validation {
+                        last_err = Some(error);
+                        continue;
+                    }
                     return Ok(IssuedWithKey {
                         issuer_key: issuer.issuer_key(),
                         issued: IssuedCertificate {
@@ -1469,7 +1626,7 @@ impl Config {
         force: bool,
         interactive: bool,
     ) -> Result<()> {
-        self.renew_cert_inner(ct, name, force, interactive, false)
+        self.renew_cert_inner(ct, name, force, interactive, false, !interactive)
             .await
     }
 
@@ -1492,8 +1649,30 @@ impl Config {
         name: &str,
         interactive: bool,
     ) -> Result<()> {
-        self.renew_cert_inner(ct, name, true, interactive, true)
+        self.renew_cert_inner(ct, name, true, interactive, true, !interactive)
             .await
+    }
+
+    pub(crate) async fn renew_in_maintenance(
+        &self,
+        ct: &CancellationToken,
+        name: &str,
+        compromised: bool,
+        observed: &Certificate,
+    ) -> Result<()> {
+        self.renew_subject_inner(
+            ct,
+            name,
+            RenewOptions {
+                force: compromised,
+                compromised,
+                observed: Some(observed),
+                ..Default::default()
+            },
+        )
+        .await?;
+        self.reload_managed_certificate(ct, name).await?;
+        Ok(())
     }
 
     async fn renew_cert_inner(
@@ -1503,34 +1682,98 @@ impl Config {
         force: bool,
         interactive: bool,
         compromised: bool,
+        retry: bool,
     ) -> Result<()> {
-        let requested_name = name.to_owned();
         let name = self.transform_subject(ct, name).await;
+        self.renew_subject_inner(
+            ct,
+            &name,
+            RenewOptions {
+                force,
+                interactive,
+                compromised,
+                retry,
+                observed: None,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn renew_subject_inner(
+        &self,
+        ct: &CancellationToken,
+        name: &str,
+        options: RenewOptions<'_>,
+    ) -> Result<()> {
+        let RenewOptions {
+            mut force,
+            interactive,
+            mut compromised,
+            retry,
+            observed,
+        } = options;
+        let name = normalized_name(name);
         let lock_key = format!("issue_cert_{name}");
         let guard = acquire_lock(ct, &self.storage(), &lock_key).await?;
         self.cert_store.validate_write_guard(&guard)?;
 
         // Re-check under the lock.
-        let (issuer_key, old_resource, old_cert) =
+        let (issuer_key, old_resource, mut old_cert) =
             match self.load_cert_resource_any_issuer(&name).await {
                 Ok(found) => found,
                 Err(Error::Storage(StorageError::NotFound(_))) => {
                     // Nothing stored: obtain instead (the same fallback
                     // applies to missing resources at renewal time).
                     drop(guard);
-                    self.obtain_cert(ct, &requested_name, interactive).await?;
+                    self.obtain_subject(ct, &name, interactive).await?;
                     return Ok(());
                 }
-                Err(err) => return Err(err),
+                Err(error) => {
+                    let mut recovered = None;
+                    for issuer in &self.options.issuers {
+                        if let Some(resource) = self
+                            .cert_store
+                            .load_for_recovery(&issuer.issuer_key(), &name)
+                            .await?
+                            && resource.private_key_pem.is_empty()
+                        {
+                            let mut cert =
+                                crate::certificate::public_certificate(&resource.certificate_pem)?;
+                            cert.issuer_key = issuer.issuer_key();
+                            cert.resource_name = Some(name.clone());
+                            recovered = Some((issuer.issuer_key(), resource, cert));
+                            break;
+                        }
+                    }
+                    recovered.ok_or(error)?
+                }
             };
 
-        if !force {
-            let stored =
-                make_certificate(&old_resource.certificate_pem, &old_resource.private_key_pem)?;
-            if !self.cert_needs_renewal(&stored) {
-                tracing::debug!(domain = %name, "renewal check: certificate does not need renewal");
-                return Ok(());
-            }
+        if compromised
+            && let Some(observed) = observed
+            && observed.leaf_hash() != old_cert.leaf_hash()
+            && !observed.same_public_key(&old_cert)
+        {
+            // Another holder already replaced the affected key. Recheck the
+            // current leaf normally instead of quarantining its successor.
+            force = false;
+            compromised = false;
+        }
+        let identifiers = old_cert.identifiers()?;
+        let compromised = compromised
+            || old_resource.private_key_pem.is_empty()
+            || matches!(
+                self.ensure_not_revoked(&old_cert).await,
+                Err(Error::Certificate(crate::error::CertificateError::Revoked))
+            );
+        // Reuse ARI only for the identical authoritative certificate.
+        old_cert.ari = self
+            .cert_cache
+            .get_by_hash(old_cert.hash())
+            .and_then(|cached| cached.ari);
+        if !force && !compromised && !self.cert_needs_renewal(&old_cert) {
+            tracing::debug!(domain = %name, "renewal check: certificate does not need renewal");
+            return Ok(());
         }
 
         let remaining = old_cert
@@ -1539,24 +1782,33 @@ impl Config {
         // ARI: `replaces` carries the certID of the certificate being
         // replaced — AKI keyIdentifier of the old leaf + its serial
         // (draft-ietf-acme-ari-03 §4.1), not the certificate URL.
-        let replaces = old_cert.ari_replaces_id();
+        let replaces = if self.options.disable_ari {
+            None
+        } else {
+            old_cert.ari_replaces_id()
+        };
         if compromised {
             require_live_lock(&guard)?;
-            self.move_compromised_private_key_locked(&issuer_key, &name, &guard)
-                .await?;
+            self.quarantine_certificate(&old_cert, &guard).await?;
+            if !old_resource.private_key_pem.is_empty() {
+                self.move_compromised_private_key_locked(&issuer_key, &name, &guard)
+                    .await?;
+            }
         }
 
-        if interactive {
+        if !retry {
             self.renew_cert_locked(
                 ct,
                 RenewalContext {
                     guard: &guard,
+                    identifiers: &identifiers,
+                    reuse_key: self.options.reuse_private_keys && !compromised,
                     name: &name,
                     force,
                     issuer_key: &issuer_key,
                     remaining,
                     attempt: 0,
-                    interactive: true,
+                    interactive,
                     replaces: replaces.as_deref(),
                 },
             )
@@ -1567,6 +1819,8 @@ impl Config {
                     ct,
                     RenewalContext {
                         guard: &guard,
+                        identifiers: &identifiers,
+                        reuse_key: self.options.reuse_private_keys && !compromised,
                         name: &name,
                         force,
                         issuer_key: &issuer_key,
@@ -1621,7 +1875,17 @@ impl Config {
 
         require_live_lock(ctx.guard)?;
         let issuance = self
-            .issue_for_name(ct, ctx.name, ctx.attempt, ctx.interactive, ctx.replaces)
+            .issue_identifiers(
+                ct,
+                IssueContext {
+                    name: ctx.name,
+                    identifiers: ctx.identifiers,
+                    attempt: ctx.attempt,
+                    interactive: ctx.interactive,
+                    replaces: ctx.replaces.map(|id| (ctx.issuer_key, id)),
+                    reuse_key: ctx.reuse_key,
+                },
+            )
             .await;
         require_live_lock(ctx.guard)?;
         let issued = issuance?;
@@ -1652,7 +1916,27 @@ impl Config {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct RenewOptions<'a> {
+    pub force: bool,
+    pub interactive: bool,
+    pub compromised: bool,
+    pub retry: bool,
+    pub observed: Option<&'a Certificate>,
+}
+
+struct IssueContext<'a> {
+    name: &'a str,
+    identifiers: &'a [crate::acme::order::Identifier],
+    attempt: u32,
+    interactive: bool,
+    replaces: Option<(&'a str, &'a str)>,
+    reuse_key: bool,
+}
+
 struct RenewalContext<'a> {
+    identifiers: &'a [crate::acme::order::Identifier],
+    reuse_key: bool,
     guard: &'a LockGuard,
     name: &'a str,
     force: bool,
@@ -1695,7 +1979,17 @@ impl Config {
         private_key_pem: &[u8],
         guard: &LockGuard,
     ) -> Result<CertificateResource> {
-        let names = make_certificate(&issued.certificate, private_key_pem)?.names;
+        let cert = make_certificate(&issued.certificate, private_key_pem)?;
+        if !cert.valid_at(time::OffsetDateTime::now_utc()) {
+            return Err(Error::Certificate(crate::error::CertificateError::Parse(
+                "issued certificate became invalid before publication".into(),
+            )));
+        }
+        let names = cert
+            .identifiers()?
+            .iter()
+            .map(crate::acme::order::Identifier::value)
+            .collect::<Vec<_>>();
         let resource = CertificateResource {
             sans: names.clone(),
             certificate_pem: issued.certificate.clone(),
@@ -1704,6 +1998,20 @@ impl Config {
         };
         self.cert_store
             .save_with_lock(issuer_key, domain, &resource, guard)
+            .await?;
+        let selection = format!(
+            "certificate-selections/{}.json",
+            crate::crypto::sha256_hex(normalized_name(domain).as_bytes())
+        );
+        self.ground_truth_storage()
+            .store_tx_with_lock(
+                &[(
+                    &selection,
+                    serde_json::to_vec(issuer_key)
+                        .map_err(|error| Error::Internal(error.to_string()))?,
+                )],
+                guard,
+            )
             .await?;
         Ok(resource)
     }
@@ -1737,21 +2045,102 @@ impl Config {
                 })
                 .collect();
         }
-        let mut last: Option<Error> = None;
+        let selection = format!(
+            "certificate-selections/{}.json",
+            crate::crypto::sha256_hex(name.as_bytes())
+        );
+        match self.ground_truth_storage().load(&selection).await {
+            Ok(data) => {
+                let selected: String = serde_json::from_slice(&data).map_err(|_| {
+                    Error::Storage(StorageError::Other(
+                        "invalid certificate issuer selection".into(),
+                    ))
+                })?;
+                if let Some(index) = prefixes.iter().position(|key| key == &selected) {
+                    let key = prefixes.remove(index);
+                    prefixes.insert(0, key);
+                }
+            }
+            Err(Error::Storage(StorageError::NotFound(_))) => {}
+            Err(error) => return Err(error),
+        }
+        let mut legacy_found = false;
+        let mut last = Error::Storage(StorageError::NotFound(name.clone()));
+        let mut expired = None;
         for issuer_key in prefixes {
-            match self.cert_store.load(&issuer_key, &name).await? {
+            let candidate = match self.cert_store.load(&issuer_key, &name).await {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    last = error;
+                    continue;
+                }
+            };
+            match candidate {
                 Some(resource) => {
-                    let mut cert =
-                        make_certificate(&resource.certificate_pem, &resource.private_key_pem)?;
+                    let mut cert = match make_certificate(
+                        &resource.certificate_pem,
+                        &resource.private_key_pem,
+                    ) {
+                        Ok(cert) => cert,
+                        Err(error) => {
+                            last = error;
+                            continue;
+                        }
+                    };
+                    let identifiers = cert.identifiers()?;
+                    let names_key = CertificateResource {
+                        sans: identifiers
+                            .iter()
+                            .map(crate::acme::order::Identifier::value)
+                            .collect(),
+                        ..Default::default()
+                    }
+                    .names_key();
+                    let wanted = match name.parse() {
+                        Ok(ip) => crate::acme::order::Identifier::Ip(ip),
+                        Err(_) => crate::acme::order::Identifier::Dns(name.clone()),
+                    };
+                    if !cert.covers(&[wanted]) && name != names_key {
+                        last = Error::Certificate(crate::error::CertificateError::Parse(
+                            "stored certificate does not cover its resource identity".into(),
+                        ));
+                        continue;
+                    }
                     cert.issuer_key = issuer_key.clone();
-                    return Ok((issuer_key, resource, cert));
+                    cert.resource_name = Some(name.clone());
+                    let found = (issuer_key, resource, cert);
+                    if found.2.valid_at(time::OffsetDateTime::now_utc()) {
+                        return Ok(found);
+                    }
+                    if expired.is_none() {
+                        expired = Some(found);
+                    }
                 }
                 None => {
-                    last = Some(Error::Storage(StorageError::NotFound(name.clone())));
+                    for issuer in self
+                        .options
+                        .issuers
+                        .iter()
+                        .filter(|issuer| issuer.issuer_key() == issuer_key)
+                    {
+                        if let Some(acme) =
+                            issuer.as_any().downcast_ref::<crate::acme::AcmeIssuer>()
+                        {
+                            let legacy = acme.legacy_issuer_key();
+                            if legacy != issuer_key && self.cert_store.has(&legacy, &name).await? {
+                                legacy_found = true;
+                            }
+                        }
+                    }
                 }
             }
         }
-        Err(last.unwrap_or(Error::Storage(StorageError::NotFound(name))))
+        if expired.is_none() && legacy_found {
+            return Err(Error::Config(ConfigError::Invalid(
+                "legacy issuer credentials require migrate_legacy_acme before management".into(),
+            )));
+        }
+        expired.ok_or(last)
     }
 
     /// Whether any configured issuer has `domain` stored.
@@ -1801,10 +2190,10 @@ impl Config {
         Ok(())
     }
 
-    async fn transform_subject(&self, ct: &CancellationToken, name: &str) -> String {
+    pub(crate) async fn transform_subject(&self, ct: &CancellationToken, name: &str) -> String {
         let normalized = normalized_name(name);
         match &self.options.subject_transformer {
-            Some(f) => f(ct.clone(), normalized).await,
+            Some(f) => normalized_name(&f(ct.clone(), normalized).await),
             None => normalized,
         }
     }
@@ -1817,35 +2206,142 @@ impl Config {
     /// [`StorageError::NotFound`] when no issuer has it stored.
     pub async fn cache_managed_certificate(
         &self,
-        _ct: &CancellationToken,
+        ct: &CancellationToken,
         domain: &str,
     ) -> Result<Certificate> {
+        if ct.is_cancelled() {
+            return Err(Error::Internal("context canceled".into()));
+        }
         let name = normalized_name(domain);
-        match self.load_cert_resource_any_issuer(&name).await {
-            Ok((_, _resource, mut cert)) => {
-                cert.managed = true;
-                self.cert_cache.cache_certificate(cert.clone());
-                Ok(cert)
-            }
+        let found = match self.load_cert_resource_any_issuer(&name).await {
+            Ok(found) => found,
             Err(Error::Storage(StorageError::NotFound(_))) => {
-                // Exact miss → retry with a progressively wilder subject.
-                let mut candidates: Vec<String> = Vec::new();
-                if let Some((_, rest)) = name.split_once('.') {
-                    candidates.push(format!("*.{rest}"));
-                }
-                candidates.push(format!("*.{name}"));
-                for candidate in candidates {
-                    if let Ok((_, _, mut cert)) =
-                        self.load_cert_resource_any_issuer(&candidate).await
-                    {
-                        cert.managed = true;
-                        self.cert_cache.cache_certificate(cert.clone());
-                        return Ok(cert);
-                    }
-                }
-                Err(Error::Storage(StorageError::NotFound(name)))
+                let candidate = crate::certificate::wildcard_candidate(&name)
+                    .ok_or_else(|| Error::Storage(StorageError::NotFound(name.clone())))?;
+                self.load_cert_resource_any_issuer(&candidate).await?
             }
-            Err(err) => Err(err),
+            Err(error) => return Err(error),
+        };
+        let preferred = found.0;
+        let resource_name = found.2.resource_name.clone().unwrap_or(name.clone());
+        let first_error = match self.prepare_and_cache(ct, found.2).await {
+            Ok(cert) => return Ok(cert),
+            Err(error) => error,
+        };
+        for issuer in &self.options.issuers {
+            if issuer.issuer_key() == preferred {
+                continue;
+            }
+            if let Some(resource) = self
+                .cert_store
+                .load(&issuer.issuer_key(), &resource_name)
+                .await?
+            {
+                let Ok(mut cert) =
+                    make_certificate(&resource.certificate_pem, &resource.private_key_pem)
+                else {
+                    continue;
+                };
+                let wanted = match name.parse() {
+                    Ok(ip) => crate::acme::order::Identifier::Ip(ip),
+                    Err(_) => crate::acme::order::Identifier::Dns(name.clone()),
+                };
+                if !cert.covers(&[wanted]) {
+                    continue;
+                }
+                cert.issuer_key = issuer.issuer_key();
+                cert.resource_name = Some(resource_name.clone());
+                if let Ok(cert) = self.prepare_and_cache(ct, cert).await {
+                    return Ok(cert);
+                }
+            }
+        }
+        Err(first_error)
+    }
+
+    async fn prepare_and_cache(
+        &self,
+        ct: &CancellationToken,
+        mut cert: Certificate,
+    ) -> Result<Certificate> {
+        self.ensure_not_revoked(&cert).await?;
+        self.restore_ari(&mut cert).await;
+        self.prepare_certificate(ct, &mut cert).await?;
+        if ct.is_cancelled() {
+            return Err(Error::Internal("context canceled".into()));
+        }
+        self.cache_managed_resource(cert)
+    }
+
+    fn cache_managed_resource(&self, mut cert: Certificate) -> Result<Certificate> {
+        cert.managed = true;
+        // Retain runtime metadata while preserving this load's issuer identity
+        // and managed status, including chains previously imported manually.
+        if let Some(cached) = self.cert_cache.get_by_hash(cert.hash())
+            && cached.issuer_key == cert.issuer_key
+        {
+            cert.ari = cached.ari;
+            cert.ari_retry_at = cached.ari_retry_at;
+        }
+        let cert = self.cert_cache.publish_managed(cert, None)?;
+        self.schedule_ari_refresh(&cert);
+        Ok(cert)
+    }
+
+    async fn prepare_certificate(
+        &self,
+        ct: &CancellationToken,
+        cert: &mut Certificate,
+    ) -> Result<()> {
+        if !cert.must_staple || cert.current_ocsp_staple().is_some() {
+            return Ok(());
+        }
+        if let Some(cached) = self.cert_cache.get_by_hash(cert.hash())
+            && cached.current_ocsp_staple().is_some()
+        {
+            cert.ocsp = cached.ocsp;
+            cert.ocsp_staple = cached.ocsp_staple;
+            return Ok(());
+        }
+        if self.options.ocsp.disable_stapling {
+            return Err(Error::Ocsp(crate::error::OcspError::Fetch(
+                "Must-Staple requires OCSP".into(),
+            )));
+        }
+        let transport = crate::acme::transport::ReqwestTransport::new(
+            std::time::Duration::from_secs(30),
+            crate::user_agent(),
+        )?;
+        self.ocsp_preparation
+            .prepare(
+                ct,
+                &self.ground_truth_storage(),
+                &self.options.ocsp,
+                cert,
+                &transport,
+            )
+            .await?;
+        if cert
+            .ocsp
+            .as_ref()
+            .is_some_and(|response| response.status == crate::ocsp::OcspCertStatus::Revoked)
+        {
+            self.record_revocation(ct, cert).await?;
+            return Err(Error::Certificate(crate::error::CertificateError::Revoked));
+        }
+        if cert.current_ocsp_staple().is_none() {
+            return Err(Error::Ocsp(crate::error::OcspError::Fetch(
+                "Must-Staple response unavailable".into(),
+            )));
+        }
+        Ok(())
+    }
+
+    async fn restore_ari(&self, cert: &mut Certificate) {
+        if !self.options.disable_ari
+            && let Err(error) = crate::ari::restore(&self.ground_truth_storage(), cert).await
+        {
+            tracing::debug!(%error, "ARI history unavailable");
         }
     }
 
@@ -1858,18 +2354,22 @@ impl Config {
     ) -> Result<Certificate> {
         let name = normalized_name(domain);
         let (_, _, mut fresh) = self.load_cert_resource_any_issuer(&name).await?;
+        self.ensure_not_revoked(&fresh).await?;
+        self.restore_ari(&mut fresh).await;
+        self.prepare_certificate(_ct, &mut fresh).await?;
         let old = self
             .cert_cache
             .get_all_matching_certs(&name)
             .into_iter()
             .find(|c| c.managed());
-        fresh.managed = true;
-        match old {
-            Some(old) => self.cert_cache.replace_certificate(&old, fresh.clone()),
-            None => {
-                self.cert_cache.cache_certificate(fresh.clone());
-            }
+        if let Some(old) = &old
+            && old.hash() == fresh.hash()
+        {
+            fresh.ari = old.ari.clone();
+            fresh.ari_retry_at = old.ari_retry_at;
         }
+        let fresh = self.cert_cache.publish_managed(fresh, old.as_ref())?;
+        self.schedule_ari_refresh(&fresh);
         Ok(fresh)
     }
 
@@ -1883,7 +2383,14 @@ impl Config {
         _interactive: bool,
     ) -> Result<()> {
         let name = normalized_name(name);
-        let (_, resource, _) = self.load_cert_resource_any_issuer(&name).await?;
+        let guard = acquire_lock(
+            ct,
+            &self.ground_truth_storage(),
+            &format!("issue_cert_{name}"),
+        )
+        .await?;
+        let (_, resource, cert) = self.load_cert_resource_any_issuer(&name).await?;
+        self.quarantine_certificate(&cert, &guard).await?;
         for issuer in &self.options.issuers {
             if issuer.revoke(ct, &resource, reason).await.is_ok() {
                 let _ = emit(
@@ -1924,20 +2431,180 @@ impl Config {
         let Some(info) = &cert.info else {
             return false;
         };
-        let interval = self
-            .cert_cache
-            .options()
-            .renew_check_interval
-            .unwrap_or(crate::cache::DEFAULT_RENEW_CHECK_INTERVAL);
+        let interval = self.cert_cache.effective_renew_interval();
         crate::certificate::cert_needs_renewal(
             info,
             &RenewalDecision {
                 renewal_window_ratio: self.renewal_window_ratio(),
                 renew_check_interval: interval,
-                ari: cert.ari.as_ref(),
+                ari: if self.options.disable_ari {
+                    None
+                } else {
+                    cert.ari.as_ref()
+                },
             },
             time::OffsetDateTime::now_utc(),
         )
+    }
+}
+
+fn revocation_key(cert: &Certificate) -> Result<String> {
+    let leaf = cert
+        .chain
+        .first()
+        .ok_or(Error::Certificate(crate::error::CertificateError::NoNames))?;
+    Ok(format!(
+        "revocations/{}.json",
+        crate::crypto::sha256_hex(leaf.as_ref())
+    ))
+}
+
+impl Config {
+    /// Apply durable revocation intents to cached certificate chains.
+    /// Reads use bounded concurrency and storage errors are returned.
+    pub async fn refresh_revocations(&self) -> Result<usize> {
+        use futures::{StreamExt, stream};
+        let mut checks = stream::iter(self.cert_cache.all_certs().into_iter().map(
+            |cert| async move {
+                let result = self.ensure_not_revoked(&cert).await;
+                (cert, result)
+            },
+        ))
+        .buffer_unordered(16);
+        let mut removed = 0;
+        let mut failure = None;
+        while let Some((cert, result)) = checks.next().await {
+            match result {
+                Err(Error::Certificate(crate::error::CertificateError::Revoked)) => {
+                    removed += self.cert_cache.quarantine_leaf(&cert);
+                }
+                Err(error) => failure = Some(error),
+                Ok(()) => {}
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(removed),
+        }
+    }
+
+    pub(crate) async fn ensure_not_revoked(&self, cert: &Certificate) -> Result<()> {
+        match self
+            .ground_truth_storage()
+            .load(&revocation_key(cert)?)
+            .await
+        {
+            Err(Error::Storage(StorageError::NotFound(_))) => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(Error::Certificate(crate::error::CertificateError::Revoked)),
+        }
+    }
+
+    async fn quarantine_certificate(&self, cert: &Certificate, guard: &LockGuard) -> Result<()> {
+        self.cert_cache.quarantine_leaf(cert);
+        let key = revocation_key(cert)?;
+        let record = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "revoked": true,
+            "leaf": cert.leaf_hash(),
+            "expires": cert.info.as_ref()
+                .map(|info| info.not_after.unix_timestamp_nanos().to_string()),
+        }))
+        .map_err(|error| Error::Internal(error.to_string()))?;
+        self.ground_truth_storage()
+            .store_tx_with_lock(&[(&key, record)], guard)
+            .await?;
+        self.cert_cache.quarantine_leaf(cert);
+        Ok(())
+    }
+
+    pub(crate) async fn record_revocation(
+        &self,
+        ct: &CancellationToken,
+        cert: &Certificate,
+    ) -> Result<()> {
+        self.cert_cache.quarantine_leaf(cert);
+        let storage = self.ground_truth_storage();
+        let guard =
+            acquire_lock(ct, &storage, &format!("revoke_leaf_{}", cert.leaf_hash())).await?;
+        self.quarantine_certificate(cert, &guard).await
+    }
+
+    /// Construct an mTLS identity from a current cached or stored certificate.
+    /// Persisted revocation intent is checked even for warm cache entries.
+    /// Returned credentials are snapshots and should be rebuilt after rotation.
+    pub async fn client_identity(
+        &self,
+        domain: &str,
+    ) -> Result<(
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    )> {
+        let name = normalized_name(domain);
+        for cert in self.cert_cache.all_matching_certificates(&name) {
+            if let Some(identity) = self.usable_client_identity(cert, &name).await? {
+                return Ok(identity);
+            }
+        }
+        for issuer in &self.options.issuers {
+            if let Some(resource) = self.cert_store.load(&issuer.issuer_key(), &name).await? {
+                let Ok(cert) =
+                    make_certificate(&resource.certificate_pem, &resource.private_key_pem)
+                else {
+                    continue;
+                };
+                if let Some(identity) = self.usable_client_identity(cert, &name).await? {
+                    return Ok(identity);
+                }
+            }
+        }
+        Err(Error::Certificate(
+            crate::error::CertificateError::NotAllowed(name),
+        ))
+    }
+
+    async fn usable_client_identity(
+        &self,
+        cert: Certificate,
+        name: &str,
+    ) -> Result<
+        Option<(
+            Vec<rustls::pki_types::CertificateDer<'static>>,
+            rustls::pki_types::PrivateKeyDer<'static>,
+        )>,
+    > {
+        if !cert.valid_at(time::OffsetDateTime::now_utc())
+            || !cert
+                .names
+                .iter()
+                .any(|subject| crate::certificate::match_wildcard(name, subject))
+        {
+            return Ok(None);
+        }
+        match self.ensure_not_revoked(&cert).await {
+            Ok(()) => {}
+            Err(Error::Certificate(crate::error::CertificateError::Revoked)) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        Ok(cert.private_key.map(|key| (cert.chain, key.clone_key())))
+    }
+
+    /// Build an mTLS client using explicitly supplied server trust anchors.
+    pub async fn client_config_with_roots(
+        &self,
+        domain: &str,
+        roots: impl Into<Arc<rustls::RootCertStore>>,
+    ) -> Result<rustls::ClientConfig> {
+        let (chain, key) = self.client_identity(domain).await?;
+        crate::install_default_provider();
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(chain, key)
+            .map_err(|error| {
+                Error::Config(ConfigError::Invalid(format!(
+                    "client TLS identity: {error}"
+                )))
+            })
     }
 }
 
@@ -2018,6 +2685,283 @@ mod orchestration_tests {
     use rcgen::{CertificateParams, KeyPair};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[derive(Debug)]
+    struct AriIssuer {
+        refreshes: AtomicUsize,
+        issued: AtomicUsize,
+        fail_refresh: bool,
+        window: (time::OffsetDateTime, time::OffsetDateTime),
+    }
+
+    #[async_trait::async_trait]
+    impl Issuer for AriIssuer {
+        async fn issue(
+            &self,
+            _: &CancellationToken,
+            csr: &crate::issuer::Csr,
+            _: u32,
+        ) -> Result<IssuedCertificate> {
+            self.issued.fetch_add(1, Ordering::SeqCst);
+            Ok(IssuedCertificate {
+                certificate: crate::test_csr::issue(&csr.der, &csr.dns_names),
+                metadata: None,
+            })
+        }
+        async fn get_renewal_info(
+            &self,
+            _: &CancellationToken,
+            _: &Certificate,
+        ) -> Result<crate::certificate::RenewalInfo> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_refresh {
+                return Err(Error::Internal("ARI unavailable".into()));
+            }
+            Ok(crate::certificate::RenewalInfo::from_suggested_window(
+                self.window.0,
+                self.window.1,
+            ))
+        }
+        fn issuer_key(&self) -> String {
+            "ari-test".into()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn ari_test_config(fail_refresh: bool) -> (Arc<Config>, tempfile::TempDir, Arc<AriIssuer>) {
+        let dir = tempfile::tempdir().unwrap();
+        let start = time::OffsetDateTime::now_utc() + time::Duration::days(2);
+        let issuer = Arc::new(AriIssuer {
+            refreshes: AtomicUsize::new(0),
+            issued: AtomicUsize::new(0),
+            fail_refresh,
+            window: (start, start + time::Duration::days(1)),
+        });
+        let config = Config::new(
+            Cache::new_without_maintenance(Default::default()).unwrap(),
+            ConfigOptions {
+                storage: Some(crate::storage::FileStorage::new(dir.path())),
+                issuers: vec![issuer.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (config, dir, issuer)
+    }
+
+    async fn wait_for_ari(config: &Config, hash: &str) -> crate::certificate::RenewalInfo {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(ari) = config.cache().get_by_hash(hash).and_then(|cert| cert.ari) {
+                    return ari;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ARI should be fetched in the background")
+    }
+
+    #[tokio::test]
+    async fn review_ari_initializes_deduplicates_and_preserves_selected_time() {
+        let (config, _dir, issuer) = ari_test_config(false);
+        config
+            .manage_sync(&CancellationToken::new(), &["ari.example.com".into()])
+            .await
+            .unwrap();
+        let cert = config
+            .cache()
+            .first_matching_certificate("ari.example.com")
+            .unwrap();
+        let first = wait_for_ari(&config, cert.hash()).await;
+        let loaded = config
+            .cache_managed_certificate(&CancellationToken::new(), "ari.example.com")
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.ari.as_ref().unwrap().selected_time,
+            first.selected_time
+        );
+        let reloaded = config
+            .reload_managed_certificate(&CancellationToken::new(), "ari.example.com")
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.ari.as_ref().unwrap().selected_time,
+            first.selected_time
+        );
+        for _ in 0..10 {
+            config.schedule_ari_refresh(&cert);
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(issuer.refreshes.load(Ordering::SeqCst), 1);
+        config.cache().update_metadata(cert.hash(), |cached| {
+            cached.ari.as_mut().unwrap().refresh_after =
+                time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        });
+        for _ in 0..10 {
+            config.schedule_ari_refresh(&cert);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while issuer.refreshes.load(Ordering::SeqCst) < 2
+                || config
+                    .cache()
+                    .get_by_hash(cert.hash())
+                    .unwrap()
+                    .ari
+                    .as_ref()
+                    .unwrap()
+                    .needs_refresh(time::OffsetDateTime::now_utc())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let refreshed = config
+            .cache()
+            .get_by_hash(cert.hash())
+            .unwrap()
+            .ari
+            .unwrap();
+        assert_eq!(refreshed.selected_time, first.selected_time);
+        assert!(!refreshed.needs_refresh(time::OffsetDateTime::now_utc()));
+        assert_eq!(issuer.refreshes.load(Ordering::SeqCst), 2);
+        config.cache().stop_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn durable_ari_survives_cache_recreation_and_retention_overflow() {
+        let (config, _dir, issuer) = ari_test_config(false);
+        let ct = CancellationToken::new();
+        config
+            .manage_sync(&ct, &["ari-durable.example.com".into()])
+            .await
+            .unwrap();
+        let cert = config
+            .cache()
+            .first_matching_certificate("ari-durable.example.com")
+            .unwrap();
+        let original = wait_for_ari(&config, cert.hash()).await;
+        let restored = Config::new(
+            Cache::new_without_maintenance(Default::default()).unwrap(),
+            (*config.options).clone(),
+        )
+        .unwrap();
+        let loaded = restored
+            .cache_managed_certificate(&ct, "ari-durable.example.com")
+            .await
+            .unwrap();
+        assert_eq!(loaded.ari.unwrap().selected_time, original.selected_time);
+        tokio::task::yield_now().await;
+        assert_eq!(issuer.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            crate::ari::clean_storage(
+                &ct,
+                &config.ground_truth_storage(),
+                std::time::Duration::MAX
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        config.cache().stop_and_wait().await;
+        restored.cache().stop_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn review_failed_ari_refresh_backs_off() {
+        let (config, _dir, issuer) = ari_test_config(true);
+        config
+            .manage_sync(
+                &CancellationToken::new(),
+                &["ari-failure.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let cert = config
+            .cache()
+            .first_matching_certificate("ari-failure.example.com")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while issuer.refreshes.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..10 {
+            config.schedule_ari_refresh(&cert);
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(issuer.refreshes.load(Ordering::SeqCst), 1);
+        let cached = config.cache().get_by_hash(cert.hash()).unwrap();
+        assert!(cached.ari.is_none());
+        assert!(
+            cached.ari_retry_at.unwrap()
+                > time::OffsetDateTime::now_utc() + time::Duration::hours(5)
+        );
+        config.cache().stop_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn review_ari_renewal_survives_authoritative_storage_recheck() {
+        let (config, _dir, issuer) = ari_test_config(false);
+        let ct = CancellationToken::new();
+        config
+            .manage_sync(&ct, &["ari-renew.example.com".into()])
+            .await
+            .unwrap();
+        let cert = config
+            .cache()
+            .first_matching_certificate("ari-renew.example.com")
+            .unwrap();
+        wait_for_ari(&config, cert.hash()).await;
+        config.cache().update_metadata(cert.hash(), |cached| {
+            let end = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+            cached.ari = Some(crate::certificate::RenewalInfo::from_suggested_window(
+                end - time::Duration::hours(1),
+                end,
+            ));
+        });
+        config
+            .renew_cert_sync(&ct, "ari-renew.example.com", false)
+            .await
+            .unwrap();
+        assert_eq!(issuer.issued.load(Ordering::SeqCst), 2);
+        assert!(config.cache().get_by_hash(cert.hash()).is_none());
+        config.cache().stop_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn review_disabled_ari_skips_fetch_and_renewal_decisions() {
+        let (base, _dir, issuer) = ari_test_config(false);
+        let mut options = (*base.options).clone();
+        options.disable_ari = true;
+        let config = Config::new(Arc::clone(base.cache()), options).unwrap();
+        config
+            .manage_sync(
+                &CancellationToken::new(),
+                &["ari-disabled.example.com".into()],
+            )
+            .await
+            .unwrap();
+        let mut cert = config
+            .cache()
+            .first_matching_certificate("ari-disabled.example.com")
+            .unwrap();
+        let end = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        cert.ari = Some(crate::certificate::RenewalInfo::from_suggested_window(
+            end - time::Duration::hours(1),
+            end,
+        ));
+        assert!(!config.cert_needs_renewal(&cert));
+        tokio::task::yield_now().await;
+        assert_eq!(issuer.refreshes.load(Ordering::SeqCst), 0);
+        config.cache().stop_and_wait().await;
+    }
+
     /// A fake CA: issues certificates for the requested CSR public key and names.
     #[derive(Debug, Default)]
     struct MockIssuer {
@@ -2079,6 +3023,111 @@ mod orchestration_tests {
     }
 
     #[tokio::test]
+    async fn review_stored_wildcard_does_not_cover_apex() {
+        let (config, _dir, _) = test_config().await;
+        let ct = CancellationToken::new();
+        config.obtain_cert_sync(&ct, "*.example.com").await.unwrap();
+        assert!(matches!(
+            config.cache_managed_certificate(&ct, "example.com").await,
+            Err(Error::Storage(StorageError::NotFound(_)))
+        ));
+        assert!(
+            config
+                .cache_managed_certificate(&ct, "api.example.com")
+                .await
+                .is_ok()
+        );
+        config.cache().stop_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn review_wildcard_storage_errors_are_preserved() {
+        let (config, _dir, _) = test_config().await;
+        config
+            .storage()
+            .store(
+                &crate::storage::STORAGE_KEYS.site_cert("mock-v1", "*.example.com"),
+                b"incomplete resource",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            config
+                .cache_managed_certificate(&CancellationToken::new(), "api.example.com")
+                .await,
+            Err(Error::Storage(StorageError::Other(_)))
+        ));
+        config.cache().stop_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn review_ip_issuance_preserves_identifier_type() {
+        #[derive(Debug)]
+        struct IpIssuer;
+        #[async_trait::async_trait]
+        impl Issuer for IpIssuer {
+            async fn issue(
+                &self,
+                _: &CancellationToken,
+                csr: &crate::issuer::Csr,
+                _: u32,
+            ) -> Result<IssuedCertificate> {
+                assert!(csr.dns_names.is_empty());
+                assert_eq!(csr.ip_addresses.len(), 1);
+                use x509_parser::prelude::FromDer;
+                let (_, request) =
+                    x509_parser::certification_request::X509CertificationRequest::from_der(
+                        &csr.der,
+                    )
+                    .unwrap();
+                let san = request
+                    .requested_extensions()
+                    .unwrap()
+                    .find_map(|extension| match extension {
+                        x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) => {
+                            Some(san)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let octets = match csr.ip_addresses[0] {
+                    std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                    std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+                };
+                assert_eq!(
+                    san.general_names,
+                    vec![x509_parser::extensions::GeneralName::IPAddress(&octets)]
+                );
+                Err(Error::Issuer(IssuerError::Other("checked IP CSR".into())))
+            }
+            fn issuer_key(&self) -> String {
+                "ip-test".into()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::new(
+            Cache::new_without_maintenance(Default::default()).unwrap(),
+            ConfigOptions {
+                storage: Some(crate::storage::FileStorage::new(directory.path())),
+                issuers: vec![Arc::new(IpIssuer)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for name in ["192.0.2.1", "2001:db8::1"] {
+            let result = config
+                .obtain_cert_sync(&CancellationToken::new(), name)
+                .await;
+            assert!(
+                matches!(result, Err(Error::Issuer(IssuerError::Other(message))) if message == "checked IP CSR")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn review_concurrent_storage_probes_are_independent() {
         let (config, _dir, _) = test_config().await;
         let probes = (0..16).map(|_| config.check_storage());
@@ -2134,11 +3183,12 @@ mod orchestration_tests {
             .save("mock-v1", "expired-review.example.com", &resource)
             .await
             .unwrap();
-        let ct = CancellationToken::new();
-        let old = config
-            .cache_managed_certificate(&ct, "expired-review.example.com")
+        let (_, _, mut old) = config
+            .load_cert_resource_any_issuer("expired-review.example.com")
             .await
             .unwrap();
+        old.managed = true;
+        config.cache().cache_certificate(old.clone());
         config.cache().renew_managed_certificates().await;
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while config.cache().get_by_hash(old.hash()).is_some() {
@@ -2212,6 +3262,220 @@ mod orchestration_tests {
         result.unwrap();
         assert_eq!(issuer.issued.load(Ordering::SeqCst), 1);
         Arc::clone(&config.cert_cache).stop_now();
+    }
+
+    #[tokio::test]
+    async fn review_replacement_id_stays_with_original_issuer() {
+        #[derive(Debug)]
+        struct ReplacementIssuer {
+            key: &'static str,
+            expected: Option<&'static str>,
+        }
+        #[async_trait::async_trait]
+        impl Issuer for ReplacementIssuer {
+            async fn issue(
+                &self,
+                _: &CancellationToken,
+                _: &crate::issuer::Csr,
+                _: u32,
+            ) -> Result<IssuedCertificate> {
+                unreachable!("replacement-aware entry point is required")
+            }
+            async fn issue_with_replaces(
+                &self,
+                _: &CancellationToken,
+                _: &crate::issuer::Csr,
+                _: u32,
+                replaces: Option<&str>,
+            ) -> Result<IssuedCertificate> {
+                assert_eq!(replaces, self.expected);
+                Err(Error::Issuer(IssuerError::Other(self.key.into())))
+            }
+            fn issuer_key(&self) -> String {
+                self.key.into()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::new(
+            Cache::new_without_maintenance(Default::default()).unwrap(),
+            ConfigOptions {
+                storage: Some(crate::storage::FileStorage::new(directory.path())),
+                issuers: vec![
+                    Arc::new(ReplacementIssuer {
+                        key: "primary",
+                        expected: Some("old-id"),
+                    }),
+                    Arc::new(ReplacementIssuer {
+                        key: "fallback",
+                        expected: None,
+                    }),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let result = config
+            .issue_for_name(
+                &CancellationToken::new(),
+                "replacement.example.com",
+                0,
+                true,
+                Some(("primary", "old-id")),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::Issuer(IssuerError::Other(message))) if message == "fallback")
+        );
+    }
+
+    #[tokio::test]
+    async fn certon_explicit_roots_complete_a_real_mutual_tls_handshake() {
+        crate::install_default_provider();
+        let (config, _dir, _) = test_config().await;
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["client-ca.test".into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let client_key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["client.example.com".into()]).unwrap();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let client = params.signed_by(&client_key, &issuer).unwrap();
+        let bundle = format!("{}{}", client.pem(), ca.pem());
+        config.cache().cache_certificate(
+            make_certificate(bundle.as_bytes(), client_key.serialize_pem().as_bytes()).unwrap(),
+        );
+
+        let server_key = KeyPair::generate().unwrap();
+        let server = CertificateParams::new(vec!["server.example.com".into()])
+            .unwrap()
+            .self_signed(&server_key)
+            .unwrap();
+        let mut client_roots = rustls::RootCertStore::empty();
+        client_roots.add(ca.der().clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+            .build()
+            .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![server.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+            )
+            .unwrap();
+        let mut server_roots = rustls::RootCertStore::empty();
+        server_roots.add(server.der().clone()).unwrap();
+        let client_config = config
+            .client_config_with_roots("client.example.com", server_roots)
+            .await
+            .unwrap();
+        let (client_io, server_io) = tokio::io::duplex(16384);
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let (accepted, connected) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(
+                    acceptor.accept(server_io),
+                    connector.connect("server.example.com".try_into().unwrap(), client_io)
+                )
+            })
+            .await
+            .unwrap();
+        assert!(accepted.is_ok());
+        assert!(connected.is_ok());
+        config.cache().stop_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn certon_mtls_checks_persisted_revocation_across_warm_caches() {
+        let (config, _dir, _) = test_config().await;
+        let ct = CancellationToken::new();
+        config
+            .manage_sync(&ct, &["client.example.com".into()])
+            .await
+            .unwrap();
+        let sibling = Config::new(
+            Cache::new_without_maintenance(Default::default()).unwrap(),
+            (*config.options).clone(),
+        )
+        .unwrap();
+        sibling
+            .cache_managed_certificate(&ct, "client.example.com")
+            .await
+            .unwrap();
+        let stale_snapshot = sibling
+            .cache()
+            .first_matching_certificate("client.example.com")
+            .unwrap();
+        let (chain, key) = sibling.client_identity("client.example.com").await.unwrap();
+        assert!(!chain.is_empty());
+        assert!(!key.secret_der().is_empty());
+        sibling
+            .client_config_with_roots("client.example.com", rustls::RootCertStore::empty())
+            .await
+            .unwrap();
+        config
+            .revoke_cert(
+                &ct,
+                "client.example.com",
+                RevocationReason::KeyCompromise,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(sibling.client_identity("client.example.com").await.is_err());
+        assert_eq!(sibling.refresh_revocations().await.unwrap(), 1);
+        sibling.cache().cache_certificate(stale_snapshot);
+        assert!(
+            sibling
+                .cache()
+                .first_matching_certificate("client.example.com")
+                .is_none()
+        );
+        assert!(matches!(
+            sibling
+                .cache_managed_certificate(&ct, "client.example.com")
+                .await,
+            Err(Error::Certificate(crate::error::CertificateError::Revoked))
+        ));
+        config.cache().stop_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn review_compromised_renewal_failure_evicts_cached_key() {
+        let (config, _dir, _) = test_config().await;
+        let ct = CancellationToken::new();
+        config
+            .manage_sync(&ct, &["compromised.example.com".into()])
+            .await
+            .unwrap();
+        let mut options = (*config.options).clone();
+        options.on_event = Some(Arc::new(|_, event| {
+            Box::pin(async move {
+                if matches!(event, EventKind::CertObtaining(_)) {
+                    return Err(Error::Internal("replacement interrupted".into()));
+                }
+                Ok(())
+            })
+        }));
+        let replacement = Config::new(Arc::clone(config.cache()), options).unwrap();
+        assert!(
+            replacement
+                .renew_cert_compromised(&ct, "compromised.example.com", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            config
+                .cache()
+                .first_matching_certificate("compromised.example.com")
+                .is_none()
+        );
+        config.cache().stop_and_wait().await;
     }
 
     #[tokio::test]
@@ -2409,26 +3673,11 @@ impl Config {
 
         let mut out = Vec::with_capacity(identifiers.len());
         for identifier in identifiers {
-            let name = crate::certificate::normalized_name(identifier);
-            let cert = self
-                .cert_cache
-                .get_all_matching_certs(&name)
-                .into_iter()
-                .find(|c| c.managed())
-                .ok_or(Error::Certificate(crate::error::CertificateError::NoNames))?;
-            let key = cert.private_key.clone().ok_or(Error::Certificate(
-                crate::error::CertificateError::NoPrivateKey,
-            ))?;
-            let signing_key =
-                crate::tls_integration::signing_key_from_der(&key).ok_or_else(|| {
-                    Error::Certificate(crate::error::CertificateError::Parse(
-                        "unsupported private key for rustls client credentials".into(),
-                    ))
-                })?;
-            out.push(rustls::sign::CertifiedKey::new(
-                cert.chain.clone(),
-                signing_key,
-            ));
+            let (chain, key) = self.client_identity(identifier).await?;
+            let signing_key = crate::tls_integration::signing_key_from_der(&key).ok_or(
+                Error::Certificate(crate::error::CertificateError::NoPrivateKey),
+            )?;
+            out.push(rustls::sign::CertifiedKey::new(chain, signing_key));
         }
         Ok(out)
     }
@@ -2445,25 +3694,8 @@ impl Config {
         identifier: &str,
     ) -> Result<rustls::ClientConfig> {
         self.manage_all(ct, &[identifier.to_owned()], false).await?;
-        let name = crate::certificate::normalized_name(identifier);
-        let cert = self
-            .cert_cache
-            .get_all_matching_certs(&name)
-            .into_iter()
-            .find(|cert| cert.managed())
-            .ok_or(Error::Certificate(crate::error::CertificateError::NoNames))?;
-        let private_key = cert
-            .private_key
-            .as_ref()
-            .map(|key| key.as_ref().clone_key())
-            .ok_or(Error::Certificate(
-                crate::error::CertificateError::NoPrivateKey,
-            ))?;
-        crate::tls_integration::install_default_provider();
-        rustls::ClientConfig::builder()
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_client_auth_cert(cert.chain, private_key)
-            .map_err(|error| Error::Config(ConfigError::Invalid(error.to_string())))
+        self.client_config_with_roots(identifier, rustls::RootCertStore::empty())
+            .await
     }
 }
 

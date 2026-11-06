@@ -176,20 +176,6 @@ fn digest_valid(value: &str) -> bool {
 
 // Reserve room for the wire envelope within serde_json's decoder depth limit.
 // Reject before upload so every published value can be decoded on a cold read.
-fn metadata_depth_valid(value: &serde_json::Value, remaining: usize) -> bool {
-    if remaining == 0 {
-        return false;
-    }
-    match value {
-        serde_json::Value::Array(items) => items
-            .iter()
-            .all(|value| metadata_depth_valid(value, remaining - 1)),
-        serde_json::Value::Object(items) => items
-            .values()
-            .all(|value| metadata_depth_valid(value, remaining - 1)),
-        _ => true,
-    }
-}
 
 impl<B: ImmutableBlobStore> RemoteCertStore<B> {
     /// Bind a remote object location to its authoritative manifest namespace.
@@ -233,7 +219,7 @@ impl<B: ImmutableBlobStore> RemoteCertStore<B> {
         if resource
             .issuer_data
             .as_ref()
-            .is_some_and(|value| !metadata_depth_valid(value, 64))
+            .is_some_and(|value| !super::metadata_depth_valid(value, 64))
         {
             return Err(failure("remote certificate metadata exceeds nesting limit"));
         }
@@ -459,6 +445,33 @@ impl<B: ImmutableBlobStore> RemoteCertStore<B> {
 
 #[async_trait]
 impl<B: ImmutableBlobStore> CertStore for RemoteCertStore<B> {
+    async fn remove_with_lock(&self, issuer: &str, domain: &str, guard: &LockGuard) -> Result<()> {
+        self.validate_write_guard(guard)?;
+        let key = resource_key(&self.prefix, issuer, domain)?;
+        for path in &key.paths {
+            self.coordinator.delete_with_lock(path, guard).await?;
+        }
+        Ok(())
+    }
+    async fn load_for_recovery(
+        &self,
+        issuer: &str,
+        domain: &str,
+    ) -> Result<Option<CertificateResource>> {
+        let key = resource_key(&self.prefix, issuer, domain)?;
+        let bytes = match self.coordinator.load(&key.paths[0]).await {
+            Ok(bytes) => bytes,
+            Err(Error::Storage(StorageError::NotFound(_))) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let reference = self.parse_reference(&bytes)?;
+        if reference.resource != key.identity {
+            return Err(failure("certificate recovery identity mismatch"));
+        }
+        let mut resource = self.read_blob(&reference).await?;
+        resource.private_key_pem.clear();
+        Ok(Some(resource))
+    }
     fn validate_write_guard(&self, guard: &LockGuard) -> Result<()> {
         self.coordinator.validate_write_guard(guard)
     }

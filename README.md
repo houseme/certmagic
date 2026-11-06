@@ -93,6 +93,49 @@ to keep the dependency tree smaller and avoid RSA-specific timing-sidechannel
 risk. RustSec `RUSTSEC-2023-0071` remains explicitly tracked because the
 upstream project has not published a fixed release yet.
 
+## Upgrading to the unreleased lifecycle integration
+
+This integration adapts Certon 0.4 lifecycle behavior to the existing Config and
+CertStore APIs. The source revision is recorded in the changelog.
+
+Stop all cooperating writers and back up the storage namespace and any remote
+certificate blobs before upgrading. Use the original ACME directory URL,
+configured email and certificate resource names to migrate existing data.
+
+```rust,no_run
+# async fn upgrade(config: &certmagic::Config) -> certmagic::Result<()> {
+let ct = tokio_util::sync::CancellationToken::new();
+let resource_names = vec!["example.com".to_owned()];
+config.migrate_legacy_acme(&ct, &resource_names).await?;
+config.manage_sync(&ct, &resource_names).await?;
+# Ok(())
+# }
+```
+
+For multi-SAN certificates, pass each original storage resource name once.
+For custom issuer renames, use `migrate_issuer_storage` with the old and new
+issuer keys. The destination issuer must be configured. Migration verifies the
+complete destination before retiring the source and records receipts for retries.
+On interruption, keep writers stopped and rerun with the same configuration.
+Conflicting generations require inspecting the preserved copies and backup.
+Complete any interrupted compromised-key replacement under its original issuer
+namespace before migrating that resource.
+
+The default ACME issuer key now hashes the complete canonical directory URL.
+Accounts use atomic, directory/email-bound snapshots under
+`acme/account-snapshots/`. Certificate snapshots under `credential-snapshots/`
+are authoritative for KeyValueCertStore. Legacy certificate/key/metadata paths
+are read for upgrade and maintained as compatibility mirrors for representable
+names. Deletion receipts prevent old mirrors from reviving retired credentials.
+Use CertStore or the storage certificate helpers when reading these resources.
+
+Restart upgraded readers together. Preserve migration receipts, revocation
+markers, credential snapshots and FileStorage's `.cm-write.guard` alongside
+`locks/*.guard`. Custom fenced backends must support guarded deletion, and
+custom CertStores should implement `load_for_recovery` to retain the public
+certificate context after private-key archival. Returned TLS keys and client
+configurations are snapshots and should be rebuilt after revocation or expiry.
+
 ## Upgrading from 0.1 to 0.2
 
 Version 0.2.0 adds optional Redis/etcd coordination and S3, Vault KV v2 and
@@ -275,11 +318,10 @@ other async deadlines, cancellation is cooperative and cannot retract a command
 already dispatched to a backend; expiring leases remain the recovery mechanism.
 
 Certificate/private-key resources can use an independent `CertStore` through
-`ConfigBuilder::cert_store`; accounts, challenge publications, locks and OCSP
-remain on `Storage`. A transactional database or a versioned object bundle can
-therefore provide stronger resource atomicity than the generic three-key adapter.
-The generic adapter overlaps its three independent reads/existence checks; this
-does not turn them into an atomic backend snapshot.
+`ConfigBuilder::cert_store`. Accounts, challenge publications, locks and OCSP
+use `Storage`. KeyValueCertStore publishes a complete authoritative snapshot as
+its final write. Legacy three-key reads use grouped backend operations and
+recheck for a concurrently published snapshot before returning.
 
 Redis is an optional choice for deployments already operating Redis, not a
 prerequisite for faster TLS cache hits. Configure persistence and eviction policy
@@ -317,7 +359,7 @@ Username/password credentials belong in options, not endpoint URLs. Debug and
 backend error output omit credentials, PEMs and remote status bodies.
 
 Config obtains/renews under its existing per-subject lock, then calls
-`CertStore::save_with_lock`. The key-value adapter delegates all three certificate
+`CertStore::save_with_lock`. The key-value adapter delegates credential snapshot
 components to `Storage::store_tx_with_lock`. Etcd compares the lock's revision,
 lease ID and random token in the **same transaction** as those writes. Private-key
 archival uses `move_private_key_with_lock` / `move_with_lock`, comparing source
@@ -355,11 +397,11 @@ fallback. Connection loss fails local lease health conservatively. Operations
 may return timeout/unavailable errors during leader changes; ambiguous write
 outcomes are not blindly retried. Linearizable writes require a quorum.
 
-These guarantees cover guarded publication and private-key archival. Plain
-`store`, `delete`, legacy `save`/`move_private_key`, account/challenge writes and
-storage cleanup are not automatically fenced. FileStorage/Redis guards keep
-their previous advisory-health behavior. This is not a guarantee against actors
-that bypass guarded APIs or an atomic transaction spanning independent systems.
+These guarantees cover operations using guarded publication, archival and
+deletion APIs, including the managed account and challenge lifecycle. Direct
+unguarded writes and custom backends require their own ownership protocol.
+FileStorage/Redis guards use advisory lease-health checks. Transactions spanning
+independent storage systems require coordination at the application boundary.
 
 Run the explicit local integration lane (requires Docker and `protoc`):
 
@@ -476,8 +518,8 @@ This is a single-endpoint lease adapter, not Redlock or write fencing. Redis
 Cluster and Sentinel discovery are not implemented. Losing a heartbeat fails
 local lease health closed. Issuance/renewal checkpoints stop retries and
 publication after detected lease loss; callers needing fenced writes still
-require a stronger atomic write protocol. `CertStore` remains separate, and the generic three-key resource
-adapter is not a crash-atomic transaction. Persist keys/accounts appropriately
+require a stronger atomic write protocol. KeyValueCertStore publishes complete
+credential snapshots. Persist keys/accounts appropriately
 (e.g. AOF with an explicit fsync policy and a non-evicting capacity plan), use
 ACL/TLS as appropriate, and do not log connection URLs. No automatic server
 configuration changes are performed.
@@ -526,8 +568,10 @@ heartbeat-only protocol, then restart them on the same version.
 This is a lease protocol, not a fencing service: a process paused past lease
 expiry can resume application writes after another instance takes over.
 Deployments requiring fencing must supply a backend that enforces it.
-Certificate resources still use separate certificate/key/metadata writes;
-`store_tx` rolls back reported errors but is not a crash-atomic transaction.
+FileStorage retains its root commit lock until a dispatched blocking write
+finishes, including after caller cancellation. KeyValueCertStore publishes the
+complete snapshot after compatibility mirrors. Arbitrary multi-key `store_tx`
+callers still rely on rollback of reported errors and backend crash guarantees.
 
 ## Testing
 

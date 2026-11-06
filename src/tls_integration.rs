@@ -81,13 +81,17 @@ pub(crate) fn to_certified_key(
     cert: &crate::certificate::Certificate,
     cache: &Mutex<HashMap<String, Arc<CertifiedKey>>>,
 ) -> Option<Arc<CertifiedKey>> {
+    let staple = cert.current_ocsp_staple();
+    if !cert.valid_at(time::OffsetDateTime::now_utc()) || (cert.must_staple && staple.is_none()) {
+        return None;
+    }
     {
         let mut keys = cache.lock().ok()?;
         if let Some(hit) = keys.get_mut(cert.hash()) {
-            if hit.ocsp != cert.ocsp_staple {
+            if hit.ocsp.as_deref() != staple {
                 // Preserve signing-key reuse while publishing the new staple.
                 // Existing handshakes retain their immutable Arc snapshot.
-                Arc::make_mut(hit).ocsp = cert.ocsp_staple.clone();
+                Arc::make_mut(hit).ocsp = staple.map(<[u8]>::to_vec);
             }
             return Some(Arc::clone(hit));
         }
@@ -100,7 +104,7 @@ pub(crate) fn to_certified_key(
         }
     };
     let mut ck = CertifiedKey::new(cert.chain.clone(), signing_key);
-    ck.ocsp = cert.ocsp_staple.clone();
+    ck.ocsp = staple.map(<[u8]>::to_vec);
     let ck = Arc::new(ck);
     if let Ok(mut map) = cache.lock() {
         map.insert(cert.hash().to_owned(), Arc::clone(&ck));
@@ -306,13 +310,13 @@ impl ResolvesServerCert for CertmagicResolver {
         // TLS-ALPN-01 must win over ordinary certificate selection. The
         // challenge map is resolver-local, avoiding cross-config leakage from
         // the solver's process-global registry.
-        if hello.alpn.iter().any(|alpn| alpn == b"acme-tls/1")
+        if hello.is_acme_tls_alpn()
             && let Some(name) = requested_name.as_deref()
-            && let Some(cert) = self
-                .challenge_certs
-                .read()
-                .ok()
-                .and_then(|certificates| certificates.get(name).cloned())
+            && let Some(cert) = self.challenge_certs.read().ok().and_then(|certificates| {
+                certificates
+                    .get(&crate::solvers::tls_alpn::TlsAlpnSolver::identifier_for_sni(name))
+                    .cloned()
+            })
         {
             return Some(cert);
         }
@@ -329,8 +333,11 @@ impl ResolvesServerCert for CertmagicResolver {
                 {
                     return None;
                 }
-                name.as_deref()
-                    .and_then(|name| self.cache.first_matching_certificate(name))
+                name.as_deref().and_then(|name| {
+                    self.cache.first_matching_where(name, |cert| {
+                        cert.supports_hello(&hello) && cert.covers_name(name)
+                    })
+                })
             });
         if let Some(cert) = cached {
             return to_certified_key(&cert, &self.keys);
@@ -341,7 +348,9 @@ impl ResolvesServerCert for CertmagicResolver {
         let fallback_name = self.policy_name(explicit_fallback, configured_fallback);
         if let Some(fallback_name) = fallback_name.as_deref()
             && fallback_name != name.as_deref().unwrap_or_default()
-            && let Some(cert) = self.cache.first_matching_certificate(fallback_name)
+            && let Some(cert) = self.cache.first_matching_where(fallback_name, |cert| {
+                cert.supports_hello(&hello) && cert.covers_name(fallback_name)
+            })
         {
             return to_certified_key(&cert, &self.keys);
         }
@@ -353,6 +362,7 @@ impl ResolvesServerCert for CertmagicResolver {
         // Scheme C: fail this handshake, obtain in the background.
         if (self.background_remediation || self.on_demand.is_some())
             && let Some(config) = config
+            && config.options.on_demand.is_some()
         {
             let background_name = requested_name.or(name).unwrap_or_default();
             if !background_name.is_empty() {
@@ -726,6 +736,16 @@ mod review_tests {
         .unwrap();
         let cache = Mutex::new(HashMap::new());
         cert.ocsp_staple = Some(vec![1, 2, 3]);
+        // Model the verified metadata supplied by the OCSP parser.
+        cert.ocsp = Some(crate::ocsp::OcspResponse {
+            status: crate::ocsp::OcspCertStatus::Good,
+            this_update: time::OffsetDateTime::now_utc() - time::Duration::minutes(1),
+            next_update: Some(time::OffsetDateTime::now_utc() + time::Duration::hours(1)),
+            revoked_at: None,
+            revocation_reason: None,
+            responder_not_after: None,
+            raw: vec![1, 2, 3],
+        });
         let first = to_certified_key(&cert, &cache).unwrap();
         assert_eq!(first.ocsp, cert.ocsp_staple);
         assert!(Arc::ptr_eq(
@@ -733,10 +753,14 @@ mod review_tests {
             &to_certified_key(&cert, &cache).unwrap()
         ));
         cert.ocsp_staple = Some(vec![4, 5]);
+        cert.ocsp.as_mut().unwrap().raw = vec![4, 5];
         let refreshed = to_certified_key(&cert, &cache).unwrap();
         assert_eq!(refreshed.ocsp, cert.ocsp_staple);
         assert!(Arc::ptr_eq(&first.key, &refreshed.key));
         assert_eq!(first.ocsp, Some(vec![1, 2, 3]));
+        cert.ocsp.as_mut().unwrap().next_update =
+            Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(1));
+        assert!(to_certified_key(&cert, &cache).unwrap().ocsp.is_none());
         cert.ocsp_staple = None;
         assert!(to_certified_key(&cert, &cache).unwrap().ocsp.is_none());
     }

@@ -65,10 +65,23 @@ impl Error {
         matches!(self, Error::NoRetry(_))
     }
 
+    /// Match an ACME problem through retry-policy wrappers.
+    #[must_use]
+    pub fn is_acme_problem(&self, expected: &ProblemType) -> bool {
+        match self {
+            Self::NoRetry(inner) => inner.is_acme_problem(expected),
+            Self::Acme(AcmeError::Problem(kind, _)) => kind == expected,
+            _ => false,
+        }
+    }
+
     /// Whether the CA reported a nonexistent account; callers delete the
     /// local account and re-register — rotating the key.
     #[must_use]
     pub fn is_account_does_not_exist(&self) -> bool {
+        if let Self::NoRetry(inner) = self {
+            return inner.is_account_does_not_exist();
+        }
         matches!(
             self,
             Error::Acme(AcmeError::Problem(ProblemType::AccountDoesNotExist, _))
@@ -220,6 +233,9 @@ pub enum OcspError {
 /// Certificate parsing / selection errors.
 #[derive(Debug, Clone, Error)]
 pub enum CertificateError {
+    /// A durable revocation intent quarantines this certificate leaf.
+    #[error("certificate leaf is revoked or quarantined")]
+    Revoked,
     /// PEM/DER bundle could not be parsed.
     #[error("parse: {0}")]
     Parse(String),

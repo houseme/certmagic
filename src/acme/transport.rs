@@ -12,6 +12,17 @@ use async_trait::async_trait;
 
 use crate::error::{AcmeError, Error, Result};
 
+/// ACME endpoint policy, separate from HTTP-capable OCSP transports.
+pub(crate) fn require_https(endpoint: &str) -> Result<()> {
+    if url::Url::parse(endpoint).is_ok_and(|url| url.scheme() == "https" && url.has_host()) {
+        Ok(())
+    } else {
+        Err(Error::Config(crate::error::ConfigError::Invalid(
+            "ACME endpoints must use HTTPS".into(),
+        )))
+    }
+}
+
 /// HTTP methods the ACME client needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -154,17 +165,7 @@ impl ReqwestTransport {
         user_agent: &str,
         accept_invalid_certs: bool,
     ) -> Result<Self> {
-        crate::tls_integration::install_default_provider();
-        let mut builder = reqwest::Client::builder()
-            .timeout(timeout)
-            .user_agent(user_agent);
-        if accept_invalid_certs {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-        let client = builder
-            .build()
-            .map_err(|e| Error::Acme(AcmeError::Http(format!("client build: {e}"))))?;
-        Ok(Self { client })
+        Self::with_options(timeout, user_agent, accept_invalid_certs, None, None, None)
     }
 
     /// Build a transport with optional extra roots, proxy and static DNS
@@ -181,7 +182,18 @@ impl ReqwestTransport {
         crate::tls_integration::install_default_provider();
         let mut builder = reqwest::Client::builder()
             .timeout(timeout)
-            .user_agent(user_agent);
+            .user_agent(user_agent)
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    attempt.error("redirect limit exceeded")
+                } else if attempt.url().scheme() != "https"
+                    && attempt.previous().iter().any(|url| url.scheme() == "https")
+                {
+                    attempt.error("HTTPS downgrade rejected")
+                } else {
+                    attempt.follow()
+                }
+            }));
         if accept_invalid_certs {
             builder = builder.danger_accept_invalid_certs(true);
         }
@@ -229,7 +241,7 @@ impl Transport for ReqwestTransport {
         let response = builder
             .send()
             .await
-            .map_err(|e| Error::Acme(AcmeError::Http(e.to_string())))?;
+            .map_err(|e| Error::Acme(AcmeError::Http(e.without_url().to_string())))?;
 
         let status = response.status().as_u16();
         let mut headers = HashMap::new();
@@ -238,11 +250,12 @@ impl Transport for ReqwestTransport {
                 headers.insert(name.as_str().to_ascii_lowercase(), v.to_owned());
             }
         }
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| Error::Acme(AcmeError::Http(e.to_string())))?
-            .to_vec();
+        let limit = if response.status().is_success() {
+            4 * 1024 * 1024
+        } else {
+            crate::http::MAX_ERROR_BODY_BYTES
+        };
+        let body = crate::http::read_body_limited(response, limit).await?;
 
         Ok(HttpResponse {
             status,
@@ -255,6 +268,15 @@ impl Transport for ReqwestTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certon_acme_endpoints_require_https() {
+        assert!(require_https("https://ca.example/private?token=secret").is_ok());
+        for endpoint in ["http://ca.example/acme", "file:///secret", "invalid"] {
+            let error = require_https(endpoint).unwrap_err().to_string();
+            assert!(!error.contains(endpoint));
+        }
+    }
 
     #[test]
     fn response_headers_are_case_insensitive_and_expose_acme_metadata() {

@@ -36,6 +36,14 @@ async fn server(
     response: String,
     delay_body: Duration,
 ) -> (S3BlobStore, tokio::task::JoinHandle<String>) {
+    server_with_timeout(response, delay_body, Duration::from_secs(3)).await
+}
+
+async fn server_with_timeout(
+    response: String,
+    delay_body: Duration,
+    operation_timeout: Duration,
+) -> (S3BlobStore, tokio::task::JoinHandle<String>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
@@ -73,7 +81,7 @@ async fn server(
         S3BlobStoreOptions {
             bucket: "fixture-bucket".into(),
             max_blob_size: 64,
-            operation_timeout: Duration::from_millis(200),
+            operation_timeout,
             ..Default::default()
         },
     )
@@ -171,7 +179,12 @@ async fn downloads_enforce_declared_and_streamed_limits_and_body_deadline() {
     );
     task.await.unwrap();
 
-    let (backend, task) = server(reply("200 OK", "secret"), Duration::from_millis(400)).await;
+    let (backend, task) = server_with_timeout(
+        reply("200 OK", "secret"),
+        Duration::from_millis(400),
+        Duration::from_millis(200),
+    )
+    .await;
     assert!(
         backend
             .get("objects/test")

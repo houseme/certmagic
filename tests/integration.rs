@@ -4,7 +4,7 @@
 //! ```sh
 //! go install github.com/letsencrypt/pebble/cmd/pebble@latest
 //! go install github.com/letsencrypt/pebble/cmd/pebble-challtestsrv@latest
-//! PEBBLE_DIRECTORY=http://localhost:14000/dir \
+//! PEBBLE_DIRECTORY=https://localhost:14000/dir \
 //! CHALLTESTSRV_MANAGEMENT=http://localhost:19530 \
 //! cargo test --features integration-tests --test integration -- --nocapture
 //! ```
@@ -159,10 +159,11 @@ async fn full_lifecycle_against_pebble() {
     let storage: Arc<dyn certmagic::storage::Storage> =
         certmagic::storage::FileStorage::new(dir.path());
     let cache = certmagic::Cache::new(Default::default()).unwrap();
+    let issuer = Arc::new(issuer);
     let config = certmagic::Config::new(
         cache,
         certmagic::ConfigOptions {
-            issuers: vec![Arc::new(issuer)],
+            issuers: vec![issuer.clone()],
             storage: Some(storage),
             ..Default::default()
         },
@@ -181,6 +182,12 @@ async fn full_lifecycle_against_pebble() {
             .await
             .unwrap()
     );
+
+    let certificate = config.cache().first_matching_certificate(&domain).unwrap();
+    let renewal = certmagic::issuer::Issuer::get_renewal_info(issuer.as_ref(), &ct, &certificate)
+        .await
+        .expect("Pebble should return ARI through anonymous GET");
+    assert!(renewal.suggested_window_end > renewal.suggested_window_start);
 
     // Force renewal produces a second certificate.
     let ct = tokio_util::sync::CancellationToken::new();

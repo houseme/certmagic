@@ -151,7 +151,7 @@ pub struct AcmeIssuer {
 impl std::fmt::Debug for AcmeIssuer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcmeIssuer")
-            .field("ca", &self.ca)
+            .field("ca", &crate::http::diagnostic_endpoint(&self.ca))
             .field("email", &self.email)
             .field("dns", &self.dns_provider.is_some())
             .field("tos_agreed", &self.tos_agreed)
@@ -245,18 +245,16 @@ impl AcmeIssuer {
 
     /// Return the most recently persisted account contact email, if any.
     pub async fn most_recent_account_email(&self) -> Result<Option<String>> {
-        let Some(account) = self.load_account().await? else {
+        let Some(storage) = &self.storage else {
             return Ok(None);
         };
-        Ok(account
-            .contacts
-            .into_iter()
-            .find_map(|contact| contact.strip_prefix("mailto:").map(str::to_owned)))
+        super::account_store::most_recent(storage.as_ref(), &self.ca).await
     }
 
     /// Persist an account explicitly (useful for account bootstrap tools).
     pub async fn save_account(&self, account: &Account) -> Result<()> {
-        self.persist_account(account).await
+        let guard = self.account_lock(&CancellationToken::new()).await?;
+        self.persist_account(account, guard.as_ref()).await
     }
 
     /// Delete only the local account material; the CA account is not
@@ -265,22 +263,66 @@ impl AcmeIssuer {
         let Some(storage) = &self.storage else {
             return Ok(());
         };
-        let (key_path, meta_path) = self.account_paths();
-        storage.delete(&key_path).await?;
-        storage.delete(&meta_path).await?;
-        Ok(())
+        let guard = self
+            .account_lock(&CancellationToken::new())
+            .await?
+            .expect("configured storage");
+        super::account_store::save(
+            storage.as_ref(),
+            &self.ca,
+            self.email.as_deref().unwrap_or_default(),
+            None,
+            &guard,
+        )
+        .await
     }
 
-    /// Stable storage/identity key: `acme-<ca hash8>`.
+    /// Full directory endpoint identity, including scheme, port, path and query.
     #[must_use]
     pub fn issuer_key(&self) -> String {
         if let Some(key) = &self.issuer_key_override {
             return key.clone();
         }
-        format!("acme-{}", &sha256_hex(self.ca.as_bytes())[..8])
+        format!(
+            "acme-{}",
+            sha256_hex(super::account_store::directory(&self.ca).as_bytes())
+        )
     }
 
-    async fn build_client(&self, use_test_ca: bool, ct: &CancellationToken) -> Result<AcmeClient> {
+    /// Previous eight-hex issuer key, for explicit offline migration.
+    #[must_use]
+    pub fn legacy_issuer_key(&self) -> String {
+        self.issuer_key_override
+            .clone()
+            .unwrap_or_else(|| format!("acme-{}", &sha256_hex(self.ca.as_bytes())[..8]))
+    }
+
+    async fn account_lock(
+        &self,
+        ct: &CancellationToken,
+    ) -> Result<Option<crate::storage::LockGuard>> {
+        match &self.storage {
+            Some(storage) => crate::storage::acquire_lock(
+                ct,
+                storage,
+                &format!(
+                    "account_{}",
+                    sha256_hex(
+                        super::account_store::path(
+                            &self.ca,
+                            self.email.as_deref().unwrap_or_default()
+                        )
+                        .as_bytes()
+                    )
+                ),
+            )
+            .await
+            .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn connect_client(&self, use_test_ca: bool) -> Result<AcmeClient> {
         let ca = if use_test_ca {
             self.test_ca.as_deref().unwrap_or(&self.ca)
         } else {
@@ -306,7 +348,7 @@ impl AcmeIssuer {
                 )?)
             }
         };
-        let mut client =
+        let client =
             AcmeClient::connect(transport, ca)
                 .await?
                 .with_rate_limiter(acme_rate_limiter(&format!(
@@ -315,11 +357,18 @@ impl AcmeIssuer {
                     self.email.as_deref().unwrap_or_default()
                 )));
 
-        let contacts: Vec<String> = self
-            .email
-            .as_deref()
-            .map(|e| vec![format!("mailto:{e}")])
-            .unwrap_or_default();
+        Ok(client)
+    }
+
+    async fn build_client(&self, use_test_ca: bool, ct: &CancellationToken) -> Result<AcmeClient> {
+        let mut client = self.connect_client(use_test_ca).await?;
+        let account_guard = self.account_lock(ct).await?;
+        let email = super::account_store::email(self.email.as_deref().unwrap_or_default());
+        let contacts: Vec<String> = if email.is_empty() {
+            Vec::new()
+        } else {
+            vec![format!("mailto:{email}")]
+        };
 
         // Adopt the configured, injected, or persisted account key; look up
         // or register. The factory runs only when local state is absent.
@@ -328,6 +377,15 @@ impl AcmeIssuer {
             && let Some(factory) = &self.new_account_func
         {
             account = Some(factory(&contacts)?);
+        }
+        if let (Some(account), Some(explicit)) = (&account, &self.account_key_pem)
+            && account.key.thumbprint_b64()?
+                != crate::acme::protocol::AccountKey::from_pkcs8_pem(explicit.as_bytes())?
+                    .thumbprint_b64()?
+        {
+            return Err(Error::Config(crate::error::ConfigError::Invalid(
+                "configured account key differs from the bound account".into(),
+            )));
         }
         let key = match (&account, &self.account_key_pem) {
             (Some(a), _) => a.key.clone(),
@@ -359,32 +417,29 @@ impl AcmeIssuer {
                         ct,
                     )
                     .await?;
-                self.persist_account(&fresh).await?;
+                self.persist_account(&fresh, account_guard.as_ref()).await?;
                 Some(fresh)
             }
             Err(err) => return Err(err),
         };
         if let Some(a) = account {
             client = client.with_account(a);
-            let desired_contacts = self
-                .email
-                .as_deref()
-                .map(|email| vec![format!("mailto:{email}")])
-                .unwrap_or_default();
+            let desired_contacts = contacts;
             if !desired_contacts.is_empty()
                 && client
                     .account()
                     .is_ok_and(|current| current.contacts != desired_contacts)
             {
                 let updated = client.update_account(&desired_contacts, ct).await?;
-                self.persist_account(&updated).await?;
+                self.persist_account(&updated, account_guard.as_ref())
+                    .await?;
             }
         }
         Ok(client)
     }
 
     fn account_paths(&self) -> (String, String) {
-        let issuer_key = self.issuer_key();
+        let issuer_key = self.legacy_issuer_key();
         let email = self.email.as_deref().unwrap_or_default();
         (
             crate::storage::account_private_key(&issuer_key, email),
@@ -397,7 +452,7 @@ impl AcmeIssuer {
     /// after the canonical layout so existing installations migrate without
     /// losing their registered account key.
     fn legacy_account_paths(&self) -> Vec<(String, String)> {
-        let issuer_key = self.issuer_key();
+        let issuer_key = self.legacy_issuer_key();
         let safe_issuer = crate::storage::STORAGE_KEYS.safe(&issuer_key);
         let mut paths = vec![(
             format!(
@@ -441,69 +496,164 @@ impl AcmeIssuer {
         let Some(storage) = &self.storage else {
             return Ok(None);
         };
-        let canonical = self.account_paths();
-        let mut loaded = None;
-        for (key_path, meta_path) in self.account_path_candidates() {
-            let key_pem = match storage.load(&key_path).await {
-                Ok(pem) => pem,
-                Err(Error::Storage(crate::error::StorageError::NotFound(_))) => continue,
-                Err(err) => return Err(err),
-            };
-            let meta: serde_json::Value = match storage.load(&meta_path).await {
-                Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
-                Err(_) => Default::default(),
-            };
-            let key = crate::acme::protocol::AccountKey::from_pkcs8_pem(&key_pem)?;
-            let account = Account {
-                key,
-                url: meta["url"].as_str().unwrap_or_default().to_owned(),
-                contacts: meta["contacts"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_owned))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                status: meta["status"].as_str().unwrap_or_default().to_owned(),
-                terms_of_service_agreed: meta["tos"].as_bool().unwrap_or(false),
-            };
-            loaded = Some((key_path, account));
-            break;
+        if let Some(account) = super::account_store::load(
+            storage.as_ref(),
+            &self.ca,
+            self.email.as_deref().unwrap_or_default(),
+        )
+        .await?
+        {
+            return Ok(account);
         }
-
-        let Some((loaded_path, account)) = loaded else {
-            return Ok(None);
-        };
-        // Migrate in place while preserving the legacy files. Keeping the
-        // old copy avoids making a failed canonical write destructive and
-        // lets older processes continue operating during rolling upgrades.
-        if loaded_path != canonical.0 {
-            self.persist_account(&account).await?;
+        for (key, _) in self.account_path_candidates() {
+            if storage.exists_exact_many(&[&key]).await?.first() == Some(&true) {
+                return Err(Error::Config(crate::error::ConfigError::Invalid(
+                    "legacy ACME credentials require migrate_legacy_account before use".into(),
+                )));
+            }
         }
-        Ok(Some(account))
+        Ok(None)
     }
 
-    async fn persist_account(&self, account: &Account) -> Result<()> {
+    async fn persist_account(
+        &self,
+        account: &Account,
+        guard: Option<&crate::storage::LockGuard>,
+    ) -> Result<()> {
         let Some(storage) = &self.storage else {
             return Ok(());
         };
-        let (key_path, meta_path) = self.account_paths();
-        let key_pem = crate::pem::encode("PRIVATE KEY", account.key.pkcs8_der());
-        let meta = json!({
-            "url": account.url,
-            "contacts": account.contacts,
-            "status": account.status,
-            "tos": account.terms_of_service_agreed,
-        });
-        crate::storage::store_tx(
+        let guard =
+            guard.ok_or_else(|| Error::Internal("account write requires ownership".into()))?;
+        super::account_store::save(
             storage.as_ref(),
-            &[
-                (key_path.as_str(), key_pem),
-                (meta_path.as_str(), meta.to_string().into_bytes()),
-            ],
+            &self.ca,
+            self.email.as_deref().unwrap_or_default(),
+            Some(account),
+            guard,
         )
         .await
+    }
+
+    /// Explicitly bind a legacy account to this complete directory and configured
+    /// email identity. Run with legacy writers quiesced. Verified receipts allow
+    /// interrupted retirement to resume without crossing sanitized email aliases.
+    pub async fn migrate_legacy_account(&self, ct: &CancellationToken) -> Result<bool> {
+        let Some(storage) = &self.storage else {
+            return Ok(false);
+        };
+        let account_guard = self.account_lock(ct).await?;
+        let email = super::account_store::email(self.email.as_deref().unwrap_or_default());
+        let current = super::account_store::load(storage.as_ref(), &self.ca, &email).await?;
+        if matches!(current, Some(None)) {
+            return Ok(false);
+        }
+        let already_bound = current.is_some();
+        let ca = super::account_store::directory(&self.ca);
+        for (key_path, meta_path) in self.account_path_candidates() {
+            let receipt_key = format!(
+                "migration-receipts/accounts/{}.json",
+                sha256_hex(key_path.as_bytes())
+            );
+            let guard = crate::storage::acquire_lock(
+                ct,
+                storage,
+                &format!("legacy_account_{}", sha256_hex(key_path.as_bytes())),
+            )
+            .await?;
+            let receipt = match storage.load(&receipt_key).await {
+                Ok(bytes) => Some(
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .map_err(|_| Error::Internal("invalid account migration receipt".into()))?,
+                ),
+                Err(Error::Storage(crate::error::StorageError::NotFound(_))) => None,
+                Err(error) => return Err(error),
+            };
+            if let Some(receipt) = &receipt
+                && (receipt["version"] != 1
+                    || receipt["directory"] != ca
+                    || receipt["email"] != email)
+            {
+                if already_bound {
+                    continue;
+                }
+                return Err(Error::Config(crate::error::ConfigError::Invalid(
+                    "legacy account slot is bound to another identity".into(),
+                )));
+            }
+            let old = match storage.load(&key_path).await {
+                Ok(bytes) => Some(bytes),
+                Err(Error::Storage(crate::error::StorageError::NotFound(_))) => None,
+                Err(error) => return Err(error),
+            };
+            if old.is_none() && receipt.is_none() {
+                continue;
+            }
+            let account = if let Some(key_pem) = old {
+                let meta: serde_json::Value =
+                    serde_json::from_slice(&storage.load(&meta_path).await?).map_err(|_| {
+                        Error::Internal("invalid legacy account registration".into())
+                    })?;
+                Account {
+                    key: crate::acme::protocol::AccountKey::from_pkcs8_pem(&key_pem)?,
+                    url: meta["url"].as_str().unwrap_or_default().into(),
+                    contacts: serde_json::from_value(meta["contacts"].clone())
+                        .map_err(|_| Error::Internal("invalid legacy account contacts".into()))?,
+                    status: meta["status"].as_str().unwrap_or_default().into(),
+                    terms_of_service_agreed: meta["tos"].as_bool().unwrap_or(false),
+                }
+            } else {
+                super::account_store::load(storage.as_ref(), &self.ca, &email)
+                    .await?
+                    .flatten()
+                    .ok_or_else(|| Error::Internal("missing verified account destination".into()))?
+            };
+            let thumbprint = account.key.thumbprint_b64()?;
+            if receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt["thumbprint"] != thumbprint)
+            {
+                return Err(Error::Internal("account migration identity changed".into()));
+            }
+            if let Some(Some(existing)) =
+                super::account_store::load(storage.as_ref(), &self.ca, &email).await?
+                && existing.key.thumbprint_b64()? != thumbprint
+            {
+                return Err(Error::Internal("account destination differs".into()));
+            }
+            super::account_store::save(
+                storage.as_ref(),
+                &self.ca,
+                &email,
+                Some(&account),
+                account_guard.as_ref().expect("configured account storage"),
+            )
+            .await?;
+            let verified = super::account_store::load(storage.as_ref(), &self.ca, &email)
+                .await?
+                .flatten()
+                .ok_or_else(|| Error::Internal("missing account snapshot".into()))?;
+            if verified.key.thumbprint_b64()? != thumbprint {
+                return Err(Error::Internal(
+                    "account snapshot verification failed".into(),
+                ));
+            }
+            let receipt = json!({"version":1,"directory":ca,"email":email,"thumbprint":thumbprint});
+            storage
+                .store_tx_with_lock(
+                    &[(
+                        &receipt_key,
+                        serde_json::to_vec(&receipt)
+                            .map_err(|error| Error::Internal(error.to_string()))?,
+                    )],
+                    &guard,
+                )
+                .await?;
+            storage.delete_with_lock(&key_path, &guard).await?;
+            storage.delete_with_lock(&meta_path, &guard).await?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Pick the solver + wire challenge for an authorization.
@@ -514,46 +664,52 @@ impl AcmeIssuer {
         let identifier = authz.identifier.value();
         let needs_dns = authz.wildcard || identifier.starts_with("*.");
 
-        let base: Arc<dyn Solver> = if self.dns_provider.is_some() || needs_dns {
-            let provider = self.dns_provider.as_ref().ok_or_else(|| {
-                Error::Issuer(IssuerError::Challenge(format!(
-                    "wildcard identifier {identifier} requires a DNS provider"
-                )))
-            })?;
-            Arc::new(Dns01Solver::new(
-                Arc::clone(provider),
-                self.dns_options.clone(),
-            ))
-        } else if !self.disable_http_challenge {
-            Arc::new(Http01Solver::with_host(
-                self.http_listen_host,
-                self.alt_http_port.unwrap_or(self.http_port),
-            ))
-        } else if !self.disable_tls_alpn_challenge {
-            match self.alt_tls_alpn_port {
-                Some(port) => Arc::new(TlsAlpnSolver::with_port(port)),
-                None => Arc::new(TlsAlpnSolver::default()),
-            }
+        let dns = cfg!(feature = "dns-01")
+            && matches!(authz.identifier, crate::acme::order::Identifier::Dns(_))
+            && self.dns_provider.is_some()
+            && authz.challenge("dns-01").is_some();
+        let http = cfg!(feature = "http-01")
+            && !self.disable_http_challenge
+            && authz.challenge("http-01").is_some();
+        let tls = !self.disable_tls_alpn_challenge && authz.challenge("tls-alpn-01").is_some();
+        let (kind, base): (&str, Arc<dyn Solver>) = if dns {
+            (
+                "dns-01",
+                Arc::new(Dns01Solver::new(
+                    Arc::clone(self.dns_provider.as_ref().expect("checked DNS provider")),
+                    self.dns_options.clone(),
+                )),
+            )
+        } else if needs_dns {
+            return Err(Error::Issuer(IssuerError::Challenge(
+                "wildcard authorization requires an enabled DNS solver and offered DNS challenge"
+                    .into(),
+            )));
+        } else if http {
+            (
+                "http-01",
+                Arc::new(Http01Solver::with_host(
+                    self.http_listen_host,
+                    self.alt_http_port.unwrap_or(self.http_port),
+                )),
+            )
+        } else if tls {
+            (
+                "tls-alpn-01",
+                Arc::new(match self.alt_tls_alpn_port {
+                    Some(port) => TlsAlpnSolver::with_port(port),
+                    None => TlsAlpnSolver::default(),
+                }),
+            )
         } else {
             return Err(Error::Issuer(IssuerError::Challenge(
-                "all challenge types disabled".into(),
+                "CA offered no enabled, configured challenge solver".into(),
             )));
         };
-
-        // Determine challenge kind by what the base solver serves.
-        let kind = if self.dns_provider.is_some() || needs_dns {
-            "dns-01"
-        } else if !self.disable_http_challenge {
-            "http-01"
-        } else {
-            "tls-alpn-01"
-        };
-
-        let chal = authz.challenge(kind).cloned().ok_or_else(|| {
-            Error::Issuer(IssuerError::Challenge(format!(
-                "CA did not offer a {kind} challenge for {identifier}"
-            )))
-        })?;
+        let chal = authz
+            .challenge(kind)
+            .cloned()
+            .expect("selected offered challenge");
 
         // Distributed wrap when storage is available.
         let solver: Arc<dyn Solver> = match (&self.storage, self.disable_distributed_solvers) {
@@ -763,12 +919,17 @@ impl Issuer for AcmeIssuer {
         cert: &crate::certificate::Certificate,
     ) -> Result<crate::certificate::RenewalInfo> {
         let (aki, serial) = aki_and_serial(cert)?;
-        let client = self.build_client(false, ct).await?;
+        let client = tokio::select! {
+            biased;
+            () = ct.cancelled() => return Err(Error::Internal("context canceled".into())),
+            client = self.connect_client(false) => client?,
+        };
         let info = client.renewal_info(&aki, &serial, ct).await?;
-        let (start, end) = info.window()?;
-        Ok(crate::certificate::RenewalInfo::from_suggested_window(
-            start, end,
-        ))
+        info.to_runtime()?.ok_or_else(|| {
+            Error::Acme(crate::error::AcmeError::Order(
+                "ARI response omitted suggestedWindow".into(),
+            ))
+        })
     }
 
     fn issuer_key(&self) -> String {
@@ -845,7 +1006,7 @@ impl AcmeIssuer {
                 relative(self.not_before),
                 relative(self.not_after),
                 self.profile.as_deref(),
-                replaces,
+                replaces.filter(|_| client.directory.renewal_info.is_some()),
                 ct,
             )
             .await?;
@@ -868,13 +1029,12 @@ impl AcmeIssuer {
                     &authz.identifier.value(),
                     &client.account()?.key,
                 )?;
-                solver.present(ct, &solvable).await?;
-                // There is no await between successful presentation and
-                // transferring cleanup ownership to the guard.
+                // Own cleanup before any provider side effect can be dispatched.
                 solved.entries.push((Arc::clone(&solver), solvable.clone()));
+                solver.present(ct, &solvable).await?;
 
-                client.trigger_challenge(&chal.url, ct).await?;
                 solver.wait(ct, &solvable).await?;
+                client.trigger_challenge(&chal.url, ct).await?;
             }
             client
                 .wait_for_order_ready(&order_url, self.cert_obtain_timeout, ct)
@@ -898,13 +1058,35 @@ impl AcmeIssuer {
         // CSR, then wait for `valid`. (RFC 8555 §7.4: an order only becomes
         // valid AFTER finalize — waiting for `valid` before this point
         // deadlocks.)
-        let finalized = client.finalize(&order.finalize, &csr.der, ct).await?;
-        let done = if finalized.is_terminal() {
-            finalized
-        } else {
-            client
-                .wait_for_order(&order_url, self.cert_obtain_timeout, ct)
-                .await?
+        let mut ready = order;
+        let done = loop {
+            if ready.is_terminal() {
+                break ready;
+            }
+            match client.finalize(&ready.finalize, &csr.der, ct).await {
+                Ok(finalized) if finalized.status == "pending" => {
+                    ready = client
+                        .wait_for_order_ready(&order_url, self.cert_obtain_timeout, ct)
+                        .await?;
+                }
+                Ok(finalized) if finalized.is_terminal() => break finalized,
+                Ok(_) => {
+                    break client
+                        .wait_for_order(&order_url, self.cert_obtain_timeout, ct)
+                        .await?;
+                }
+                Err(error) if error.is_acme_problem(&crate::error::ProblemType::OrderNotReady) => {
+                    tokio::select! {
+                        biased;
+                        () = ct.cancelled() => return Err(Error::Internal("context canceled".into())),
+                        () = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    }
+                    ready = client
+                        .wait_for_order_ready(&order_url, self.cert_obtain_timeout, ct)
+                        .await?;
+                }
+                Err(error) => return Err(error),
+            }
         };
         if done.status != "valid" {
             return Err(Error::Issuer(IssuerError::Other(format!(
@@ -1023,13 +1205,153 @@ fn aki_and_serial(cert: &crate::certificate::Certificate) -> Result<(Vec<u8>, Ve
             ))
         })?;
 
-    Ok((aki, parsed.serial.to_bytes_be()))
+    Ok((aki, parsed.raw_serial().to_vec()))
 }
 
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(feature = "file-storage")]
+    #[tokio::test]
+    async fn configured_account_identities_are_distinct_and_legacy_upgrade_is_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn crate::storage::Storage> =
+            crate::storage::FileStorage::new(directory.path());
+        let issuer = AcmeIssuer {
+            ca: "https://account.example/directory?tenant=one".into(),
+            email: Some("operator+prod@example.com".into()),
+            storage: Some(Arc::clone(&storage)),
+            ..Default::default()
+        };
+        let mut account =
+            Account::new_es256(&["mailto:mutable-contact@example.com".into()]).unwrap();
+        account.url = "https://account.example/account/one".into();
+        account.status = "valid".into();
+        let (key, meta) = issuer.account_paths();
+        storage
+            .store(
+                &key,
+                &crate::pem::encode("PRIVATE KEY", account.key.pkcs8_der()),
+            )
+            .await
+            .unwrap();
+        let metadata = serde_json::to_vec(&json!({
+            "url": account.url,
+            "contacts": account.contacts,
+            "status": account.status,
+            "tos": true,
+        }))
+        .unwrap();
+        storage.store(&meta, &metadata).await.unwrap();
+        assert!(issuer.load_account().await.is_err());
+        assert!(
+            issuer
+                .migrate_legacy_account(&CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            issuer
+                .load_account()
+                .await
+                .unwrap()
+                .unwrap()
+                .key
+                .thumbprint_b64()
+                .unwrap(),
+            account.key.thumbprint_b64().unwrap()
+        );
+        assert!(
+            issuer
+                .migrate_legacy_account(&CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        assert!(!storage.exists(&key).await.unwrap());
+        assert_eq!(
+            issuer.most_recent_account_email().await.unwrap().as_deref(),
+            Some("operator+prod@example.com")
+        );
+        let alias = AcmeIssuer {
+            email: Some("operator_plus_prod@example.com".into()),
+            ..issuer.clone()
+        };
+        assert!(
+            alias
+                .migrate_legacy_account(&CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(alias.load_account().await.unwrap().is_none());
+        alias
+            .save_account(&Account::new_es256(&[]).unwrap())
+            .await
+            .unwrap();
+        assert!(alias.load_account().await.unwrap().is_some());
+        let other = AcmeIssuer {
+            ca: "https://account.example/directory?tenant=two".into(),
+            ..issuer.clone()
+        };
+        assert_ne!(issuer.issuer_key(), other.issuer_key());
+        assert!(other.load_account().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn review_ari_uses_raw_serial_and_anonymous_requests() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["ari.example.com".into()]).unwrap();
+        params.serial_number = Some(rcgen::SerialNumber::from_slice(&[0x80, 0x01]));
+        params.use_authority_key_identifier_extension = true;
+        let signed = params.self_signed(&key).unwrap();
+        let certificate = crate::certificate::make_certificate(
+            signed.pem().as_bytes(),
+            key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        let (aki, serial) = aki_and_serial(&certificate).unwrap();
+        assert_eq!(serial, vec![0, 0x80, 1]);
+        let cert_id = crate::acme::order::ari_cert_id(&aki, &serial);
+        assert_eq!(certificate.ari_replaces_id().unwrap(), cert_id);
+
+        #[derive(Debug)]
+        struct AriTransport {
+            url: String,
+        }
+        #[async_trait]
+        impl Transport for AriTransport {
+            async fn execute(
+                &self,
+                request: crate::acme::transport::HttpRequest,
+            ) -> Result<crate::acme::transport::HttpResponse> {
+                assert_eq!(request.method, crate::acme::transport::Method::Get);
+                assert!(request.body.is_none());
+                let body = if request.url == "https://ca.example/directory" {
+                    br#"{"renewalInfo":"https://ca.example/ari"}"#.to_vec()
+                } else {
+                    assert_eq!(request.url, self.url);
+                    br#"{"suggestedWindow":{"start":"2030-01-01T00:00:00Z","end":"2030-01-02T00:00:00Z"}}"#.to_vec()
+                };
+                Ok(crate::acme::transport::HttpResponse {
+                    status: 200,
+                    headers: [("retry-after".into(), "120".into())].into_iter().collect(),
+                    body,
+                })
+            }
+        }
+        let issuer = AcmeIssuer {
+            ca: "https://ca.example/directory".into(),
+            transport: Some(Arc::new(AriTransport {
+                url: format!("https://ca.example/ari/{cert_id}"),
+            })),
+            ..Default::default()
+        };
+        issuer
+            .get_renewal_info(&CancellationToken::new(), &certificate)
+            .await
+            .unwrap();
+    }
 
     #[derive(Debug)]
     struct CleanupProbe {

@@ -157,6 +157,16 @@ pub async fn txt_contains_authoritative(name: &str, value: &str) -> Result<bool>
             authoritative_ips.sort_unstable();
             authoritative_ips.dedup();
             if let Ok(mut entries) = cache.lock() {
+                entries
+                    .retain(|_, (stored, _)| stored.elapsed() < std::time::Duration::from_secs(60));
+                if entries.len() >= 1024
+                    && let Some(oldest) = entries
+                        .iter()
+                        .min_by_key(|(_, (stored, _))| *stored)
+                        .map(|(key, _)| key.clone())
+                {
+                    entries.remove(&oldest);
+                }
                 entries.insert(zone, (std::time::Instant::now(), authoritative_ips.clone()));
             }
             authoritative_ips
@@ -304,7 +314,7 @@ async fn soa_exists(resolver: &hickory_resolver::TokioResolver, name: &str) -> b
                 hickory_resolver::proto::rr::RecordType::SOA,
             )
             .await,
-        Ok(response) if !response.answers().is_empty()
+        Ok(response) if response.answers().iter().any(|record| matches!(record.data, hickory_resolver::proto::rr::RData::SOA(_)) && record.name.to_utf8().trim_end_matches('.').eq_ignore_ascii_case(name.trim_end_matches('.')))
     )
 }
 

@@ -569,6 +569,28 @@ impl Storage for EtcdStorage {
         .await?;
         Ok(())
     }
+    async fn delete_with_lock(&self, key: &str, guard: &LockGuard) -> Result<()> {
+        let lease = self.lease(guard)?;
+        let key = self.canonical_key(key)?;
+        let mut client = self.inner.client.clone();
+        let response = rpc(
+            self.inner.options.operation_timeout,
+            "guarded delete",
+            client.txn(Txn::new().when(lease.compares()?).and_then(vec![
+                TxnOp::delete(self.data_key(&key)?, None),
+                TxnOp::delete(
+                    self.child_prefix(&key),
+                    Some(DeleteOptions::new().with_prefix()),
+                ),
+            ])),
+        )
+        .await?;
+        if !response.succeeded() {
+            lease.lose();
+            return Err(stale(&lease.name));
+        }
+        Ok(())
+    }
     async fn exists(&self, key: &str) -> Result<bool> {
         let key = self.canonical_key(key)?;
         let mut client = self.inner.client.clone();

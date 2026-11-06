@@ -200,6 +200,38 @@ pub fn pem_encode_private_key(key: &PrivateKeyDer<'_>) -> Result<Vec<u8>> {
     Ok(pem::encode(label, key.secret_der()))
 }
 
+/// Generate a key on the blocking pool with a process-wide CPU budget.
+/// At most four generators run concurrently. Cancelled callers release their
+/// wait immediately, while started generators retain their permits to completion.
+pub async fn generate_key_async(
+    source: std::sync::Arc<dyn KeyGenerator>,
+    ct: &tokio_util::sync::CancellationToken,
+) -> Result<PrivateKeyDer<'static>> {
+    static BUDGET: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let budget = BUDGET.get_or_init(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(4),
+        ))
+    });
+    let permit = tokio::select! {
+        biased;
+        () = ct.cancelled() => return Err(Error::Internal("context canceled".into())),
+        permit = budget.clone().acquire_owned() => permit.map_err(|_| Error::Internal("key generation budget closed".into()))?,
+    };
+    let generated = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        source.generate_key()
+    });
+    tokio::select! {
+        biased;
+        () = ct.cancelled() => Err(Error::Internal("context canceled".into())),
+        result = generated => result.map_err(|error| Error::Internal(format!("key generation task: {error}")))?,
+    }
+}
+
 /// PEM-decode a private key, accepting PKCS#8 / PKCS#1 / SEC1
 ///.
 ///
@@ -336,6 +368,41 @@ pub fn random_u64_below(n: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn certon_async_key_generation_keeps_runtime_responsive() {
+        #[derive(Debug)]
+        struct WaitingGenerator {
+            started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl KeyGenerator for WaitingGenerator {
+            fn generate_key(&self) -> Result<PrivateKeyDer<'static>> {
+                self.started
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                StandardKeyGenerator::default().generate_key()
+            }
+        }
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let source = std::sync::Arc::new(WaitingGenerator {
+            started: std::sync::Mutex::new(Some(started)),
+            release: std::sync::Mutex::new(blocked),
+        });
+        let task = tokio::spawn(async move {
+            generate_key_async(source, &tokio_util::sync::CancellationToken::new()).await
+        });
+        ready.await.unwrap();
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        assert!(task.await.unwrap().is_ok());
+    }
 
     #[test]
     fn keygen_p256_roundtrip_pem() {

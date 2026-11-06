@@ -89,6 +89,7 @@ impl Directory {
         transport: &dyn super::transport::Transport,
         directory_url: &str,
     ) -> Result<Self> {
+        super::transport::require_https(directory_url)?;
         let resp = transport
             .execute(super::transport::HttpRequest {
                 method: super::transport::Method::Get,

@@ -86,3 +86,59 @@ mod tests {
         assert_eq!(clock.now().unix_timestamp(), 1_000_060);
     }
 }
+
+/// Stable persisted UTC timestamps, independent of Cargo feature unification.
+pub(crate) mod wire_time {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use time::OffsetDateTime;
+
+    pub(crate) fn parse(value: serde_json::Value) -> Option<OffsetDateTime> {
+        match value {
+            serde_json::Value::String(value) => value
+                .parse::<i128>()
+                .ok()
+                .and_then(|value| OffsetDateTime::from_unix_timestamp_nanos(value).ok())
+                .or_else(|| {
+                    OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339)
+                        .ok()
+                }),
+            value => serde_json::from_value(value).ok(),
+        }
+    }
+    pub fn serialize<S: Serializer>(
+        value: &OffsetDateTime,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.unix_timestamp_nanos().to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<OffsetDateTime, D::Error> {
+        parse(serde_json::Value::deserialize(deserializer)?)
+            .ok_or_else(|| serde::de::Error::custom("invalid UTC timestamp"))
+    }
+}
+
+pub(crate) mod optional_wire_time {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use time::OffsetDateTime;
+    pub fn serialize<S: Serializer>(
+        value: &Option<OffsetDateTime>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => serializer.serialize_some(&value.unix_timestamp_nanos().to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<OffsetDateTime>, D::Error> {
+        Option::<serde_json::Value>::deserialize(deserializer)?
+            .map(|value| {
+                super::wire_time::parse(value)
+                    .ok_or_else(|| serde::de::Error::custom("invalid UTC timestamp"))
+            })
+            .transpose()
+    }
+}

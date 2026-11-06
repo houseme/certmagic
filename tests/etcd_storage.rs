@@ -993,6 +993,19 @@ mod remote_publication {
                 .is_err()
         );
         assert!(
+            store
+                .remove_with_lock("issuer", "example.test", &old_guard)
+                .await
+                .is_err()
+        );
+        assert!(
+            peer_store
+                .load("issuer", "example.test")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
             peer_store
                 .load_archived_private_key("archive/stale")
                 .await

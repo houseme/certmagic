@@ -23,7 +23,6 @@ use async_trait::async_trait;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use super::{KeyInfo, LockGuard, LockRelease, STORAGE_KEYS, Storage};
@@ -52,6 +51,7 @@ struct LockMeta {
 ///.
 pub struct FileStorage {
     root: PathBuf,
+    writes: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl fmt::Debug for FileStorage {
@@ -70,7 +70,58 @@ impl FileStorage {
     /// Create a file storage rooted at `root`.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Arc<Self> {
-        Arc::new(Self { root: root.into() })
+        let root = root.into();
+        static GATES: std::sync::OnceLock<
+            std::sync::Mutex<
+                std::collections::HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>,
+            >,
+        > = std::sync::OnceLock::new();
+        let identity = std::fs::canonicalize(&root).unwrap_or_else(|_| {
+            if root.is_absolute() {
+                root.clone()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(&root)
+            }
+        });
+        let mut gates = GATES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let writes = gates
+            .get(&identity)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| {
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                gates.insert(identity, Arc::downgrade(&gate));
+                gate
+            });
+        Arc::new(Self { root, writes })
+    }
+
+    async fn write_owned<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let gate = Arc::clone(&self.writes).lock_owned().await;
+        let root = self.root.clone();
+        // Acquire cross-process ownership before dispatching any mutation.
+        // Cancellation during acquisition cannot start a later write.
+        let coordination = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&root)?;
+            let coordination = coordination_file(&root.join(".cm-write"))?;
+            coordination.lock()?;
+            Ok::<_, Error>(coordination)
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("file write lock task: {error}")))??;
+        tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            let _coordination = coordination;
+            operation()
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("file commit task: {error}")))?
     }
 
     /// The default data directory`):
@@ -132,6 +183,12 @@ impl FileStorage {
     /// would let a caller escape the configured storage root.
     fn checked_filename(&self, key: &str) -> Result<PathBuf> {
         let key = self.canonical_key(key)?;
+        if key
+            .split('/')
+            .any(|part| part == ".cm-write.guard" || part.starts_with(".cm-tmp-"))
+        {
+            return Err(Error::Storage(StorageError::InvalidKey(key.into_owned())));
+        }
         Ok(self.root.join(key.as_ref()))
     }
 
@@ -421,46 +478,59 @@ impl Storage for FileStorage {
 
     async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
         let path = self.checked_filename(key)?;
-        let dir = path
-            .parent()
-            .ok_or_else(|| Error::Storage(StorageError::InvalidKey(key.to_owned())))?;
-        tokio::fs::create_dir_all(dir).await?;
-
-        // Temp file in the same directory → fsync → rename (atomic).
-        let tmp = dir.join(format!(
-            ".cm-tmp-{}-{}",
-            std::process::id(),
-            rand::rng().random::<u64>()
-        ));
-        let mut options = tokio::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut cleanup = TempFileCleanup(None);
-        let mut f = options.open(&tmp).await?;
-        cleanup.0 = Some(tmp.clone());
-        f.write_all(value).await?;
-        f.sync_all().await?;
-        drop(f);
-        // std/Tokio rename replaces an existing file on Windows as well.
-        // Removing the destination first creates a gap and loses it on failure.
-        match tokio::fs::rename(&tmp, &path).await {
-            Ok(()) => {
-                cleanup.0 = None;
-                Ok(())
+        let value = value.to_vec();
+        self.write_owned(move || {
+            let dir = path
+                .parent()
+                .ok_or_else(|| Error::Storage(StorageError::InvalidKey("missing parent".into())))?;
+            std::fs::create_dir_all(dir)?;
+            let temporary = dir.join(format!(
+                ".cm-tmp-{}-{}",
+                std::process::id(),
+                rand::rng().random::<u64>()
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
-            Err(err) => Err(err.into()),
-        }
+            let mut cleanup = TempFileCleanup(Some(temporary.clone()));
+            let mut file = options.open(&temporary)?;
+            file.write_all(&value)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &path)?;
+            cleanup.0 = None;
+            #[cfg(unix)]
+            std::fs::File::open(dir)?.sync_all()?;
+            Ok(())
+        })
+        .await
     }
 
     async fn load(&self, key: &str) -> Result<Vec<u8>> {
         let path = self.checked_filename(key)?;
-        match tokio::fs::read(&path).await {
-            Ok(data) => Ok(data),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Err(Error::Storage(StorageError::NotFound(key.to_owned())))
+        let name = key.to_owned();
+        if self.root.join(".cm-write.guard").exists() {
+            self.write_owned(move || match std::fs::read(&path) {
+                Ok(bytes) => Ok(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Err(Error::Storage(StorageError::NotFound(name)))
+                }
+                Err(error) => Err(error.into()),
+            })
+            .await
+        } else {
+            // Read-only legacy roots have no commit coordinator yet.
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => Ok(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Err(Error::Storage(StorageError::NotFound(name)))
+                }
+                Err(error) => Err(error.into()),
             }
-            Err(err) => Err(err.into()),
         }
     }
 
@@ -470,34 +540,28 @@ impl Storage for FileStorage {
         if source_key == destination_key {
             return Ok(());
         }
-        let source = self.root.join(&source_key);
-        let destination = self.root.join(destination_key.as_ref());
-        // Only archive creation runs detached. If this future is cancelled
-        // before acknowledgement, its worker must not later unlink a source
-        // that a subsequent owner may already have replaced.
-        let archive_source = source.clone();
-        tokio::task::spawn_blocking(move || {
-            archive_move_source(&source_key, &archive_source, &destination)
+        let source = self.checked_filename(&source_key)?;
+        let destination = self.checked_filename(destination_key.as_ref())?;
+        self.write_owned(move || {
+            archive_move_source(&source_key, &source, &destination)?;
+            std::fs::remove_file(source)?;
+            Ok(())
         })
         .await
-        .map_err(|error| Error::Internal(format!("file move worker failed: {error}")))??;
-        // An interrupted unlink has the usual filesystem I/O ambiguity. Keep
-        // the acknowledged archive, including when source removal fails.
-        tokio::fs::remove_file(source).await?;
-        Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.checked_filename(key)?;
-        match tokio::fs::metadata(&path).await {
-            Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(&path).await?,
-            Ok(_) => tokio::fs::remove_file(&path).await?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(());
+        self.write_owned(move || {
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&path)?,
+                Ok(_) => std::fs::remove_file(&path)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            Err(err) => return Err(err.into()),
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
@@ -532,6 +596,11 @@ impl Storage for FileStorage {
             };
             while let Some(entry) = entries.next_entry().await.map_err(Error::from)? {
                 let path = entry.path();
+                if entry.file_name().to_string_lossy() == ".cm-write.guard"
+                    || entry.file_name().to_string_lossy().starts_with(".cm-tmp-")
+                {
+                    continue;
+                }
                 let key = path
                     .strip_prefix(&self.root)
                     .unwrap_or(&path)
@@ -659,6 +728,36 @@ mod tests {
                     .is_none()
             );
         });
+    }
+
+    #[tokio::test]
+    async fn cancelled_commit_retains_write_ownership_until_worker_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(directory.path());
+        let path = directory.path().join("ordered");
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let writing = Arc::clone(&storage);
+        let old = tokio::spawn(async move {
+            writing
+                .write_owned(move || {
+                    started.send(()).unwrap();
+                    blocked.recv().unwrap();
+                    std::fs::write(path, b"old")?;
+                    Ok(())
+                })
+                .await
+        });
+        ready.await.unwrap();
+        old.abort();
+        assert!(old.await.unwrap_err().is_cancelled());
+        let another = FileStorage::new(directory.path());
+        let newer = tokio::spawn(async move { another.store("ordered", b"new").await });
+        tokio::task::yield_now().await;
+        assert!(!newer.is_finished());
+        release.send(()).unwrap();
+        newer.await.unwrap().unwrap();
+        assert_eq!(storage.load("ordered").await.unwrap(), b"new");
     }
 
     #[tokio::test]

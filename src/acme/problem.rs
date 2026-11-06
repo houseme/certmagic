@@ -59,24 +59,35 @@ impl Problem {
     /// Convert into the crate error type.
     #[must_use]
     pub fn into_error(self) -> Error {
-        Error::Acme(AcmeError::Problem(
+        if self.problem_type == ProblemType::AccountDoesNotExist && self.status != 400 {
+            return Error::Acme(AcmeError::Account(format!(
+                "unexpected HTTP {} for account lookup failure",
+                self.status
+            )))
+            .no_retry();
+        }
+        let permanent = (400..500).contains(&self.status)
+            && self.status != 429
+            && !(self.status == 400 && self.is_bad_nonce());
+        let error = Error::Acme(AcmeError::Problem(
             self.problem_type,
             self.detail.unwrap_or_default(),
-        ))
+        ));
+        if permanent { error.no_retry() } else { error }
     }
 
     /// badNonce problems are retried transparently by the client (RFC 8555
     /// §6.5); everything else is returned.
     #[must_use]
     pub fn is_bad_nonce(&self) -> bool {
-        self.problem_type == ProblemType::BadNonce
+        self.status == 400 && self.problem_type == ProblemType::BadNonce
     }
 
     /// Whether this problem reports a missing account
     ///.
     #[must_use]
     pub fn is_account_does_not_exist(&self) -> bool {
-        self.problem_type == ProblemType::AccountDoesNotExist
+        self.status == 400 && self.problem_type == ProblemType::AccountDoesNotExist
     }
 }
 
@@ -96,6 +107,39 @@ pub fn problem_from_response(resp: &crate::acme::transport::HttpResponse) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certon_permanent_http_errors_stop_retries_and_preserve_account_recovery() {
+        for status in [400, 401, 403, 404, 409, 422] {
+            assert!(
+                Problem::parse(status, b"temporary-looking message")
+                    .into_error()
+                    .has_no_retry()
+            );
+        }
+        for status in [429, 500, 503] {
+            assert!(!Problem::parse(status, b"error").into_error().has_no_retry());
+        }
+        let missing = Problem::parse(
+            400,
+            br#"{"type":"urn:ietf:params:acme:error:accountDoesNotExist"}"#,
+        )
+        .into_error();
+        assert!(missing.has_no_retry());
+        assert!(missing.is_account_does_not_exist());
+        let forbidden = Problem::parse(
+            403,
+            br#"{"type":"urn:ietf:params:acme:error:accountDoesNotExist"}"#,
+        )
+        .into_error();
+        assert!(!forbidden.is_account_does_not_exist());
+        assert!(forbidden.has_no_retry());
+        assert!(
+            !Problem::parse(400, br#"{"type":"urn:ietf:params:acme:error:badNonce"}"#)
+                .into_error()
+                .has_no_retry()
+        );
+    }
 
     #[test]
     fn parses_rfc7807_document() {

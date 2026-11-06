@@ -163,35 +163,41 @@ pub fn parse_response(
             .is_some_and(|t| t.is_context() && t.number() == 0),
     );
     idx += 1; // responderID (not needed)
-    let _produced_at = rd
+    let produced_at = rd
         .get(idx)
-        .and_then(|t| asn1::parse_generalized_time(t.content));
+        .and_then(|t| asn1::parse_generalized_time(t.content))
+        .ok_or_else(|| Error::Ocsp(OcspError::Malformed("invalid producedAt".into())))?;
     idx += 1;
     let responses = rd
         .get(idx)
         .ok_or_else(|| Error::Ocsp(OcspError::Malformed("missing responses".into())))?;
 
-    let single = responses
-        .children()
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::Ocsp(OcspError::Malformed("no single responses".into())))?;
-    let s = single.children();
-    if s.len() < 3 {
-        return Err(Error::Ocsp(OcspError::Malformed(
-            "SingleResponse too short".into(),
-        )));
+    // Batched OCSP replies may place this leaf anywhere in responses.
+    // Require one exact CertID, including its hash algorithm.
+    let mut selected = None;
+    for single in responses.children() {
+        let fields = single.children();
+        if fields.len() < 3 {
+            return Err(Error::Ocsp(OcspError::Malformed(
+                "SingleResponse too short".into(),
+            )));
+        }
+        let id = fields[0].children();
+        let matches = id.len() == 4
+            && id[0]
+                .children()
+                .first()
+                .is_some_and(|algorithm| bytes_to_dotted(algorithm.content) == cert_id.hash_oid)
+            && id[1].content == cert_id.issuer_name_hash
+            && id[2].content == cert_id.issuer_key_hash
+            && serial_matches(id[3].content, &cert_id.serial);
+        if matches && selected.replace(fields).is_some() {
+            return Err(Error::Ocsp(OcspError::Malformed(
+                "ambiguous duplicate OCSP CertID".into(),
+            )));
+        }
     }
-
-    // CertID match guards against cross-certificate confusion.
-    let resp_cert_id = s[0].children();
-    let id_matches = resp_cert_id.len() >= 4
-        && resp_cert_id[1].content == cert_id.issuer_name_hash
-        && resp_cert_id[2].content == cert_id.issuer_key_hash
-        && serial_matches(resp_cert_id[3].content, &cert_id.serial);
-    if !id_matches {
-        return Err(Error::Ocsp(OcspError::CertIdMismatch));
-    }
+    let s = selected.ok_or(Error::Ocsp(OcspError::CertIdMismatch))?;
 
     // certStatus: [0] good (absent-tag default) / [1] revoked / [2] unknown.
     let status_tlv = &s[1];
@@ -200,7 +206,7 @@ pub fn parse_response(
         let revoked_time = ri
             .first()
             .and_then(|t| asn1::parse_generalized_time(t.content))
-            .unwrap_or_else(OffsetDateTime::now_utc);
+            .ok_or_else(|| Error::Ocsp(OcspError::Malformed("bad revocation time".into())))?;
         let reason = ri
             .get(1)
             .and_then(|t| t.children().into_iter().next())
@@ -208,8 +214,12 @@ pub fn parse_response(
         (OcspCertStatus::Revoked, Some(revoked_time), reason)
     } else if status_tlv.is_context() && status_tlv.number() == 2 {
         (OcspCertStatus::Unknown, None, None)
-    } else {
+    } else if status_tlv.is_context() && status_tlv.number() == 0 && status_tlv.content.is_empty() {
         (OcspCertStatus::Good, None, None)
+    } else {
+        return Err(Error::Ocsp(OcspError::Malformed(
+            "invalid certificate status".into(),
+        )));
     };
 
     let this_update = asn1::parse_generalized_time(s[2].content)
@@ -219,6 +229,16 @@ pub fn parse_response(
         .filter(|t| t.is_context() && t.number() == 0)
         .and_then(|t| t.children().into_iter().next())
         .and_then(|c| asn1::parse_generalized_time(c.content));
+
+    let latest = OffsetDateTime::now_utc() + time::Duration::minutes(5);
+    if produced_at > latest
+        || this_update > latest
+        || next_update.is_some_and(|next| next <= this_update)
+    {
+        return Err(Error::Ocsp(OcspError::Malformed(
+            "invalid OCSP response times".into(),
+        )));
+    }
 
     // --- Signature verification + responder authorization (§4.2.2.2) ---
     let mut responder_not_after = None;
@@ -243,6 +263,9 @@ pub fn parse_response(
 
                 let (_, rcert) = x509_parser::parse_x509_certificate(responder_der)
                     .map_err(|_| Error::Ocsp(OcspError::UnauthorizedResponder))?;
+                if !rcert.validity().is_valid() {
+                    return Err(Error::Ocsp(OcspError::UnauthorizedResponder));
+                }
                 let has_eku = rcert.extensions().iter().any(|e| {
                     e.oid.to_id_string() == OID_EXT_KEY_USAGE
                         && bytes_contain(e.value, &OCSP_SIGNING_EKU_BYTES)
@@ -594,6 +617,66 @@ mod tests {
         // name hash is 20 bytes (SHA-1)
         assert_eq!(fields[1].content.len(), 20);
         assert_eq!(fields[3].content, &[0x01, 0x02]);
+    }
+
+    #[test]
+    fn certon_batched_responses_select_one_exact_certificate_id() {
+        use asn1::{context_explicit, enumerated, generalized_time, octet_string, seq, tlv};
+        let (issuer, _) = issuer_fixture();
+        let wanted = CertId::from_issuer_sha1(&issuer, &[2]).unwrap();
+        let unrelated = CertId::from_issuer_sha1(&issuer, &[1]).unwrap();
+        let now = OffsetDateTime::now_utc();
+        let single = |id: &CertId| seq(&[&id.encode(), &tlv(0x80, &[]), &generalized_time(now)]);
+        let make_batch = |ids: &[&CertId]| {
+            let singles: Vec<_> = ids.iter().map(|id| single(id)).collect();
+            let slices: Vec<_> = singles.iter().map(Vec::as_slice).collect();
+            let data = seq(&[&tlv(0x82, &[7; 20]), &generalized_time(now), &seq(&slices)]);
+            // Structural matching is tested here. Signed verification has its
+            // own fixtures and remains required by the production staple path.
+            let basic = seq(&[
+                &data,
+                &asn1::algorithm_identifier("1.2.840.10045.4.3.2"),
+                &tlv(asn1::tags::BIT_STRING, &[0]),
+            ]);
+            let bytes = seq(&[
+                &tlv(asn1::tags::OID, &OCSP_RESPONSE_OID_BYTES),
+                &octet_string(&basic),
+            ]);
+            seq(&[&enumerated(0), &context_explicit(0, &bytes)])
+        };
+        assert!(parse_response(&make_batch(&[&unrelated, &wanted]), &wanted, None).is_ok());
+        assert!(matches!(
+            parse_response(&make_batch(&[&wanted, &wanted]), &wanted, None),
+            Err(Error::Ocsp(OcspError::Malformed(_)))
+        ));
+    }
+
+    #[test]
+    fn signed_responses_reject_future_and_inverted_update_windows() {
+        let (issuer_der, key) = issuer_fixture();
+        let cert_id = CertId::from_issuer_sha1(&issuer_der, &[10]).unwrap();
+        let now = OffsetDateTime::now_utc();
+        for (this_update, next_update) in [
+            (
+                now + time::Duration::hours(1),
+                now + time::Duration::days(1),
+            ),
+            (now, now - time::Duration::hours(1)),
+        ] {
+            let der = build_response(
+                &issuer_der,
+                &[10],
+                &key,
+                SingleStatus::Good,
+                this_update,
+                next_update,
+                None,
+            );
+            assert!(matches!(
+                parse_response(&der, &cert_id, Some(&issuer_der)),
+                Err(Error::Ocsp(OcspError::Malformed(_)))
+            ));
+        }
     }
 
     #[test]

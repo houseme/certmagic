@@ -61,6 +61,7 @@ pub static HTTP_CHALLENGE_PORT: AtomicU16 = AtomicU16::new(80);
 pub static TLS_ALPN_CHALLENGE_PORT: AtomicU16 = AtomicU16::new(443);
 
 pub mod acme;
+pub mod ari;
 pub mod cache;
 pub mod cert_store;
 pub mod certificate;
@@ -78,6 +79,7 @@ pub mod issuer;
 #[cfg(feature = "local-cache")]
 pub mod localcache;
 pub mod maintain;
+pub mod migration;
 pub mod ocsp;
 pub mod pem;
 pub mod ratelimiter;
@@ -86,6 +88,8 @@ pub mod singleflight;
 pub mod solvers;
 pub mod storage;
 pub mod tls_integration;
+pub mod tls_listener;
+pub use tls_listener::{BoundTlsListener, TlsListenerLimits};
 #[cfg(feature = "zerossl")]
 pub mod zerossl;
 
@@ -632,6 +636,19 @@ pub async fn listen_on(
         .await
         .map_err(Error::from)?;
     Ok((listener, acceptor))
+}
+
+/// Bind a listener with bounded concurrent TLS handshakes and owned workers.
+pub async fn listen_bounded(
+    addr: std::net::SocketAddr,
+    domain_names: &[String],
+) -> Result<BoundTlsListener> {
+    let config = tls(domain_names).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    Ok(BoundTlsListener::new(
+        listener,
+        tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)),
+    ))
 }
 
 /// Obtain or load certificates, probe-bind `addr`, and return a standard

@@ -22,7 +22,7 @@ use crate::error::Result;
 
 /// A challenge being solved: the wire challenge plus the derived key
 /// authorization.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolvableChallenge {
     /// Challenge type: `http-01` / `dns-01` / `tls-alpn-01`.
     pub kind: String,
@@ -99,10 +99,39 @@ impl ActiveChallenges {
     }
 
     /// Remove a registered challenge.
+    #[cfg(test)]
     pub(crate) fn remove(key: &str) {
         if let Ok(mut map) = ActiveChallenges::global().map.lock() {
             map.remove(key);
         }
+    }
+
+    pub(crate) fn remove_owned(chal: &SolvableChallenge) -> bool {
+        let key = challenge_key(chal);
+        if let Ok(mut map) = ActiveChallenges::global().map.lock()
+            && map.get(&key) == Some(chal)
+        {
+            map.remove(&key);
+            return true;
+        }
+        false
+    }
+    pub(crate) fn get_token(
+        kind: &str,
+        identifier: &str,
+        token: &str,
+    ) -> Option<SolvableChallenge> {
+        ActiveChallenges::global()
+            .map
+            .lock()
+            .ok()?
+            .values()
+            .find(|challenge| {
+                challenge.kind == kind
+                    && challenge.identifier.eq_ignore_ascii_case(identifier)
+                    && challenge.token == token
+            })
+            .cloned()
     }
 
     /// Look up a challenge by identifier for challenge `kind`
@@ -120,7 +149,16 @@ impl ActiveChallenges {
 
 /// Registry key for a challenge (URL-derived, stable per challenge).
 pub(crate) fn challenge_key(chal: &SolvableChallenge) -> String {
-    crate::crypto::sha256_hex(chal.url.as_bytes())
+    crate::crypto::sha256_hex(
+        format!(
+            "{}\0{}\0{}\0{}",
+            chal.kind,
+            chal.identifier.to_lowercase(),
+            chal.url,
+            chal.key_authorization
+        )
+        .as_bytes(),
+    )
 }
 
 /// Wraps a solver to maintain the process-wide active-challenges registry
@@ -151,8 +189,10 @@ impl<S: Solver> Solver for SolverWrapper<S> {
     }
 
     async fn cleanup(&self, chal: &SolvableChallenge) {
-        ActiveChallenges::remove(&challenge_key(chal));
         self.inner.cleanup(chal).await;
+        if !crate::solvers::http::still_present(chal).await {
+            ActiveChallenges::remove_owned(chal);
+        }
     }
 }
 

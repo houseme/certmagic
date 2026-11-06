@@ -31,10 +31,17 @@ pub struct ChallengeCert {
     pub der: CertificateDer<'static>,
 }
 
-static CHALLENGE_CERTS: OnceLock<Mutex<HashMap<String, Arc<ChallengeCert>>>> = OnceLock::new();
+struct OwnedChallenge {
+    identifier: String,
+    sequence: u64,
+    cert: Arc<ChallengeCert>,
+}
+static CHALLENGE_CERTS: OnceLock<Mutex<HashMap<String, OwnedChallenge>>> = OnceLock::new();
+static PRESENT_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CHALLENGE_LISTENERS: OnceLock<Mutex<HashMap<u16, Arc<ChallengeListener>>>> = OnceLock::new();
 
-fn challenge_certs() -> &'static Mutex<HashMap<String, Arc<ChallengeCert>>> {
+fn challenge_certs() -> &'static Mutex<HashMap<String, OwnedChallenge>> {
     CHALLENGE_CERTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -130,26 +137,48 @@ impl TlsAlpnSolver {
         })
     }
 
-    /// Register a challenge cert for `identifier`.
-    pub(crate) fn register(identifier: &str, cert: ChallengeCert) {
-        if let Ok(mut map) = challenge_certs().lock() {
-            map.insert(identifier.to_owned(), Arc::new(cert));
+    pub(crate) fn identifier_for_sni(name: &str) -> String {
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        if let Some(reverse) = name.strip_suffix(".in-addr.arpa") {
+            let parts: Vec<_> = reverse.split('.').collect();
+            if parts.len() == 4
+                && let Ok(octets) = parts
+                    .iter()
+                    .rev()
+                    .map(|part| part.parse::<u8>())
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            {
+                return std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])
+                    .to_string();
+            }
         }
-    }
-
-    /// Remove the challenge cert for `identifier`.
-    pub(crate) fn unregister(identifier: &str) {
-        if let Ok(mut map) = challenge_certs().lock() {
-            map.remove(identifier);
+        if let Some(reverse) = name.strip_suffix(".ip6.arpa") {
+            let parts: Vec<_> = reverse.split('.').collect();
+            if parts.len() == 32
+                && parts
+                    .iter()
+                    .all(|part| part.len() == 1 && part.as_bytes()[0].is_ascii_hexdigit())
+            {
+                let hex = parts.into_iter().rev().collect::<String>();
+                if let Ok(value) = u128::from_str_radix(&hex, 16) {
+                    return std::net::Ipv6Addr::from(value).to_string();
+                }
+            }
         }
+        name.parse::<std::net::IpAddr>()
+            .map_or(name.clone(), |ip| ip.to_string())
     }
-
-    /// Look up the challenge cert to serve during a TLS-ALPN-01 handshake
-    /// (regenerating when the
-    /// challenge data is only available via shared storage).
+    /// Resolve DNS identifiers and RFC 8738 reverse-SNI IP identifiers.
     #[must_use]
     pub fn get(identifier: &str) -> Option<Arc<ChallengeCert>> {
-        challenge_certs().lock().ok()?.get(identifier).cloned()
+        let identifier = Self::identifier_for_sni(identifier);
+        challenge_certs()
+            .lock()
+            .ok()?
+            .values()
+            .filter(|entry| entry.identifier == identifier)
+            .max_by_key(|entry| entry.sequence)
+            .map(|entry| Arc::clone(&entry.cert))
     }
 
     async fn ensure_listener(&self) -> Result<()> {
@@ -215,18 +244,45 @@ impl TlsAlpnSolver {
 impl Solver for TlsAlpnSolver {
     async fn present(
         &self,
-        _ct: &CancellationToken,
+        ct: &CancellationToken,
         chal: &crate::solvers::SolvableChallenge,
     ) -> Result<()> {
+        let _gate = tokio::select! { biased; () = ct.cancelled() => return Err(Error::Internal("context canceled".into())), gate = PRESENT_GATE.lock() => gate };
+        let owner = format!("{}:{:?}", crate::solvers::challenge_key(chal), self.port);
+        if challenge_certs()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&owner)
+        {
+            return Ok(());
+        }
         let cert = Self::generate_challenge_cert(&chal.identifier, &chal.key_authorization)?;
         self.ensure_listener().await?;
-        Self::register(&chal.identifier, cert);
+        challenge_certs()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                owner,
+                OwnedChallenge {
+                    identifier: Self::identifier_for_sni(&chal.identifier),
+                    sequence: SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    cert: Arc::new(cert),
+                },
+            );
         Ok(())
     }
 
     async fn cleanup(&self, chal: &crate::solvers::SolvableChallenge) {
-        Self::unregister(&chal.identifier);
-        self.release_listener();
+        let _gate = PRESENT_GATE.lock().await;
+        let owner = format!("{}:{:?}", crate::solvers::challenge_key(chal), self.port);
+        if challenge_certs()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&owner)
+            .is_some()
+        {
+            self.release_listener();
+        }
     }
 }
 
@@ -238,6 +294,10 @@ impl rustls::server::ResolvesServerCert for ChallengeResolver {
         &self,
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let protocols: Vec<_> = client_hello.alpn()?.collect();
+        if protocols != [b"acme-tls/1".as_slice()] {
+            return None;
+        }
         TlsAlpnSolver::get(client_hello.server_name()?)
             .map(|challenge| Arc::clone(&challenge.certified_key))
     }
@@ -253,27 +313,77 @@ async fn serve_challenge_listener(
         .with_cert_resolver(Arc::new(ChallengeResolver));
     config.alpn_protocols = vec![b"acme-tls/1".to_vec()];
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let mut workers = tokio::task::JoinSet::new();
     loop {
-        let accepted = tokio::select! {
-            () = state.stop.cancelled() => return,
-            accepted = listener.accept() => accepted,
-        };
-        let Ok((stream, _)) = accepted else { continue };
-        let acceptor = acceptor.clone();
-        tokio::spawn(async move {
-            let Ok(mut tls) = acceptor.accept(stream).await else {
-                return;
-            };
-            let mut buffer = [0_u8; 1];
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tls.read(&mut buffer))
-                .await;
-        });
+        tokio::select! {
+            biased;
+            () = state.stop.cancelled() => { workers.abort_all(); while workers.join_next().await.is_some() {} return; }
+            _ = workers.join_next(), if !workers.is_empty() => {}
+            accepted = listener.accept(), if workers.len() < 256 => {
+                let Ok((stream, _)) = accepted else { continue; };
+                let acceptor = acceptor.clone();
+                workers.spawn(async move {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        let mut tls = acceptor.accept(stream).await?;
+                        let mut buffer = [0; 1];
+                        let _ = tls.read(&mut buffer).await;
+                        Ok::<_, std::io::Error>(())
+                    }).await;
+                });
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stale_cleanup_preserves_the_new_owner_and_reverse_ip_sni() {
+        let solver = TlsAlpnSolver::default();
+        let old = sample("ownership.example.test");
+        let mut new = old.clone();
+        new.url.push_str("/new");
+        new.key_authorization = "new.thumb".into();
+        solver
+            .present(&CancellationToken::new(), &old)
+            .await
+            .unwrap();
+        solver
+            .present(&CancellationToken::new(), &new)
+            .await
+            .unwrap();
+        let fresh = TlsAlpnSolver::get(&new.identifier).unwrap();
+        solver.cleanup(&old).await;
+        solver.cleanup(&old).await;
+        assert_eq!(TlsAlpnSolver::get(&new.identifier).unwrap().der, fresh.der);
+        solver.cleanup(&new).await;
+        let ip = sample("192.0.2.19");
+        solver
+            .present(&CancellationToken::new(), &ip)
+            .await
+            .unwrap();
+        assert!(TlsAlpnSolver::get("19.2.0.192.in-addr.arpa").is_some());
+        solver.cleanup(&ip).await;
+        let ip = sample("2001:db8::19");
+        solver
+            .present(&CancellationToken::new(), &ip)
+            .await
+            .unwrap();
+        let address: std::net::Ipv6Addr = ip.identifier.parse().unwrap();
+        let reverse = format!(
+            "{}.ip6.arpa",
+            format!("{:032x}", u128::from(address))
+                .chars()
+                .rev()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(".")
+        );
+        assert!(TlsAlpnSolver::get(&reverse).is_some());
+        solver.cleanup(&ip).await;
+    }
 
     fn sample(identifier: &str) -> crate::solvers::SolvableChallenge {
         crate::solvers::SolvableChallenge {

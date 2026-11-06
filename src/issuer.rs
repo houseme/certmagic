@@ -10,13 +10,22 @@ use tokio_util::sync::CancellationToken;
 use crate::error::Result;
 
 /// A certificate that an issuer produced.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IssuedCertificate {
     /// The certificate chain as PEM (leaf first).
     pub certificate: Vec<u8>,
     /// Issuer-specific metadata, serialized into the stored meta JSON
     ///.
     pub metadata: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for IssuedCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedCertificate")
+            .field("certificate_bytes", &self.certificate.len())
+            .field("has_metadata", &self.metadata.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A certificate resource as represented in storage

@@ -27,9 +27,21 @@ pub const ZEROSSL_REST_API_BASE: &str = "https://api.zerossl.com";
 /// ZeroSSL's non-standard HTTP validation path prefix.
 pub const ZEROSSL_HTTP_VALIDATION_PREFIX: &str = "/.well-known/pki-validation/";
 
-fn http_client() -> reqwest::Client {
-    crate::tls_integration::install_default_provider();
-    reqwest::Client::new()
+fn http_client() -> Result<reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<std::result::Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            crate::tls_integration::install_default_provider();
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .user_agent(crate::user_agent())
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(|error| Error::Acme(AcmeError::Http(error)))
 }
 
 /// Whether an HTTP request is a ZeroSSL/Sectigo file-validation request.
@@ -212,30 +224,29 @@ struct EabResponse {
     #[serde(default)]
     eab_hmac_key: Option<String>,
     #[serde(default)]
-    success: Option<bool>,
+    success: Option<Value>,
     #[serde(default)]
     error: Option<serde_json::Value>,
 }
 
 async fn fetch_eab(api_key: &str) -> Result<EabCredentials> {
-    let url = format!("{EAB_CREDENTIALS_URL}/?access_key={api_key}");
-    let client = http_client();
+    let mut url = Url::parse(EAB_CREDENTIALS_URL).expect("built-in EAB URL");
+    url.query_pairs_mut().append_pair("access_key", api_key);
+    let client = http_client()?;
     let resp = client
-        .post(&url)
+        .post(url)
         .timeout(std::time::Duration::from_secs(30))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .send()
         .await
         .map_err(|e| Error::Acme(AcmeError::Http(e.without_url().to_string())))?;
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| Error::Acme(AcmeError::Http(e.to_string())))?;
+    let status = resp.status();
+    let bytes = crate::http::read_body_limited(resp, crate::http::MAX_JSON_BODY_BYTES).await?;
     let body: EabResponse = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Acme(AcmeError::Http(format!("decode: {e}"))))?;
 
-    if body.success == Some(false) || body.eab_kid.is_none() || body.eab_hmac_key.is_none() {
+    if !status.is_success() || !body.valid() {
         let detail = body
             .error
             .as_ref()
@@ -249,6 +260,46 @@ async fn fetch_eab(api_key: &str) -> Result<EabCredentials> {
         key_id: body.eab_kid.expect("checked above"),
         hmac_key: body.eab_hmac_key.expect("checked above"),
     })
+}
+
+impl EabResponse {
+    fn valid(&self) -> bool {
+        self.success
+            .as_ref()
+            .is_some_and(|value| value.as_bool() == Some(true) || value.as_u64() == Some(1))
+            && self.error.as_ref().is_none_or(Value::is_null)
+            && self
+                .eab_kid
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .eab_hmac_key
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn certon_eab_success_accepts_documented_integer_and_boolean() {
+    for value in [json!(true), json!(1)] {
+        let response: EabResponse =
+            serde_json::from_value(json!({"success":value,"eab_kid":"kid","eab_hmac_key":"key"}))
+                .unwrap();
+        assert!(response.valid());
+    }
+    for value in [json!(false), json!(0), json!(2), json!("1"), Value::Null] {
+        let response: EabResponse =
+            serde_json::from_value(json!({"success":value,"eab_kid":"kid","eab_hmac_key":"key"}))
+                .unwrap();
+        assert!(!response.valid());
+    }
+    for body in [
+        json!({"success":1,"eab_kid":"","eab_hmac_key":"key"}),
+        json!({"success":1,"eab_kid":"kid","eab_hmac_key":"key","error":{"code":1}}),
+    ] {
+        assert!(!serde_json::from_value::<EabResponse>(body).unwrap().valid());
+    }
 }
 
 /// Convenience: build a ZeroSSL issuer synchronously when the EAB
@@ -276,13 +327,17 @@ pub struct ZeroSslApiIssuer {
     api_base_url: Url,
     validity_days: u32,
     poll_interval: Duration,
+    validation_emails: std::collections::BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for ZeroSslApiIssuer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ZeroSslApiIssuer")
             .field("api_key", &"[REDACTED]")
-            .field("api_base_url", &self.api_base_url)
+            .field(
+                "api_base_url",
+                &crate::http::diagnostic_endpoint(self.api_base_url.as_str()),
+            )
             .field("validity_days", &self.validity_days)
             .field("poll_interval", &self.poll_interval)
             .finish()
@@ -300,6 +355,7 @@ impl ZeroSslApiIssuer {
                 .expect("the built-in ZeroSSL REST API URL must be valid"),
             validity_days: 90,
             poll_interval: Duration::from_secs(5),
+            validation_emails: Default::default(),
         }
     }
 
@@ -347,6 +403,57 @@ impl ZeroSslApiIssuer {
         self
     }
 
+    /// Select an eligible email recipient for a domain. Once configured,
+    /// every requested domain must have a selection advertised by the CA.
+    /// An empty configuration retains the existing provider-default flow.
+    pub fn with_validation_email(
+        mut self,
+        domain: impl AsRef<str>,
+        email: impl AsRef<str>,
+    ) -> Result<Self> {
+        let domain = crate::certificate::normalized_name(domain.as_ref().trim_end_matches('.'));
+        let email = email.as_ref();
+        if !crate::certificate::subject_qualifies_for_cert(&domain)
+            || !domain.contains('.')
+            || email.len() > 254
+            || email
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || byte == b',')
+            || !email.split_once('@').is_some_and(|(local, host)| {
+                !local.is_empty() && !host.is_empty() && !host.contains('@')
+            })
+            || self.validation_emails.contains_key(&domain)
+        {
+            return Err(Error::Config(crate::error::ConfigError::Invalid(
+                "invalid or duplicate ZeroSSL validation recipient".into(),
+            )));
+        }
+        self.validation_emails.insert(domain, email.to_owned());
+        Ok(self)
+    }
+
+    fn selected_emails(&self, domains: &[String]) -> Result<Option<Vec<String>>> {
+        if self.validation_emails.is_empty() {
+            return Ok(None);
+        }
+        domains
+            .iter()
+            .map(|domain| {
+                self.validation_emails
+                    .get(&crate::certificate::normalized_name(
+                        domain.trim_end_matches('.'),
+                    ))
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Config(crate::error::ConfigError::Missing(
+                            "configure a validation recipient for every requested domain".into(),
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+
     fn endpoint(&self, path: &str) -> String {
         let mut url = self.api_base_url.clone();
         let mut joined = url.path().trim_end_matches('/').to_owned();
@@ -372,9 +479,13 @@ impl ZeroSslApiIssuer {
 
     async fn response_json(&self, response: reqwest::Response) -> Result<Value> {
         let status = response.status();
-        let body = response
-            .json::<Value>()
-            .await
+        let limit = if status.is_success() {
+            crate::http::MAX_JSON_BODY_BYTES
+        } else {
+            crate::http::MAX_ERROR_BODY_BYTES
+        };
+        let bytes = crate::http::read_body_limited(response, limit).await?;
+        let body: Value = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Acme(AcmeError::Http(format!("ZeroSSL response: {e}"))))?;
         if !status.is_success() {
             return Err(Error::Acme(AcmeError::Http(format!(
@@ -386,6 +497,14 @@ impl ZeroSslApiIssuer {
                 "ZeroSSL REST API error: {error}"
             ))));
         }
+        if body
+            .get("success")
+            .is_some_and(|value| value.as_bool() != Some(true) && value.as_u64() != Some(1))
+        {
+            return Err(Error::Acme(AcmeError::Account(
+                "ZeroSSL API did not confirm success".into(),
+            )));
+        }
         Ok(body)
     }
 
@@ -394,11 +513,12 @@ impl ZeroSslApiIssuer {
         ct: &CancellationToken,
         csr_pem: &str,
         domains: &[String],
+        emails: Option<&[String]>,
     ) -> Result<String> {
         let response = self
             .send(
                 ct,
-                http_client().post(self.endpoint("certificates")).form(&[
+                http_client()?.post(self.endpoint("certificates")).form(&[
                     ("certificate_domains", domains.join(",")),
                     ("certificate_csr", csr_pem.to_owned()),
                     ("certificate_validity_days", self.validity_days.to_string()),
@@ -406,6 +526,34 @@ impl ZeroSslApiIssuer {
             )
             .await?;
         let body = self.response_json(response).await?;
+        if let Some(emails) = emails {
+            let candidates = body
+                .pointer("/validation/email_validation")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    Error::Acme(AcmeError::Account(
+                        "ZeroSSL response omitted eligible validation recipients".into(),
+                    ))
+                })?;
+            for (domain, email) in domains.iter().zip(emails) {
+                let name = crate::certificate::normalized_name(domain.trim_end_matches('.'));
+                let matches: Vec<_> = candidates
+                    .iter()
+                    .filter(|(key, _)| {
+                        crate::certificate::normalized_name(key.trim_end_matches('.')) == name
+                    })
+                    .collect();
+                if matches.len() != 1
+                    || !matches[0].1.as_array().is_some_and(|values| {
+                        values.iter().any(|value| value.as_str() == Some(email))
+                    })
+                {
+                    return Err(Error::Acme(AcmeError::Account(
+                        "selected ZeroSSL recipient is not uniquely eligible".into(),
+                    )));
+                }
+            }
+        }
         body.get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
@@ -413,16 +561,71 @@ impl ZeroSslApiIssuer {
             .ok_or_else(|| Error::Acme(AcmeError::Account("ZeroSSL response missing id".into())))
     }
 
-    async fn start_email_validation(&self, ct: &CancellationToken, id: &str) -> Result<()> {
+    async fn start_email_validation(
+        &self,
+        ct: &CancellationToken,
+        id: &str,
+        emails: Option<&[String]>,
+    ) -> Result<()> {
+        let mut form = vec![("validation_method", "EMAIL".to_owned())];
+        if let Some(emails) = emails {
+            form.push(("validation_email", emails.join(",")));
+        }
         let response = self
             .send(
                 ct,
-                http_client()
+                http_client()?
                     .post(self.endpoint(&format!("certificates/{id}/challenges")))
-                    .form(&[("validation_method", "EMAIL")]),
+                    .form(&form),
             )
             .await?;
-        self.response_json(response).await.map(|_| ())
+        let body = self.response_json(response).await?;
+        let has_identity = body.get("id").is_some() || body.get("status").is_some();
+        let confirmed = if has_identity {
+            body["id"].as_str() == Some(id)
+                && matches!(
+                    body["status"].as_str(),
+                    Some("pending_validation" | "issued")
+                )
+        } else {
+            body["success"].as_bool() == Some(true) || body["success"].as_u64() == Some(1)
+        };
+        if !confirmed {
+            return Err(Error::Acme(AcmeError::Account(
+                "ZeroSSL email validation was not confirmed".into(),
+            )));
+        }
+        if let Some(method) = body.get("validation_type").filter(|value| !value.is_null())
+            && !method
+                .as_str()
+                .is_some_and(|method| method.eq_ignore_ascii_case("EMAIL"))
+        {
+            return Err(Error::Acme(AcmeError::Account(
+                "ZeroSSL confirmed a different validation method".into(),
+            )));
+        }
+        if let (Some(emails), Some(confirmed)) = (
+            emails,
+            body.get("validation_emails")
+                .filter(|value| !value.is_null()),
+        ) {
+            let actual = confirmed.as_str().map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .collect::<std::collections::BTreeSet<_>>()
+            });
+            let expected = emails
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            if actual != Some(expected) {
+                return Err(Error::Acme(AcmeError::Account(
+                    "ZeroSSL confirmed different validation recipients".into(),
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn wait_for_issued(&self, ct: &CancellationToken, id: &str) -> Result<()> {
@@ -435,7 +638,7 @@ impl ZeroSslApiIssuer {
             let response = self
                 .send(
                     ct,
-                    http_client().get(self.endpoint(&format!("certificates/{id}"))),
+                    http_client()?.get(self.endpoint(&format!("certificates/{id}"))),
                 )
                 .await?;
             let body = self.response_json(response).await?;
@@ -462,7 +665,7 @@ impl ZeroSslApiIssuer {
         let response = self
             .send(
                 ct,
-                http_client().get(self.endpoint(&format!("certificates/{id}/download/return"))),
+                http_client()?.get(self.endpoint(&format!("certificates/{id}/download/return"))),
             )
             .await?;
         let body = self.response_json(response).await?;
@@ -497,10 +700,17 @@ impl Issuer for ZeroSslApiIssuer {
             )));
         }
         let csr_pem = crate::pem::encode("CERTIFICATE REQUEST", &csr.der);
+        let emails = self.selected_emails(&csr.dns_names)?;
         let certificate_id = self
-            .create_certificate(ct, &String::from_utf8_lossy(&csr_pem), &csr.dns_names)
+            .create_certificate(
+                ct,
+                &String::from_utf8_lossy(&csr_pem),
+                &csr.dns_names,
+                emails.as_deref(),
+            )
             .await?;
-        self.start_email_validation(ct, &certificate_id).await?;
+        self.start_email_validation(ct, &certificate_id, emails.as_deref())
+            .await?;
         self.wait_for_issued(ct, &certificate_id).await?;
         let certificate = self.download_certificate(ct, &certificate_id).await?;
         Ok(IssuedCertificate {
@@ -539,7 +749,7 @@ impl Issuer for ZeroSslApiIssuer {
         let response = self
             .send(
                 ct,
-                http_client()
+                http_client()?
                     .post(self.endpoint(&format!("certificates/{certificate_id}/revoke")))
                     .form(&[("reason", (reason as u8).to_string())]),
             )

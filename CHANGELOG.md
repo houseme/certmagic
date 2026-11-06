@@ -6,6 +6,60 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Certon 0.4 incremental integration
+
+Source baseline is [certon 88f1ab3](https://github.com/salvo-rs/certon/tree/88f1ab3e3d4ef9752abe0a2014e25ab7c0044ecd).
+
+- Add `BoundTlsListener`, `TlsListenerLimits`, and `listen_bounded`, with owned
+  handshake workers, bounded concurrency and total handshake deadlines.
+- Add `client_identity` and `client_config_with_roots` for explicit mTLS server
+  trust, valid sibling selection and durable revocation checks on warm caches.
+- Persist revocation intent by DER leaf under `revocations/`, quarantine alternate
+  chains and late cache publications, and expose `refresh_revocations`. CA failure
+  retains the intent. Cluster-wide enforcement requires upgraded readers.
+- Apply maintenance interval changes while running, preserving unchanged timer
+  phases, and enforce cache capacity reductions immediately.
+- Add bounded job admission, total retry budgets, permanent HTTP error
+  classification, and asynchronous key generation with a shared CPU budget.
+- Isolate badNonce replay nonces, require HTTPS for ACME endpoints, prevent
+  redirect downgrade, bound streamed responses, and redact private endpoint URLs.
+- Filter TLS candidates by current validity and offered signature schemes. Drop
+  expired or unverified OCSP staples, select unique CertIDs in batched responses,
+  and propagate verified revocation across alternate chains.
+- Accept documented ZeroSSL EAB integer success flags, pool provider connections,
+  and add `with_validation_email` with eligibility and confirmation checks.
+  Empty recipient configuration uses the existing provider-default flow.
+- Integrate initial ARI fetching, Retry-After refresh scheduling, deduplication,
+  cancellation and failure backoff. Preserve selected times for unchanged windows
+  and carry ARI decisions through authoritative renewal checks.
+- Cover these paths with regression tests, real TLS/mTLS handshakes and local
+  ACME, Redis and etcd integration tests.
+
+- Persist issuer/leaf-bound ARI history, shared selected times and refresh
+  backoff, with expiry-based retention and explicit namespace migration.
+- Preserve all DNS/IP SANs and the original resource key during renewal,
+  persist issuer selection, validate fallback results before saving, and retain
+  public recovery context after compromised-key archival.
+- Prepare Must-Staple certificates before publication with verified AIA issuer
+  discovery, single-flight fetching, deadlines and failure cooldown. Keep working
+  cache entries when preparation fails and recheck validity at publication.
+- Schedule OCSP independently through a bounded deadline index and job pool.
+  Retain quarantined metadata for recovery and apply per-leaf renewal backoff.
+- Add job wait/cancel/shutdown, cleanup-before-completion semantics and execution
+  permit release during retry sleeps. Background issuance populates the cache
+  through the full managed pipeline and consumes on-demand admission once.
+- Publish complete credential snapshots and deletion receipts. Bind ACME account
+  identity to the full directory URL and configured email. Add restartable,
+  verified migration helpers for legacy accounts and issuer namespaces.
+- Retain FileStorage write ownership across async cancellation until the
+  dispatched commit finishes, and fence etcd deletion/retirement operations.
+- Make challenge cleanup owner-specific, bound HTTP/TLS listener workers,
+  validate DNS SOA discovery and cache TTLs, support reverse-IP TLS-ALPN names,
+  retry orderNotReady on the existing order and verify alternate chain identity.
+
+See the README's unreleased upgrade guidance before opening existing storage
+with the new account and credential layouts.
+
 ## [0.2.0] - 2026-10-11
 
 Add shared storage and remote certificate backends, guarded multi-node

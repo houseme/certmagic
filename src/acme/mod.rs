@@ -3,6 +3,7 @@
 //! transport abstraction that keeps the protocol unit-testable.
 
 pub mod account;
+mod account_store;
 pub mod acme_issuer;
 pub mod client;
 pub mod directory;

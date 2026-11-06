@@ -74,12 +74,21 @@ pub struct Certificate {
     pub(crate) ocsp: Option<crate::ocsp::OcspResponse>,
     /// Hash of the chain (cache key).
     pub(crate) hash: String,
+    pub(crate) leaf_hash: String,
     /// Whether certmagic manages (auto-renews) this certificate.
     pub(crate) managed: bool,
     /// Issuer key identifying who issued it (storage prefix).
     pub(crate) issuer_key: String,
+    pub(crate) resource_name: Option<String>,
+    pub(crate) identifiers: Vec<crate::acme::order::Identifier>,
+    pub(crate) must_staple: bool,
+    pub(crate) quarantined: bool,
+    pub(crate) ocsp_retry_at: Option<OffsetDateTime>,
+    pub(crate) ocsp_failures: u32,
     /// ARI renewal information, when fetched.
     pub(crate) ari: Option<RenewalInfo>,
+    /// Admission deadline for an in-flight or failed ARI refresh.
+    pub(crate) ari_retry_at: Option<OffsetDateTime>,
     /// Parsed leaf facts.
     pub(crate) info: Option<CertInfo>,
 }
@@ -96,6 +105,56 @@ impl fmt::Debug for Certificate {
 }
 
 impl Certificate {
+    /// Whether the leaf is currently valid and has no verified revocation.
+    pub fn valid_at(&self, now: OffsetDateTime) -> bool {
+        !self.quarantined
+            && self
+                .info
+                .as_ref()
+                .is_some_and(|info| now >= info.not_before && now < info.not_after)
+            && self
+                .ocsp
+                .as_ref()
+                .is_none_or(|response| response.status != crate::ocsp::OcspCertStatus::Revoked)
+    }
+
+    pub(crate) fn supports_hello(&self, hello: &crate::handshake::ClientHelloInfo) -> bool {
+        if !self.valid_at(OffsetDateTime::now_utc())
+            || (self.must_staple && self.current_ocsp_staple().is_none())
+        {
+            return false;
+        }
+        if hello.signature_schemes.is_empty() {
+            return true;
+        }
+        let schemes: Vec<_> = hello
+            .signature_schemes
+            .iter()
+            .copied()
+            .map(rustls::SignatureScheme::from)
+            .collect();
+        self.signing_key
+            .as_ref()
+            .is_some_and(|key| key.choose_scheme(&schemes).is_some())
+    }
+
+    pub(crate) fn current_ocsp_staple(&self) -> Option<&[u8]> {
+        let response = self.ocsp.as_ref()?;
+        if self.ocsp_staple.as_deref()? != response.raw {
+            return None;
+        }
+        let now = OffsetDateTime::now_utc();
+        let deadline = response
+            .next_update
+            .or_else(|| response.this_update.checked_add(time::Duration::hours(24)))?;
+        (response.status == crate::ocsp::OcspCertStatus::Good
+            && response.this_update <= now + time::Duration::minutes(5)
+            && now < deadline
+            && response
+                .responder_not_after
+                .is_none_or(|expiry| now < expiry))
+        .then_some(response.raw.as_slice())
+    }
     /// An empty certificate`-style placeholder).
     #[must_use]
     pub fn empty() -> Self {
@@ -108,9 +167,17 @@ impl Certificate {
             tags: Vec::new(),
             ocsp: None,
             hash: String::new(),
+            leaf_hash: String::new(),
             managed: false,
             issuer_key: String::new(),
+            resource_name: None,
+            identifiers: Vec::new(),
+            must_staple: false,
+            quarantined: false,
+            ocsp_retry_at: None,
+            ocsp_failures: 0,
             ari: None,
+            ari_retry_at: None,
             info: None,
         }
     }
@@ -125,6 +192,12 @@ impl Certificate {
     #[must_use]
     pub fn hash(&self) -> &str {
         &self.hash
+    }
+
+    /// SHA-256 identity of the DER leaf, shared across alternate chains.
+    #[must_use]
+    pub fn leaf_hash(&self) -> &str {
+        &self.leaf_hash
     }
 
     /// Whether certmagic manages this certificate.
@@ -147,6 +220,87 @@ impl Certificate {
             Some(info) => now > info.not_after,
             None => false,
         }
+    }
+
+    pub(crate) fn same_public_key(&self, other: &Self) -> bool {
+        let parse = |cert: &Self| {
+            cert.chain
+                .first()
+                .and_then(|leaf| x509_parser::parse_x509_certificate(leaf.as_ref()).ok())
+                .map(|(_, cert)| cert.public_key().raw.to_vec())
+        };
+        matches!((parse(self), parse(other)), (Some(a), Some(b)) if a == b)
+    }
+
+    /// Attach an OCSP response after verifying its CertID and issuer signature.
+    pub fn with_ocsp_response(mut self, bytes: &[u8]) -> Result<Self> {
+        let leaf = self
+            .chain
+            .first()
+            .ok_or(Error::Certificate(CertificateError::NoNames))?;
+        let issuer = self.chain.get(1).unwrap_or(leaf);
+        crate::ocsp::verify_issuer_link(leaf.as_ref(), issuer.as_ref())?;
+        let info = self
+            .info
+            .as_ref()
+            .ok_or(Error::Certificate(CertificateError::NoNames))?;
+        let id = crate::ocsp::rfc6960::CertId::from_issuer_sha1(issuer.as_ref(), &info.serial)?;
+        let response = crate::ocsp::rfc6960::parse_response(bytes, &id, Some(issuer.as_ref()))?;
+        if self
+            .ocsp
+            .as_ref()
+            .is_none_or(|old| old.status != crate::ocsp::OcspCertStatus::Revoked)
+        {
+            self.ocsp_staple = (response.status == crate::ocsp::OcspCertStatus::Good)
+                .then(|| response.raw.clone());
+            self.ocsp = Some(response);
+        }
+        Ok(self)
+    }
+
+    /// DNS/IP identifiers carried by the leaf SAN extension.
+    pub(crate) fn identifiers(&self) -> Result<Vec<crate::acme::order::Identifier>> {
+        if self.identifiers.is_empty() {
+            return Err(Error::Certificate(CertificateError::NoNames));
+        }
+        Ok(self.identifiers.clone())
+    }
+
+    pub(crate) fn covers_name(&self, name: &str) -> bool {
+        use crate::acme::order::Identifier;
+        if let Ok(ip) = name.parse::<IpAddr>() {
+            return self
+                .identifiers
+                .iter()
+                .any(|identifier| matches!(identifier, Identifier::Ip(value) if value == &ip));
+        }
+        if self
+            .identifiers
+            .iter()
+            .any(|identifier| matches!(identifier, Identifier::Dns(value) if value == name))
+        {
+            return true;
+        }
+        wildcard_candidate(name).is_some_and(|wildcard| {
+            self.identifiers.iter().any(
+                |identifier| matches!(identifier, Identifier::Dns(value) if value == &wildcard),
+            )
+        })
+    }
+
+    pub(crate) fn covers(&self, identifiers: &[crate::acme::order::Identifier]) -> bool {
+        use crate::acme::order::Identifier;
+        self.identifiers().is_ok_and(|actual| {
+            let actual = actual.into_iter().collect::<std::collections::HashSet<_>>();
+            identifiers.iter().all(|wanted| {
+                actual.contains(wanted)
+                    || match wanted {
+                        Identifier::Dns(name) => wildcard_candidate(name)
+                            .is_some_and(|candidate| actual.contains(&Identifier::Dns(candidate))),
+                        Identifier::Ip(_) => false,
+                    }
+            })
+        })
     }
 
     /// Remaining lifetime of the leaf, if parsed.
@@ -197,10 +351,29 @@ impl Certificate {
                 "empty chain".into(),
             )));
         };
-        let (info, names) = parse_leaf(leaf_der.as_ref())?;
+        let (info, names, identifiers) = parse_leaf(leaf_der.as_ref())?;
         self.names = names;
+        self.identifiers = identifiers;
         self.hash = hash_certificate_chain(&self.chain);
+        self.leaf_hash = crate::crypto::sha256_hex(leaf_der.as_ref());
         self.info = Some(info);
+        let (_, parsed) = x509_parser::parse_x509_certificate(leaf_der.as_ref())
+            .map_err(|_| Error::Certificate(CertificateError::Parse("invalid leaf".into())))?;
+        self.must_staple = parsed
+            .extensions()
+            .iter()
+            .filter(|extension| extension.oid.to_id_string() == "1.3.6.1.5.5.7.1.24")
+            .any(|extension| {
+                crate::ocsp::asn1::parse_all(extension.value)
+                    .iter()
+                    .any(|sequence| {
+                        sequence.tag == 0x30
+                            && sequence
+                                .children()
+                                .iter()
+                                .any(|feature| feature.tag == 2 && feature.content == [5])
+                    })
+            });
         Ok(())
     }
 }
@@ -210,7 +383,7 @@ const OID_CAISSUERS: &str = "1.3.6.1.5.5.7.48.2"; // id-ad-caIssuers
 
 /// Parse a DER leaf into [`CertInfo`] + `names` in a single pass
 ///.
-fn parse_leaf(der: &[u8]) -> Result<(CertInfo, Vec<String>)> {
+fn parse_leaf(der: &[u8]) -> Result<(CertInfo, Vec<String>, Vec<crate::acme::order::Identifier>)> {
     let (_, cert) = x509_parser::parse_x509_certificate(der)
         .map_err(|e| Error::Certificate(CertificateError::Parse(format!("leaf: {e}"))))?;
 
@@ -270,13 +443,18 @@ fn parse_leaf(der: &[u8]) -> Result<(CertInfo, Vec<String>)> {
     if let Some(cn) = &subject_cn {
         push(cn.clone(), false);
     }
+    let mut identifiers = Vec::new();
     if let Ok(Some(san)) = cert.subject_alternative_name() {
         for gn in &san.value.general_names {
             match gn {
-                x509_parser::extensions::GeneralName::DNSName(d) => push((*d).to_owned(), true),
+                x509_parser::extensions::GeneralName::DNSName(d) => {
+                    push((*d).to_owned(), true);
+                    identifiers.push(crate::acme::order::Identifier::Dns(d.to_ascii_lowercase()));
+                }
                 x509_parser::extensions::GeneralName::IPAddress(bytes) => {
                     if let Some(ip) = parse_ip_bytes(bytes) {
                         push(ip.to_string(), true);
+                        identifiers.push(crate::acme::order::Identifier::Ip(ip));
                     }
                 }
                 x509_parser::extensions::GeneralName::RFC822Name(e) => push((*e).to_owned(), true),
@@ -295,12 +473,12 @@ fn parse_leaf(der: &[u8]) -> Result<(CertInfo, Vec<String>)> {
         subject_cn,
         ocsp_servers,
         issuing_certificate_url,
-        serial: cert.serial.to_bytes_be(),
+        serial: cert.raw_serial().to_vec(),
         is_ca,
         aki_key_identifier,
         issuer_spki_hash,
     };
-    Ok((info, names))
+    Ok((info, names, identifiers))
 }
 
 fn parse_ip_bytes(bytes: &[u8]) -> Option<IpAddr> {
@@ -344,9 +522,17 @@ pub fn make_certificate(cert_pem: &[u8], key_pem: &[u8]) -> Result<Certificate> 
         tags: Vec::new(),
         ocsp: None,
         hash: String::new(),
+        leaf_hash: String::new(),
         managed: false,
         issuer_key: String::new(),
+        resource_name: None,
+        identifiers: Vec::new(),
+        must_staple: false,
+        quarantined: false,
+        ocsp_retry_at: None,
+        ocsp_failures: 0,
         ari: None,
+        ari_retry_at: None,
         info: None,
     };
     let key = crate::tls_integration::signing_key_from_der(
@@ -369,6 +555,17 @@ pub fn make_certificate(cert_pem: &[u8], key_pem: &[u8]) -> Result<Certificate> 
     Ok(cert)
 }
 
+pub(crate) fn public_certificate(cert_pem: &[u8]) -> Result<Certificate> {
+    let mut cert = Certificate::empty();
+    cert.chain = pem::sections(cert_pem)
+        .into_iter()
+        .filter(|section| section.label == "CERTIFICATE")
+        .map(|section| CertificateDer::from(section.der))
+        .collect();
+    cert.fill_from_leaf()?;
+    Ok(cert)
+}
+
 // ---------------------------------------------------------------------------
 // Name matching.
 // ---------------------------------------------------------------------------
@@ -377,6 +574,18 @@ pub fn make_certificate(cert_pem: &[u8], key_pem: &[u8]) -> Result<Certificate> 
 #[must_use]
 pub fn normalized_name(s: &str) -> String {
     s.trim().to_lowercase()
+}
+
+/// The TLS wildcard covering exactly the leftmost DNS label.
+pub(crate) fn wildcard_candidate(name: &str) -> Option<String> {
+    if name.parse::<IpAddr>().is_ok() || name.contains('*') {
+        return None;
+    }
+    let (label, rest) = name.split_once('.')?;
+    if label.is_empty() || rest.split('.').any(str::is_empty) {
+        return None;
+    }
+    Some(format!("*.{rest}"))
 }
 
 /// Normalize an SNI value: trim, then IDNA/punycode conversion
@@ -548,7 +757,10 @@ pub fn currently_in_renewal_window(
     let Ok(lifetime_ms) = i64::try_from(lifetime.whole_milliseconds()) else {
         return false;
     };
-    let ratio = if renewal_window_ratio <= 0.0 {
+    let ratio = if !renewal_window_ratio.is_finite()
+        || !(0.0..=1.0).contains(&renewal_window_ratio)
+        || renewal_window_ratio == 0.0
+    {
         DEFAULT_RENEWAL_WINDOW_RATIO
     } else {
         renewal_window_ratio
@@ -587,8 +799,11 @@ pub fn cert_needs_renewal(
         if now > info.not_after - emergency {
             return true;
         }
-        let cutoff = ari.selected_time
-            - time::Duration::milliseconds(decision.renew_check_interval.as_millis() as i64);
+        let lead =
+            time::Duration::try_from(decision.renew_check_interval).unwrap_or(time::Duration::MAX);
+        let Some(cutoff) = ari.selected_time.checked_sub(lead) else {
+            return true;
+        };
         return now > cutoff;
     }
 
@@ -607,9 +822,9 @@ pub fn cert_needs_renewal(
     let fallback_window = time::Duration::milliseconds(
         (lifetime.whole_milliseconds() as f64 * FALLBACK_RENEWAL_RATIO) as i64,
     );
-    let five_checks =
-        time::Duration::milliseconds((decision.renew_check_interval.as_millis() * 5) as i64);
-    now > info.not_after - fallback_window || now > info.not_after - five_checks
+    let remaining: Duration = (info.not_after - now).try_into().unwrap_or(Duration::ZERO);
+    now > info.not_after - fallback_window
+        || remaining < decision.renew_check_interval.saturating_mul(5)
 }
 
 // ---------------------------------------------------------------------------
@@ -628,7 +843,10 @@ pub struct RenewalInfo {
     pub selected_time: OffsetDateTime,
     /// The window these values were computed from (to detect changes).
     #[serde(skip)]
-    pub(crate) window_seen: (i64, i64),
+    pub(crate) window_seen: (i128, i128),
+    /// Next refresh deadline derived from Retry-After or the six-hour fallback.
+    #[serde(skip)]
+    pub(crate) refresh_after: OffsetDateTime,
 }
 
 /// A serializable ARI suggested renewal window (wire DTO).
@@ -684,7 +902,7 @@ impl RenewalInfo {
     /// within `[start, end]`+start`).
     #[must_use]
     pub fn from_suggested_window(start: OffsetDateTime, end: OffsetDateTime) -> Self {
-        let window_seen = (start.unix_timestamp(), end.unix_timestamp());
+        let window_seen = (start.unix_timestamp_nanos(), end.unix_timestamp_nanos());
         let span_ms = (end - start).whole_milliseconds().max(1);
         let offset_ms = crate::crypto::random_u64_below(span_ms as u64) as i64;
         let selected_time = start + time::Duration::milliseconds(offset_ms);
@@ -693,22 +911,21 @@ impl RenewalInfo {
             suggested_window_end: end,
             selected_time,
             window_seen,
+            refresh_after: OffsetDateTime::now_utc() + time::Duration::hours(6),
         }
     }
 
-    /// Whether ARI should be re-fetched from the CA: when half the window has
-    /// elapsed since selection.
+    /// Whether the Retry-After deadline has elapsed. Locally constructed
+    /// windows use a six-hour refresh interval.
     #[must_use]
     pub fn needs_refresh(&self, now: OffsetDateTime) -> bool {
-        let midpoint = self.suggested_window_start
-            + ((self.suggested_window_end - self.suggested_window_start) / 2);
-        now > midpoint
+        now >= self.refresh_after
     }
 
     /// Re-select a jittered time when the CA changed the window
     ///.
     pub fn update_window(&mut self, start: OffsetDateTime, end: OffsetDateTime) {
-        let new_seen = (start.unix_timestamp(), end.unix_timestamp());
+        let new_seen = (start.unix_timestamp_nanos(), end.unix_timestamp_nanos());
         if new_seen != self.window_seen {
             *self = Self::from_suggested_window(start, end);
         }
@@ -873,6 +1090,39 @@ mod tests {
             0.0,
             not_after - time::Duration::days(10)
         ));
+    }
+
+    #[test]
+    fn certon_renewal_math_handles_unbounded_intervals_and_nonfinite_ratios() {
+        let cert = self_signed(&["overflow.example.com"]);
+        let now = OffsetDateTime::now_utc();
+        let info = cert.info.as_ref().unwrap();
+        for ratio in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 2.0] {
+            assert_eq!(
+                currently_in_renewal_window(info.not_before, info.not_after, ratio, now),
+                currently_in_renewal_window(
+                    info.not_before,
+                    info.not_after,
+                    DEFAULT_RENEWAL_WINDOW_RATIO,
+                    now
+                )
+            );
+        }
+        let ari = RenewalInfo::from_suggested_window(
+            now + time::Duration::days(1),
+            now + time::Duration::days(2),
+        );
+        for ari in [None, Some(&ari)] {
+            assert!(cert_needs_renewal(
+                info,
+                &RenewalDecision {
+                    renewal_window_ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
+                    renew_check_interval: Duration::MAX,
+                    ari
+                },
+                now
+            ));
+        }
     }
 
     #[test]

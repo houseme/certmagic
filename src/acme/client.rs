@@ -295,23 +295,38 @@ impl AcmeClient {
                 limiter.wait(ct).await?;
             }
             let jws = key.sign_jws(url, &nonce, kid, payload)?;
-            let resp = self.post_raw(url, &jws).await?;
-
-            // Harvest the next nonce from every response.
-            if let Some(next) = resp.nonce() {
-                self.nonces.supply(next);
-            }
+            let resp = tokio::select! {
+                biased;
+                () = ct.cancelled() => return Err(Error::Internal("context canceled".into())),
+                response = self.post_raw(url, &jws) => response?,
+            };
 
             if let Some(problem) = crate::acme::problem::problem_from_response(&resp) {
                 if problem.is_bad_nonce() && attempt + 1 < MAX_ATTEMPTS {
-                    tracing::debug!(url, "badNonce; retrying with a fresh one");
-                    nonce = self
-                        .nonces
-                        .fetch_fresh(ct, self.transport.as_ref(), self.directory.new_nonce()?)
-                        .await?;
+                    // This response nonce belongs to this retry. Publishing it
+                    // to the shared pool lets a concurrent request consume it.
+                    tracing::debug!("badNonce; retrying with a fresh nonce");
+                    nonce = match resp
+                        .nonce()
+                        .filter(|value| !value.is_empty() && *value != nonce)
+                    {
+                        Some(next) => next.to_owned(),
+                        None => {
+                            self.nonces
+                                .fetch_fresh(
+                                    ct,
+                                    self.transport.as_ref(),
+                                    self.directory.new_nonce()?,
+                                )
+                                .await?
+                        }
+                    };
                     continue;
                 }
                 return Err(problem.into_error());
+            }
+            if let Some(next) = resp.nonce() {
+                self.nonces.supply(next);
             }
             return Ok(resp);
         }
@@ -321,6 +336,7 @@ impl AcmeClient {
     }
 
     async fn post_raw(&self, url: &str, jws: &Value) -> Result<HttpResponse> {
+        crate::acme::transport::require_https(url)?;
         let body = serde_json::to_vec(jws)
             .map_err(|e| Error::Acme(AcmeError::Jws(format!("serialize: {e}"))))?;
         self.transport
@@ -503,7 +519,15 @@ impl AcmeClient {
         let alternate_links = resp.header("link").map(str::to_owned);
         let mut chains = vec![resp.body];
         if let Some(links) = alternate_links.as_deref() {
+            let base = url::Url::parse(url)
+                .map_err(|_| Error::Acme(AcmeError::Order("invalid chain URL".into())))?;
+            let leaf = crate::pem::first_section_with_label(&chains[0], &["CERTIFICATE"])
+                .map(|section| section.der);
+            let mut seen = std::collections::HashSet::from([base.to_string()]);
             for link in links.split(',') {
+                if seen.len() >= 6 {
+                    break;
+                }
                 let Some(start) = link.find('<') else {
                     continue;
                 };
@@ -511,11 +535,27 @@ impl AcmeClient {
                     continue;
                 };
                 let target = &link[start + 1..start + 1 + end];
-                if !link[start + 1 + end..].contains("alternate") {
+                if !link[start + 1 + end..].split(';').any(|parameter| {
+                    parameter.trim().strip_prefix("rel=").is_some_and(|value| {
+                        value
+                            .trim_matches('"')
+                            .split_ascii_whitespace()
+                            .any(|relation| relation == "alternate")
+                    })
+                }) {
                     continue;
                 }
-                let alternate = self.post_as_get(target, ct).await?;
-                if alternate.is_success() && !crate::pem::sections(&alternate.body).is_empty() {
+                let Ok(target) = base.join(target) else {
+                    continue;
+                };
+                if target.scheme() != "https" || !seen.insert(target.to_string()) {
+                    continue;
+                }
+                if let Ok(alternate) = self.post_as_get(target.as_str(), ct).await
+                    && crate::pem::first_section_with_label(&alternate.body, &["CERTIFICATE"])
+                        .map(|section| section.der)
+                        == leaf
+                {
                     chains.push(alternate.body);
                 }
             }
@@ -523,26 +563,39 @@ impl AcmeClient {
         Ok(chains)
     }
 
-    /// Fetch ARI renewal info for a certificate
-    /// (`issuer_spki`: issuing certificate's SubjectPublicKeyInfo DER;
-    /// `serial_der`: leaf serial).
+    /// Fetch ARI renewal info with an unauthenticated GET (RFC 9773).
+    /// `aki` is the Authority Key Identifier's keyIdentifier, and `serial_der`
+    /// retains the DER INTEGER content bytes, including any leading zero.
     ///
     /// # Errors
     /// [`AcmeError::MissingEndpoint`] when the CA does not advertise ARI.
     pub async fn renewal_info(
         &self,
-        issuer_spki: &[u8],
+        aki: &[u8],
         serial_der: &[u8],
         ct: &CancellationToken,
     ) -> Result<RenewalInfoResponse> {
         let base = self.directory.renewal_info()?.trim_end_matches('/');
-        let url = format!("{base}/{}", ari_cert_id(issuer_spki, serial_der));
-        let resp = self.post_as_get(&url, ct).await?;
+        let url = format!("{base}/{}", ari_cert_id(aki, serial_der));
+        crate::acme::transport::require_https(&url)?;
+        let resp = tokio::select! {
+            biased;
+            () = ct.cancelled() => return Err(Error::Internal("context canceled".into())),
+            response = self.transport.execute(HttpRequest {
+                method: Method::Get,
+                url,
+                body: None,
+                content_type: None,
+                accept: Some("application/json".into()),
+            }) => response?,
+        };
         if let Some(problem) = crate::acme::problem::problem_from_response(&resp) {
             return Err(problem.into_error());
         }
-        serde_json::from_slice(&resp.body)
-            .map_err(|e| Error::Acme(AcmeError::Order(format!("ARI decode: {e}"))))
+        let mut info: RenewalInfoResponse = serde_json::from_slice(&resp.body)
+            .map_err(|e| Error::Acme(AcmeError::Order(format!("ARI decode: {e}"))))?;
+        info.retry_after = resp.retry_after().map(|duration| duration.as_secs());
+        Ok(info)
     }
 
     /// Poll an order until it is `valid` or `invalid`, with 500 ms → 5 s
@@ -578,6 +631,72 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn certon_bad_nonce_reuses_response_nonce_without_sharing_it() {
+        #[derive(Debug)]
+        struct RetryTransport(AtomicUsize);
+        #[async_trait]
+        impl Transport for RetryTransport {
+            async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
+                assert_eq!(request.method, Method::Post);
+                let jws: Value = serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+                let protected: Value = serde_json::from_slice(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(jws["protected"].as_str().unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+                let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+                assert_eq!(
+                    protected["nonce"],
+                    if first {
+                        "initial"
+                    } else {
+                        "request-owned-retry"
+                    }
+                );
+                Ok(HttpResponse {
+                    status: if first { 400 } else { 200 },
+                    headers: [(
+                        "replay-nonce".into(),
+                        if first {
+                            "request-owned-retry".into()
+                        } else {
+                            "future-request".into()
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                    body: if first {
+                        br#"{"type":"urn:ietf:params:acme:error:badNonce"}"#.to_vec()
+                    } else {
+                        b"{}".to_vec()
+                    },
+                })
+            }
+        }
+        let mut account = Account::new_es256(&[]).unwrap();
+        account.url = "https://ca.example/account".into();
+        let nonces = NoncePool::new();
+        nonces.supply("initial");
+        let client = AcmeClient {
+            transport: Arc::new(RetryTransport(AtomicUsize::new(0))),
+            directory: Directory {
+                new_nonce: Some("https://ca.example/nonce".into()),
+                ..Default::default()
+            },
+            nonces,
+            account: Some(account),
+            rate_limiter: None,
+        };
+        client
+            .jws_post("https://ca.example/order", None, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(client.nonces.take().as_deref(), Some("future-request"));
+        assert!(client.nonces.take().is_none());
+    }
 
     /// A scripted CA for protocol tests.
     #[derive(Debug, Default)]
@@ -670,7 +789,9 @@ mod tests {
                     headers,
                     body: b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".to_vec(),
                 }),
-                (Method::Post, u) if u.starts_with("https://ca/renewal-info/") => {
+                (Method::Get, u) if u.starts_with("https://ca/renewal-info/") => {
+                    assert!(req.body.is_none());
+                    headers.insert("retry-after".into(), "120".into());
                     assert_eq!(
                         u,
                         "https://ca/renewal-info/aXNzdWVyLXNwa2k.AQID",
@@ -770,11 +891,7 @@ mod tests {
     #[tokio::test]
     async fn ari_roundtrip_with_cert_id_in_url() {
         let ca = Arc::new(MockCa::default());
-        let mut client = AcmeClient::connect(ca, "https://ca/directory")
-            .await
-            .unwrap();
-        client
-            .register_account(&[], true, None, false, &CancellationToken::new())
+        let client = AcmeClient::connect(ca, "https://ca/directory")
             .await
             .unwrap();
         let info = client
@@ -783,6 +900,7 @@ mod tests {
             .unwrap();
         let (start, end) = info.window().unwrap();
         assert!(end > start);
+        assert_eq!(info.retry_after, Some(120));
     }
 
     #[tokio::test]

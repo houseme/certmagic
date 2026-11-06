@@ -264,7 +264,7 @@ impl HttpChallengeHandler {
         }
 
         if let Some(host) = host
-            && let Some(challenge) = ActiveChallenges::get("http-01", host)
+            && let Some(challenge) = ActiveChallenges::get_token("http-01", host, token)
             && challenge.token == token
         {
             return Some(challenge.key_authorization);
@@ -375,7 +375,7 @@ pub fn handle_http_challenge_request(host: &str, method: &str, path: &str) -> Op
     // Host normalization: strip port, lowercase.
     let host_only = normalize_host(host)?;
 
-    let challenge = ActiveChallenges::get("http-01", &host_only)?;
+    let challenge = ActiveChallenges::get_token("http-01", &host_only, token)?;
     if challenge.token != token {
         return None;
     }
@@ -679,20 +679,55 @@ impl Http01Solver {
     }
 }
 
+fn presentation_owners()
+-> &'static tokio::sync::Mutex<std::collections::HashSet<(SocketAddr, String)>> {
+    static OWNERS: std::sync::OnceLock<
+        tokio::sync::Mutex<std::collections::HashSet<(SocketAddr, String)>>,
+    > = std::sync::OnceLock::new();
+    OWNERS.get_or_init(Default::default)
+}
+pub(crate) async fn still_present(chal: &crate::solvers::SolvableChallenge) -> bool {
+    let key = crate::solvers::challenge_key(chal);
+    presentation_owners()
+        .lock()
+        .await
+        .iter()
+        .any(|(_, owner)| owner == &key)
+}
+
 #[async_trait]
 impl Solver for Http01Solver {
     async fn present(
         &self,
-        _ct: &CancellationToken,
+        ct: &CancellationToken,
         chal: &crate::solvers::SolvableChallenge,
     ) -> Result<()> {
+        let mut owners = tokio::select! { biased; () = ct.cancelled() => return Err(Error::Internal("context canceled".into())), owners = presentation_owners().lock() => owners };
+        let owner = (
+            SocketAddr::new(self.listen_host, self.port),
+            crate::solvers::challenge_key(chal),
+        );
+        if owners.contains(&owner) {
+            return Ok(());
+        }
         self.ensure_listener().await?;
+        owners.insert(owner);
         ActiveChallenges::insert(&crate::solvers::challenge_key(chal), chal);
         Ok(())
     }
 
     async fn cleanup(&self, chal: &crate::solvers::SolvableChallenge) {
-        ActiveChallenges::remove(&crate::solvers::challenge_key(chal));
+        let mut owners = presentation_owners().lock().await;
+        let owner = (
+            SocketAddr::new(self.listen_host, self.port),
+            crate::solvers::challenge_key(chal),
+        );
+        if !owners.remove(&owner) {
+            return;
+        }
+        if !owners.iter().any(|(_, key)| key == &owner.1) {
+            ActiveChallenges::remove_owned(chal);
+        }
 
         let key = (self.listen_host, self.port);
         if let Ok(mut map) = listeners().lock()
@@ -707,15 +742,18 @@ impl Solver for Http01Solver {
 
 fn spawn_serve(listener: tokio::net::TcpListener, ct: CancellationToken) {
     tokio::spawn(async move {
+        let mut workers = tokio::task::JoinSet::new();
         loop {
-            let stream = tokio::select! {
-                () = ct.cancelled() => return,
-                accepted = listener.accept() => match accepted {
-                    Ok((stream, _)) => stream,
-                    Err(_) => continue,
-                },
-            };
-            tokio::spawn(serve_one(stream, ct.clone()));
+            tokio::select! {
+                biased;
+                () = ct.cancelled() => { workers.abort_all(); while workers.join_next().await.is_some() {} return; }
+                _ = workers.join_next(), if !workers.is_empty() => {}
+                accepted = listener.accept(), if workers.len() < 256 => {
+                    let Ok((stream, _)) = accepted else { continue; };
+                    let ct = ct.clone();
+                    workers.spawn(async move { let _ = tokio::time::timeout(Duration::from_secs(10), serve_one(stream, ct)).await; });
+                }
+            }
         }
     });
 }

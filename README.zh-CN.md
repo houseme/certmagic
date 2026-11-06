@@ -64,6 +64,38 @@ certmagic = { version = "0.2", default-features = false, features = [
 路径的 timing side-channel 风险。RustSec `RUSTSEC-2023-0071` 仍被显式跟踪，
 因为上游尚未发布修复版本。
 
+## 升级到尚未发布的生命周期改造版本
+
+本次将 Certon 0.4 的生命周期改进适配到现有 Config 和 CertStore API，来源提交见
+CHANGELOG。升级前停止所有协作写入实例，备份完整存储命名空间及远程证书对象。
+使用原有 ACME 目录 URL、配置邮箱和证书资源名称执行显式迁移。
+
+```rust,no_run
+# async fn upgrade(config: &certmagic::Config) -> certmagic::Result<()> {
+let ct = tokio_util::sync::CancellationToken::new();
+let resource_names = vec!["example.com".to_owned()];
+config.migrate_legacy_acme(&ct, &resource_names).await?;
+config.manage_sync(&ct, &resource_names).await?;
+# Ok(())
+# }
+```
+
+多 SAN 证书按原存储资源名传入一次。自定义签发者改名可调用
+`migrate_issuer_storage`，目标签发者须在配置中。迁移会校验完整目标资源后退役旧副本，
+并保存可重试收据。中断后保持写入暂停，以相同配置重试。遇到代际冲突时检查保留副本和
+备份。曾因泄露私钥进入替换流程的资源，应先在原签发者命名空间完成替换。
+
+默认 ACME issuer key 改为完整规范目录 URL 的摘要。账户使用
+`acme/account-snapshots/` 下绑定目录与配置邮箱的完整快照。KeyValueCertStore 以
+`credential-snapshots/` 下的完整证书快照为准，兼容读取旧三文件布局，并为可表示名称
+维护旧路径镜像。删除收据防止旧镜像恢复已退役凭据。读取证书资源应使用 CertStore
+或 storage 证书辅助函数。
+
+迁移后一起启动已升级的读取实例。备份和保留迁移收据、撤销标记、证书快照，以及
+FileStorage 的 `.cm-write.guard` 和 `locks/*.guard`。自定义 fencing 后端须实现
+受保护删除，自定义 CertStore 应实现 `load_for_recovery`，保留私钥归档后的证书公开信息。
+已返回的 TLS key 和客户端配置属于当时的快照，撤销或过期后应重新构造。
+
 ## 从 0.1 升级到 0.2
 
 0.2.0 增加可选 Redis/etcd 协调后端，以及 S3、Vault KV v2 和 AWS Secrets Manager
@@ -220,9 +252,9 @@ revision 比较；受保护的 etcd 移动在同一事务内区分数据冲突�
 try-lock 的超时预算覆盖在途后端调用和重试等待。异步取消仍不能撤回已发出的后端命令，
 租约过期继续承担恢复职责。
 
-证书与私钥还可通过 `ConfigBuilder::cert_store` 单独接入 `CertStore`；账号、挑战记录、
-锁和 OCSP 仍走 `Storage`。数据库事务或带版本的完整证书资源对象，可以提供比通用三键
-适配器更强的原子性。通用适配器现已并发读取三项内容及存在性，但这不是后端事务快照。
+证书与私钥可通过 `ConfigBuilder::cert_store` 单独接入 `CertStore`。账号、挑战记录、
+锁和 OCSP 使用 `Storage`。KeyValueCertStore 将完整权威快照作为最后一步发布。
+兼容读取旧三键资源时使用后端分组读取，并在返回前复查并发发布的完整快照。
 
 **建议保留默认文件后端，将 Redis 作为可选适配器。** 单机握手缓存命中不需要 Redis；
 多实例且已有 Redis 基础设施时，可以显式启用 `redis-storage`，并配置持久化、容量和故障恢复策略。
@@ -247,7 +279,7 @@ TLS 使用所选择的 Ring 或 AWS-LC provider。
 端点必须使用相同协议。支持 HTTPS、WebPKI/自定义 CA、双向 TLS 和用户名密码；
 认证信息放在 options 中，不允许嵌入 URL，日志与 Debug 不输出凭据或 PEM。
 
-签发和续期通过 `CertStore::save_with_lock` 发布完整证书资源，默认键值适配器将三项写入
+签发和续期通过 `CertStore::save_with_lock` 发布完整证书资源，默认键值适配器将快照写入
 交给 `Storage::store_tx_with_lock`。etcd 在同一事务中校验锁的 revision、lease ID 和 token，
 并写入证书、私钥和元数据。泄露私钥归档通过 `move_private_key_with_lock` / `move_with_lock`
 原子完成，同时比较源 revision 和目标不存在条件，避免旧持有者覆盖、归档或移除新私钥。
@@ -267,8 +299,9 @@ Config 在联系 CA 前就检查兼容性。etcd 上下文支持原存储句柄�
 扩展到超过配置的时长。取消在途续租后立即放弃本地所有权，防止错用迟到响应。
 `Drop` 尽力撤销租约，`release_and_wait` 等待确认，进程或运行时退出由 TTL 恢复。
 leader 切换期间可能返回暂时不可用或超时；不盲目重试结果不确定的写入，失去多数节点时
-拒绝写入。普通 `store/delete`、旧 `save/move_private_key`、账号/挑战写入和存储清理
-不自动具备 fencing；FileStorage/Redis 保留此前的本地健康检查语义。
+拒绝写入。受保护的发布、归档和删除 API 会校验所有权，托管账户和挑战流程使用这些 API。
+直接调用未受保护的写入 API 或使用自定义后端时，需要调用方提供所有权协议。
+FileStorage/Redis 使用租约健康检查。
 
 显式运行隔离测试（需要 Docker 和 `protoc`）：
 
@@ -304,7 +337,7 @@ certmagic = { version = "0.2", features = ["redis-storage"] }
 
 **边界：** 当前不是 Redlock，不实现 Cluster/Sentinel 自动发现，也不提供写入侧 fencing。
 签发/续期会在检测到租约丢失后停止重试和发布，但这些检查点不能替代原子写入 fencing。
-证书通用三键适配器仍不是跨键崩溃事务。账号和私钥的持久化、非淘汰容量策略以及 ACL/TLS
+KeyValueCertStore 发布完整证书快照。账号和私钥的持久化、非淘汰容量策略以及 ACL/TLS
 需要由部署配置保证，库不会修改 Redis 服务端配置或输出连接 URL。
 
 真实实例测试会启动独立临时目录、回环端口的 Redis，不使用生产 URL：
@@ -377,8 +410,9 @@ FileStorage 使用永久保留的 `locks/*.guard` 文件和唯一持有者标识
 
 该机制属于租约协议，不提供 fencing：进程暂停超过租约后恢复，仍可能继续执行原有
 业务写入。需要 fencing 的部署必须使用能强制隔离失效持有者的后端。
-证书、私钥和元数据仍分别写入；`store_tx` 能回滚返回的写入错误，但不具备跨文件的
-崩溃原子性。
+FileStorage 在已派发的阻塞写入完成前持有根目录提交锁，覆盖调用方取消的情况。
+KeyValueCertStore 在兼容镜像之后发布完整快照。任意多键 `store_tx` 调用仍依赖
+返回错误时的回滚及后端的崩溃恢复保证。
 
 ## 测试
 

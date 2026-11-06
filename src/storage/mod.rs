@@ -109,6 +109,12 @@ pub trait Storage: Locker {
         store_tx(self, items).await
     }
 
+    /// Delete a key/prefix while validating an acquisition's ownership.
+    async fn delete_with_lock(&self, key: &str, guard: &LockGuard) -> Result<()> {
+        guard.check_unfenced_write()?;
+        self.delete(key).await
+    }
+
     /// Move one exact key under this acquisition. Fenced implementations must
     /// compare ownership, copy the value and remove the source atomically.
     async fn move_with_lock(
@@ -515,21 +521,8 @@ pub async fn store_certificate(
     issuer_key: &str,
     resource: &crate::issuer::CertificateResource,
 ) -> Result<()> {
-    let domain = resource.names_key();
-    let metadata = serde_json::to_vec(resource)
-        .map_err(|error| Error::Storage(StorageError::Other(format!("meta encode: {error}"))))?;
-    let private_key = site_private_key(issuer_key, &domain);
-    let certificate = site_cert_key(issuer_key, &domain);
-    let metadata_key = site_meta_key(issuer_key, &domain);
-    store_tx(
-        storage,
-        &[
-            (&private_key, resource.private_key_pem.clone()),
-            (&certificate, resource.certificate_pem.clone()),
-            (&metadata_key, metadata),
-        ],
-    )
-    .await
+    crate::cert_store::snapshot::save(storage, issuer_key, &resource.names_key(), resource, None)
+        .await
 }
 
 /// Load a complete certificate resource from storage.
@@ -538,31 +531,9 @@ pub async fn load_certificate(
     issuer_key: &str,
     domain: &str,
 ) -> Result<crate::issuer::CertificateResource> {
-    let keys = [
-        site_private_key(issuer_key, domain),
-        site_cert_key(issuer_key, domain),
-        site_meta_key(issuer_key, domain),
-    ];
-    let values = storage
-        .load_many(&keys.each_ref().map(String::as_str))
-        .await?;
-    if values.len() != keys.len() {
-        return Err(Error::Internal(
-            "storage returned an invalid certificate snapshot".into(),
-        ));
-    }
-    let mut values = values
-        .into_iter()
-        .zip(keys)
-        .map(|(value, key)| value.ok_or(Error::Storage(StorageError::NotFound(key))));
-    let private_key = values.next().expect("validated snapshot length")?;
-    let certificate = values.next().expect("validated snapshot length")?;
-    let metadata = values.next().expect("validated snapshot length")?;
-    let mut resource: crate::issuer::CertificateResource = serde_json::from_slice(&metadata)
-        .map_err(|error| Error::Storage(StorageError::Other(format!("meta decode: {error}"))))?;
-    resource.private_key_pem = private_key;
-    resource.certificate_pem = certificate;
-    Ok(resource)
+    crate::cert_store::snapshot::load(storage, issuer_key, domain, false)
+        .await?
+        .ok_or_else(|| Error::Storage(StorageError::NotFound(domain.into())))
 }
 
 // ---------------------------------------------------------------------------
@@ -615,7 +586,11 @@ pub async fn clean_storage(
     }
 
     if opts.expired_certs {
+        crate::cert_store::snapshot::clean(storage.as_ref(), opts.expired_cert_grace_period)
+            .await?;
         delete_expired_certs(storage, opts.expired_cert_grace_period).await;
+        crate::ari::clean_storage(ct, storage, opts.expired_cert_grace_period).await?;
+        clean_revocations(storage, opts.expired_cert_grace_period).await?;
     }
     if opts.ocsp_staples {
         delete_old_ocsp_staples(storage).await;
@@ -628,6 +603,39 @@ pub async fn clean_storage(
     storage
         .store(LAST_CLEAN_KEY, record.to_string().as_bytes())
         .await?;
+    Ok(())
+}
+
+async fn clean_revocations(storage: &Arc<dyn Storage>, grace: Duration) -> Result<()> {
+    let Ok(grace) = time::Duration::try_from(grace) else {
+        return Ok(());
+    };
+    let keys = match storage.list("revocations", true).await {
+        Ok(keys) => keys,
+        Err(Error::Storage(StorageError::NotFound(_))) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for key in keys {
+        let record: serde_json::Value = match serde_json::from_slice(&storage.load(&key).await?) {
+            Ok(record) => record,
+            Err(_) => continue,
+        };
+        let Some(leaf) = record["leaf"].as_str() else {
+            continue;
+        };
+        if record["version"] != 1 || key != format!("revocations/{leaf}.json") {
+            continue;
+        }
+        let Some(expires) = crate::clock::wire_time::parse(record["expires"].clone()) else {
+            continue;
+        };
+        if expires
+            .checked_add(grace)
+            .is_some_and(|expiry| expiry < OffsetDateTime::now_utc())
+        {
+            storage.delete(&key).await?;
+        }
+    }
     Ok(())
 }
 
@@ -693,7 +701,7 @@ async fn delete_old_ocsp_staples(storage: &Arc<dyn Storage>) {
 }
 
 /// Extract the leaf NotAfter from a PEM certificate bundle.
-fn cert_expiry_from_pem(pem_bundle: &[u8]) -> Option<OffsetDateTime> {
+pub(crate) fn cert_expiry_from_pem(pem_bundle: &[u8]) -> Option<OffsetDateTime> {
     let der = crate::pem::first_section_with_label(pem_bundle, &["CERTIFICATE"])?.der;
     let (_, cert) = x509_parser::parse_x509_certificate(&der).ok()?;
     Some(cert.validity().not_after.to_datetime())

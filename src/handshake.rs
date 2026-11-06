@@ -135,16 +135,7 @@ impl Config {
             let managed_on_demand =
                 cert.managed() && self.options.on_demand.is_some() && load_or_obtain;
             if managed_on_demand {
-                return match self.handshake_maintenance(ct, &cert).await {
-                    Ok(fresh) => Ok(fresh),
-                    Err(err) => {
-                        if cert.expired_at(ctx_now()) {
-                            return Err(err);
-                        }
-                        tracing::warn!(error = %err, "handshake maintenance failed; serving certificate anyway");
-                        Ok(cert)
-                    }
-                };
+                return self.handshake_maintenance(ct, &cert).await;
             }
             return Ok(cert);
         }
@@ -193,35 +184,57 @@ impl Config {
                 })
                 .await;
 
-            let on_demand_ready: std::result::Result<Certificate, Arc<Error>> =
-                match flight.into_value() {
-                    Ok(cert) => {
-                        if let Ok(fresh) = self.handshake_maintenance(ct, &cert).await {
-                            return Ok(fresh);
+            match flight.into_value() {
+                Ok(cert) => return self.handshake_maintenance(ct, &cert).await,
+                Err(err) => {
+                    if matches!(err.as_ref(), Error::Certificate(_) | Error::Ocsp(_)) {
+                        let mut resource = self.load_cert_resource_any_issuer(&resolved_name).await;
+                        if matches!(
+                            resource,
+                            Err(Error::Storage(crate::error::StorageError::NotFound(_)))
+                        ) && let Some(wildcard) =
+                            crate::certificate::wildcard_candidate(&resolved_name)
+                        {
+                            resource = self.load_cert_resource_any_issuer(&wildcard).await;
                         }
-                        return Ok(cert);
+                        let (_, _, cert) = resource?;
+                        if matches!(err.as_ref(), Error::Ocsp(_)) && !self.cert_needs_renewal(&cert)
+                        {
+                            return Err((*err).clone());
+                        }
+                        self.renew_subject_inner(
+                            ct,
+                            cert.resource_name.as_deref().unwrap_or(&resolved_name),
+                            crate::config::RenewOptions {
+                                force: true,
+                                interactive: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                        return self.load_cert_from_storage(ct, &resolved_name).await;
                     }
-                    Err(err) => Err(err),
-                };
-
-            // Storage miss → on-demand issuance, deduplicated per name.
-            if let Err(err) = on_demand_ready {
-                tracing::debug!(domain = %resolved_name, error = %err, "dynamic load failed");
-                self.obtain_on_demand_certificate(ct, hello, &resolved_name)
-                    .await?;
-                let cert = self.load_cert_from_storage(ct, &resolved_name).await?;
-                if let Ok(fresh) = self.handshake_maintenance(ct, &cert).await {
-                    return Ok(fresh);
+                    if !matches!(
+                        err.as_ref(),
+                        Error::Storage(crate::error::StorageError::NotFound(_))
+                    ) {
+                        return Err((*err).clone());
+                    }
+                    tracing::debug!(domain = %resolved_name, error = %err, "dynamic load missed");
                 }
-                return Ok(cert);
             }
+            self.obtain_on_demand_certificate(ct, hello, &resolved_name)
+                .await?;
+            let cert = self.load_cert_from_storage(ct, &resolved_name).await?;
+            return self.handshake_maintenance(ct, &cert).await;
         }
 
         // 5) Fallback server name.
         if defaulted
-            && let Some(cert) = self.get_certificate_from_cache_by_name(&normalized_name(
-                &self.options.fallback_server_name,
-            ))
+            && let Some(cert) = self.get_certificate_from_cache_by_name(
+                hello,
+                &normalized_name(&self.options.fallback_server_name),
+            )
         {
             return Ok(cert);
         }
@@ -231,7 +244,7 @@ impl Config {
         )))
     }
 
-    /// Cache lookup with progressive wildcard candidates
+    /// Cache lookup with leftmost-label wildcard matching
     ///. Returns
     /// `(certificate, resolved_name, defaulted)`.
     ///
@@ -260,24 +273,38 @@ impl Config {
         };
 
         let cert = if let Some(selector) = &self.options.cert_selection {
+            let choices: Vec<_> = self
+                .cert_cache
+                .all_matching_certificates(&name)
+                .into_iter()
+                .filter(|cert| cert.supports_hello(hello) && cert.covers_name(&name))
+                .collect();
             selector
-                .select_certificate(hello, &self.cert_cache.all_matching_certificates(&name))
+                .select_certificate(hello, &choices)
                 .ok()
+                .filter(|cert| cert.supports_hello(hello) && cert.covers_name(&name))
         } else {
-            self.get_certificate_from_cache_by_name(&name)
+            self.get_certificate_from_cache_by_name(hello, &name)
         };
         let defaulted = cert.is_none()
             && !self.options.fallback_server_name.is_empty()
             && self
-                .get_certificate_from_cache_by_name(&normalized_name(
-                    &self.options.fallback_server_name,
-                ))
+                .get_certificate_from_cache_by_name(
+                    hello,
+                    &normalized_name(&self.options.fallback_server_name),
+                )
                 .is_some();
         (cert, name, defaulted)
     }
 
-    fn get_certificate_from_cache_by_name(&self, name: &str) -> Option<Certificate> {
-        self.cert_cache.first_matching_certificate(name)
+    fn get_certificate_from_cache_by_name(
+        &self,
+        hello: &ClientHelloInfo,
+        name: &str,
+    ) -> Option<Certificate> {
+        self.cert_cache.first_matching_where(name, |cert| {
+            cert.supports_hello(hello) && cert.covers_name(name)
+        })
     }
 
     /// On-demand gating.
@@ -309,12 +336,12 @@ impl Config {
             )));
         }
 
-        let internal_allowlist = on_demand
+        let allowed = on_demand
             .allowlist
             .read()
             .ok()
-            .and_then(|guard| guard.clone());
-        if internal_allowlist.is_some_and(|set| set.contains(name)) {
+            .is_some_and(|guard| guard.as_ref().is_some_and(|set| set.contains(name)));
+        if allowed {
             return Ok(());
         }
 
@@ -346,18 +373,7 @@ impl Config {
         ct: &CancellationToken,
         name: &str,
     ) -> Result<Certificate> {
-        match self.cache_managed_certificate(ct, name).await {
-            Ok(cert) => Ok(cert),
-            Err(Error::Storage(crate::error::StorageError::NotFound(_))) => {
-                // Wildcard retry: replace the leftmost label with "*".
-                let wild = match name.split_once('.') {
-                    Some((_, rest)) => format!("*.{rest}"),
-                    None => format!("*.{name}"),
-                };
-                self.cache_managed_certificate(ct, &wild).await
-            }
-            Err(err) => Err(err),
-        }
+        self.cache_managed_certificate(ct, name).await
     }
 
     /// On-demand issuance with per-name single-flight and the 180 s cap
@@ -418,50 +434,102 @@ impl Config {
         ct: &CancellationToken,
         cert: &Certificate,
     ) -> Result<Certificate> {
-        // ARI refresh: background, 8-minute budget (avoids blocking the
-        // handshake).
-        if !self.options.disable_ari
-            && let Some(ari) = &cert.ari
-            && ari.needs_refresh(time::OffsetDateTime::now_utc())
-        {
-            let this = self.clone();
-            let hash = cert.hash().to_owned();
-            let ct2 = ct.clone();
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(8 * 60),
-                    this.refresh_ari(&ct2, &hash),
-                )
-                .await;
-            });
-        }
+        self.schedule_ari_refresh(cert);
 
         // Renew if inside the window.
         if self.cert_needs_renewal(cert) {
             let name = cert
-                .names
-                .first()
-                .cloned()
+                .resource_name
+                .clone()
+                .or_else(|| cert.names.first().cloned())
                 .ok_or(Error::Certificate(CertificateError::NoNames))?;
-            self.renew_cert(ct, &name, false, true).await?;
-            return self.reload_managed_certificate(ct, &name).await;
+            let renewal = async {
+                self.renew_subject_inner(
+                    ct,
+                    &name,
+                    crate::config::RenewOptions {
+                        interactive: true,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                self.reload_managed_certificate(ct, &name).await
+            }
+            .await;
+            return match renewal {
+                Ok(fresh) => Ok(fresh),
+                Err(err) if !cert.expired_at(ctx_now()) => {
+                    tracing::warn!(error = %err, "handshake maintenance failed; serving certificate anyway");
+                    Ok(cert.clone())
+                }
+                Err(err) => Err(err),
+            };
         }
         Ok(cert.clone())
     }
 
-    /// Background ARI refresh for a cached certificate.
-    async fn refresh_ari(&self, ct: &CancellationToken, hash: &str) -> crate::error::Result<()> {
-        let Some(cert) = self.cert_cache.get_by_hash(hash) else {
-            return Ok(());
-        };
-        for issuer in &self.options.issuers {
-            if let Ok(ari) = issuer.get_renewal_info(ct, &cert).await {
-                self.cert_cache
-                    .update_metadata(cert.hash(), |cached| cached.ari = Some(ari));
-                break;
-            }
+    /// Admit one bounded refresh per cached certificate. Failed or cancelled
+    /// attempts retain a six-hour backoff, including for unsupported issuers.
+    pub(crate) fn schedule_ari_refresh(&self, cert: &Certificate) {
+        if self.options.disable_ari {
+            return;
         }
-        Ok(())
+        let Some(cert) = self.cert_cache.claim_ari_refresh(cert.hash()) else {
+            return;
+        };
+        let Some(issuer) = self
+            .options
+            .issuers
+            .iter()
+            .find(|issuer| issuer.issuer_key() == cert.issuer_key)
+        else {
+            return;
+        };
+        let issuer = Arc::clone(issuer);
+        let cache = Arc::clone(&self.cert_cache);
+        let storage = self.ground_truth_storage();
+        let ct = cache.stop_token();
+        let hash = cert.hash().to_owned();
+        let admitted = self.cert_cache.ari_jobs.submit(&hash, move || Box::pin(async move {
+            let result = tokio::select! {
+                biased;
+                () = ct.cancelled() => return Ok(()),
+                result = tokio::time::timeout(Duration::from_secs(30), issuer.get_renewal_info(&ct, &cert)) => result,
+            };
+            let success = matches!(&result, Ok(Ok(_)));
+            let candidate = match result {
+                Ok(Ok(ari)) => Some(ari),
+                _ => cert.ari.clone(),
+            };
+            let saved = tokio::select! {
+                biased;
+                () = ct.cancelled() => return Ok(()),
+                saved = tokio::time::timeout(Duration::from_secs(5), crate::ari::save(&storage, &ct, &cert, candidate.clone(), success)) => saved,
+            };
+            let ari = match saved {
+                Ok(Ok(info)) => info,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "ARI history persistence failed");
+                    candidate
+                }
+                Err(_) => {
+                    tracing::warn!("ARI history persistence timed out");
+                    candidate
+                }
+            };
+            if success && let Some(ari) = ari {
+                cache.update_metadata(cert.hash(), |cached| {
+                    cached.ari = Some(ari);
+                    cached.ari_retry_at = None;
+                });
+            }
+            Ok(())
+        }));
+        if admitted.is_err() {
+            self.cert_cache.update_metadata(&hash, |cert| {
+                cert.ari_retry_at = Some(ctx_now() + time::Duration::minutes(1));
+            });
+        }
     }
 
     /// TLS-ALPN-01: answer a validation probe with the registered challenge
@@ -479,13 +547,17 @@ impl Config {
         // 2) Distributed: another instance published the challenge to shared
         //    storage; regenerate the challenge certificate locally.
         if let Some(storage) = self.storage_for_distributed() {
+            let identifier = crate::solvers::tls_alpn::TlsAlpnSolver::identifier_for_sni(sni);
             let issuer_keys = self.issuer_keys();
-            if let Ok(Some(published)) =
-                crate::solvers::distributed::load_published(storage.as_ref(), &issuer_keys, sni)
-                    .await
+            if let Ok(Some(published)) = crate::solvers::distributed::load_published(
+                storage.as_ref(),
+                &issuer_keys,
+                &identifier,
+            )
+            .await
             {
                 let cc = crate::solvers::tls_alpn::TlsAlpnSolver::generate_challenge_cert(
-                    sni,
+                    &identifier,
                     &published.key_authorization,
                 )?;
                 return Ok(Some(make_certificate_from_challenge(&cc)?));
@@ -495,7 +567,7 @@ impl Config {
     }
 
     fn storage_for_distributed(&self) -> Option<Arc<dyn crate::storage::Storage>> {
-        self.options.storage.clone()
+        Some(self.ground_truth_storage())
     }
 
     fn issuer_keys(&self) -> Vec<String> {
@@ -519,9 +591,17 @@ fn make_certificate_from_challenge(
         tags: Vec::new(),
         ocsp: None,
         hash: String::new(),
+        leaf_hash: String::new(),
         managed: false,
         issuer_key: String::new(),
+        resource_name: None,
+        identifiers: Vec::new(),
+        must_staple: false,
+        quarantined: false,
+        ocsp_retry_at: None,
+        ocsp_failures: 0,
         ari: None,
+        ari_retry_at: None,
         info: None,
     };
     cert.fill_from_leaf()?;
@@ -554,27 +634,28 @@ impl Config {
         let this = self.clone();
         let name = name.to_owned();
         let ct = CancellationToken::new();
-        let job = format!("ondemand_{name}");
-        let _ = crate::runtime::global_job_manager().submit(&job, move || {
-            let this = this.clone();
-            let name = name.clone();
-            let ct = ct.clone();
+        let job = format!("config_{}/ondemand_{name}", self.job_namespace);
+        if let Err(error) = crate::runtime::global_job_manager().submit(&job, move || {
             Box::pin(async move {
-                if this
-                    .check_if_cert_should_be_obtained(&ct, &name, false)
+                if this.options.on_demand.is_some() {
+                    let hello = ClientHelloInfo {
+                        server_name: Some(name),
+                        ..Default::default()
+                    };
+                    this.get_cert_during_handshake(&ct, &hello, true)
+                        .await
+                        .map(|_| ())
+                } else {
+                    let name = this.transform_subject(&ct, &name).await;
+                    crate::runtime::do_with_retry(&ct, |_| {
+                        this.manage_one_subject(&ct, &name, false)
+                    })
                     .await
-                    .is_ok()
-                    && this.allow_on_demand_issuance(&name).is_ok()
-                {
-                    // A sync/foreground obtain performs one interactive
-                    // attempt.  Resolver remediation is detached work and
-                    // must follow the non-interactive retry path so transient
-                    // CA/storage failures do not strand the name forever.
-                    let _ = this.obtain_cert(&ct, &name, false).await;
                 }
-                Ok(())
             })
-        });
+        }) {
+            tracing::warn!(%error, "background certificate admission failed");
+        }
     }
 }
 
@@ -749,6 +830,115 @@ mod logic_tests {
             .unwrap();
         assert!(cert.names.contains(&"example.com".to_string()));
         Arc::clone(&config.cert_cache).stop_now();
+    }
+
+    #[tokio::test]
+    async fn certon_selection_skips_expired_and_incompatible_siblings() {
+        let cache = Cache::new_without_maintenance(Default::default()).unwrap();
+        let config = Config::new(Arc::clone(&cache), Default::default()).unwrap();
+        let make = |algorithm, expired| {
+            let key = KeyPair::generate_for(algorithm).unwrap();
+            let mut params = CertificateParams::new(vec!["schemes.example.com".into()]).unwrap();
+            if expired {
+                params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(90);
+                params.not_after = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+            }
+            let cert = params.self_signed(&key).unwrap();
+            crate::certificate::make_certificate(
+                cert.pem().as_bytes(),
+                key.serialize_pem().as_bytes(),
+            )
+            .unwrap()
+        };
+        cache.cache_certificate(make(&rcgen::PKCS_ECDSA_P384_SHA384, true));
+        cache.cache_certificate(make(&rcgen::PKCS_ECDSA_P256_SHA256, false));
+        let expected = make(&rcgen::PKCS_ECDSA_P384_SHA384, false);
+        cache.cache_certificate(expected.clone());
+        let hello = ClientHelloInfo {
+            server_name: Some("schemes.example.com".into()),
+            signature_schemes: vec![u16::from(rustls::SignatureScheme::ECDSA_NISTP384_SHA384)],
+            ..Default::default()
+        };
+        assert_eq!(
+            config.get_cached_cert_sync(&hello).unwrap().hash(),
+            expected.hash()
+        );
+        assert_eq!(
+            config
+                .get_certificate(&CancellationToken::new(), &hello)
+                .await
+                .unwrap()
+                .hash(),
+            expected.hash()
+        );
+    }
+
+    #[tokio::test]
+    async fn review_cold_expired_certificate_propagates_renewal_failure() {
+        #[derive(Debug)]
+        struct UnavailableIssuer;
+        #[async_trait::async_trait]
+        impl Issuer for UnavailableIssuer {
+            async fn issue(
+                &self,
+                _: &CancellationToken,
+                _: &crate::issuer::Csr,
+                _: u32,
+            ) -> Result<IssuedCertificate> {
+                Err(Error::Issuer(crate::error::IssuerError::Other(
+                    "CA unavailable".into(),
+                )))
+            }
+            fn issuer_key(&self) -> String {
+                "unavailable".into()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::new(
+            Cache::new_without_maintenance(Default::default()).unwrap(),
+            ConfigOptions {
+                storage: Some(crate::storage::FileStorage::new(directory.path())),
+                issuers: vec![Arc::new(UnavailableIssuer)],
+                on_demand: Some(
+                    OnDemandConfig::default().with_host_allowlist(["expired.example.com"]),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["expired.example.com".into()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "expired.example.com");
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(90);
+        params.not_after = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        let cert = params.self_signed(&key).unwrap();
+        config
+            .cert_store()
+            .save(
+                "unavailable",
+                "expired.example.com",
+                &crate::issuer::CertificateResource {
+                    sans: vec!["expired.example.com".into()],
+                    certificate_pem: cert.pem().into_bytes(),
+                    private_key_pem: key.serialize_pem().into_bytes(),
+                    issuer_data: None,
+                },
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let result = config
+                .get_certificate(&CancellationToken::new(), &hello_for("expired.example.com"))
+                .await;
+            assert!(
+                matches!(result, Err(Error::Issuer(crate::error::IssuerError::Other(message))) if message == "CA unavailable")
+            );
+        }
     }
 
     #[tokio::test]

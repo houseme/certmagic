@@ -28,7 +28,7 @@ impl std::fmt::Debug for EabCredentials {
 
 /// An ACME account: the key *is* the account; the URL is its server-side
 /// identifier.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Account {
     /// The account key pair.
     pub key: AccountKey,
@@ -40,6 +40,16 @@ pub struct Account {
     pub status: String,
     /// Whether the CA reports the TOS as agreed.
     pub terms_of_service_agreed: bool,
+}
+
+impl std::fmt::Debug for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Account")
+            .field("url", &crate::http::diagnostic_endpoint(&self.url))
+            .field("status", &self.status)
+            .field("registered", &self.is_registered())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Account {

@@ -18,9 +18,29 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::error::{Error, Result, StorageError};
+use crate::error::Result;
+#[cfg(test)]
+use crate::error::{Error, StorageError};
 use crate::issuer::CertificateResource;
-use crate::storage::{LockGuard, STORAGE_KEYS, Storage, store_tx};
+#[cfg(test)]
+use crate::storage::STORAGE_KEYS;
+use crate::storage::{LockGuard, Storage};
+pub(crate) mod snapshot;
+
+pub(crate) fn metadata_depth_valid(value: &serde_json::Value, remaining: usize) -> bool {
+    if remaining == 0 {
+        return false;
+    }
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .all(|value| metadata_depth_valid(value, remaining - 1)),
+        serde_json::Value::Object(items) => items
+            .values()
+            .all(|value| metadata_depth_valid(value, remaining - 1)),
+        _ => true,
+    }
+}
 
 /// Persistence for complete certificate resources.
 #[async_trait]
@@ -64,6 +84,16 @@ pub trait CertStore: Send + Sync + std::fmt::Debug {
     /// Load a resource, returning `Ok(None)` when the complete resource is absent.
     async fn load(&self, issuer_key: &str, domain: &str) -> Result<Option<CertificateResource>>;
 
+    /// Recover public certificate context after a private key was retired.
+    /// Implementations may return a resource with an empty private key.
+    async fn load_for_recovery(
+        &self,
+        issuer_key: &str,
+        domain: &str,
+    ) -> Result<Option<CertificateResource>> {
+        self.load(issuer_key, domain).await
+    }
+
     /// Save certificate PEM, private key PEM and metadata for a domain.
     async fn save(
         &self,
@@ -77,6 +107,16 @@ pub trait CertStore: Send + Sync + std::fmt::Debug {
 
     /// Remove the complete resource. Missing resources are not an error.
     async fn remove(&self, issuer_key: &str, domain: &str) -> Result<()>;
+    /// Retire a resource with the same fencing contract used for publication.
+    async fn remove_with_lock(
+        &self,
+        issuer_key: &str,
+        domain: &str,
+        guard: &LockGuard,
+    ) -> Result<()> {
+        guard.check_unfenced_write()?;
+        self.remove(issuer_key, domain).await
+    }
 
     /// Move only the private key to `destination_key`, removing the source key.
     /// Existing destination values must not be overwritten. A canonical self
@@ -124,32 +164,7 @@ impl KeyValueCertStore {
         resource: &CertificateResource,
         guard: Option<&LockGuard>,
     ) -> Result<()> {
-        if let Some(guard) = guard {
-            self.validate_write_guard(guard)?;
-        }
-        let (certificate, private_key, metadata) = self.paths(issuer_key, domain);
-        let metadata_value = serde_json::to_vec(resource).map_err(|_| {
-            Error::Storage(StorageError::Other(
-                "certificate metadata encoding failed".into(),
-            ))
-        })?;
-        let items = [
-            (&*certificate, resource.certificate_pem.clone()),
-            (&*private_key, resource.private_key_pem.clone()),
-            (&*metadata, metadata_value),
-        ];
-        match guard {
-            Some(guard) => self.storage.store_tx_with_lock(&items, guard).await,
-            None => store_tx(self.storage.as_ref(), &items).await,
-        }
-    }
-
-    fn paths(&self, issuer_key: &str, domain: &str) -> (String, String, String) {
-        (
-            STORAGE_KEYS.site_cert(issuer_key, domain),
-            STORAGE_KEYS.site_private_key(issuer_key, domain),
-            STORAGE_KEYS.site_meta(issuer_key, domain),
-        )
+        snapshot::save(self.storage.as_ref(), issuer_key, domain, resource, guard).await
     }
 }
 
@@ -177,38 +192,26 @@ impl CertStore for KeyValueCertStore {
         destination_key: &str,
         guard: &LockGuard,
     ) -> Result<()> {
-        let (_, key, _) = self.paths(issuer_key, domain);
-        self.storage
-            .move_with_lock(&key, destination_key, guard)
-            .await
+        snapshot::move_key(
+            self.storage.as_ref(),
+            issuer_key,
+            domain,
+            destination_key,
+            Some(guard),
+        )
+        .await
     }
 
     async fn load(&self, issuer_key: &str, domain: &str) -> Result<Option<CertificateResource>> {
-        let (certificate_key, private_key_key, metadata_key) = self.paths(issuer_key, domain);
-        let values = self
-            .storage
-            .load_many(&[&certificate_key, &private_key_key, &metadata_key])
-            .await?;
-        let [certificate, private_key, metadata]: [Option<Vec<u8>>; 3] = values
-            .try_into()
-            .map_err(|_| Error::Internal("storage returned an invalid resource snapshot".into()))?;
-        match (certificate, private_key, metadata) {
-            (None, None, None) => Ok(None),
-            (Some(certificate_pem), Some(private_key_pem), Some(metadata)) => {
-                let mut resource: CertificateResource =
-                    serde_json::from_slice(&metadata).map_err(|_| {
-                        Error::Storage(StorageError::Other(
-                            "certificate metadata decoding failed".into(),
-                        ))
-                    })?;
-                resource.certificate_pem = certificate_pem;
-                resource.private_key_pem = private_key_pem;
-                Ok(Some(resource))
-            }
-            _ => Err(Error::Storage(StorageError::Other(format!(
-                "incomplete certificate resource for {domain} under {issuer_key}"
-            )))),
-        }
+        snapshot::load(self.storage.as_ref(), issuer_key, domain, false).await
+    }
+
+    async fn load_for_recovery(
+        &self,
+        issuer_key: &str,
+        domain: &str,
+    ) -> Result<Option<CertificateResource>> {
+        snapshot::load(self.storage.as_ref(), issuer_key, domain, true).await
     }
 
     async fn save(
@@ -221,44 +224,33 @@ impl CertStore for KeyValueCertStore {
     }
 
     async fn has(&self, issuer_key: &str, domain: &str) -> Result<bool> {
-        let (certificate_key, private_key_key, metadata_key) = self.paths(issuer_key, domain);
-        let values = self
-            .storage
-            .exists_exact_many(&[&certificate_key, &private_key_key, &metadata_key])
-            .await?;
-        if values.len() != 3 {
-            return Err(Error::Internal(
-                "storage returned an invalid existence snapshot".into(),
-            ));
-        }
-        let count = values.iter().filter(|value| **value).count();
-        match count {
-            0 => Ok(false),
-            3 => Ok(true),
-            _ => Err(Error::Storage(StorageError::Other(format!(
-                "incomplete certificate resource for {domain} under {issuer_key}"
-            )))),
-        }
+        snapshot::has(self.storage.as_ref(), issuer_key, domain).await
     }
-
     async fn remove(&self, issuer_key: &str, domain: &str) -> Result<()> {
-        let (certificate_key, private_key_key, metadata_key) = self.paths(issuer_key, domain);
-        for key in [certificate_key, private_key_key, metadata_key] {
-            self.storage.delete(&key).await?;
-        }
-        Ok(())
+        snapshot::remove(self.storage.as_ref(), issuer_key, domain, None).await
     }
-
+    async fn remove_with_lock(
+        &self,
+        issuer_key: &str,
+        domain: &str,
+        guard: &LockGuard,
+    ) -> Result<()> {
+        snapshot::remove(self.storage.as_ref(), issuer_key, domain, Some(guard)).await
+    }
     async fn move_private_key(
         &self,
         issuer_key: &str,
         domain: &str,
         destination_key: &str,
     ) -> Result<()> {
-        let (_, private_key_key, _) = self.paths(issuer_key, domain);
-        self.storage
-            .move_key(&private_key_key, destination_key)
-            .await
+        snapshot::move_key(
+            self.storage.as_ref(),
+            issuer_key,
+            domain,
+            destination_key,
+            None,
+        )
+        .await
     }
 }
 
@@ -394,15 +386,15 @@ mod parallel_read_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn independent_reads_share_one_latency_window() {
+    async fn legacy_reads_verify_canonical_publication_after_parallel_fields() {
         let store = backend(3);
         let start = tokio::time::Instant::now();
         let resource = store.load("issuer", "example.com").await.unwrap().unwrap();
-        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
         assert_eq!(resource.private_key_pem, b"private-key");
         let start = tokio::time::Instant::now();
         assert!(store.has("issuer", "example.com").await.unwrap());
-        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
     }
 
     #[tokio::test(start_paused = true)]

@@ -59,6 +59,9 @@ impl NoncePool {
         transport: &dyn super::transport::Transport,
         new_nonce_url: &str,
     ) -> Result<String> {
+        if ct.is_cancelled() {
+            return Err(Error::Internal("context canceled".into()));
+        }
         if let Some(nonce) = self.take() {
             return Ok(nonce);
         }
@@ -75,16 +78,18 @@ impl NoncePool {
         transport: &dyn super::transport::Transport,
         new_nonce_url: &str,
     ) -> Result<String> {
-        let _ = ct; // GET newNonce is fast; cancellation checked by the caller between attempts
-        let resp = transport
-            .execute(super::transport::HttpRequest {
+        super::transport::require_https(new_nonce_url)?;
+        let resp = tokio::select! {
+            biased;
+            () = ct.cancelled() => return Err(Error::Internal("context canceled".into())),
+            response = transport.execute(super::transport::HttpRequest {
                 method: super::transport::Method::Get,
                 url: new_nonce_url.to_owned(),
                 body: None,
                 content_type: None,
                 accept: None,
-            })
-            .await?;
+            }) => response?,
+        };
         let Some(nonce) = resp.nonce().map(str::to_owned) else {
             return Err(Error::Acme(AcmeError::Nonce(
                 "newNonce response missing Replay-Nonce header".into(),

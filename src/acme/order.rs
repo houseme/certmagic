@@ -19,7 +19,7 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_ORDER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An order identifier (RFC 8555 §9.7.1 + RFC 8738).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "lowercase")]
 pub enum Identifier {
     /// A DNS name.
@@ -281,16 +281,18 @@ impl RenewalInfoResponse {
     /// Convert the server response into local renewal state when a window is
     /// present.
     ///
-    /// The conversion intentionally discards response metadata from the
-    /// runtime value and re-generates `selected_time` inside the validated
-    /// window.  Callers that need `retry_after` or `explanation_url` should
-    /// retain this response DTO alongside the native state.
+    /// Select a renewal instant in the validated window and schedule refresh
+    /// using Retry-After, bounded to one minute through one day. Missing or
+    /// invalid headers use the six-hour fallback. Retain this DTO to preserve
+    /// the explanation URL and original server metadata.
     pub fn to_runtime(&self) -> Result<Option<crate::certificate::RenewalInfo>> {
         self.window_opt()?
             .map(|(start, end)| {
-                Ok(crate::certificate::RenewalInfo::from_suggested_window(
-                    start, end,
-                ))
+                let mut info = crate::certificate::RenewalInfo::from_suggested_window(start, end);
+                let seconds = self.retry_after.unwrap_or(6 * 3600).clamp(60, 24 * 3600);
+                info.refresh_after =
+                    OffsetDateTime::now_utc() + time::Duration::seconds(seconds as i64);
+                Ok(info)
             })
             .transpose()
     }
@@ -404,6 +406,30 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn review_ari_retry_after_bounds_refresh_deadlines() {
+        for (retry_after, seconds) in [
+            (None, 21600),
+            (Some(0), 60),
+            (Some(120), 120),
+            (Some(u64::MAX), 86400),
+        ] {
+            let response = RenewalInfoResponse {
+                suggested_window: Some(SuggestedWindow {
+                    start: "2030-01-01T00:00:00Z".into(),
+                    end: "2030-01-02T00:00:00Z".into(),
+                }),
+                retry_after,
+                ..Default::default()
+            };
+            let before = OffsetDateTime::now_utc();
+            let runtime = response.to_runtime().unwrap().unwrap();
+            let after = OffsetDateTime::now_utc();
+            assert!(runtime.refresh_after >= before + time::Duration::seconds(seconds));
+            assert!(runtime.refresh_after <= after + time::Duration::seconds(seconds));
+        }
     }
 
     #[test]

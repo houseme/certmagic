@@ -344,6 +344,13 @@ impl Storage for LocalCache {
         self.forget(key, true);
         self.inner.delete(key).await
     }
+    async fn delete_with_lock(&self, key: &str, guard: &LockGuard) -> Result<()> {
+        self.validate_write_guard(guard)?;
+        let key = self.canonical_key(key)?;
+        let _prefix = self.prefixes.write().await;
+        self.forget(&key, true);
+        self.inner.delete_with_lock(&key, guard).await
+    }
 
     async fn exists(&self, key: &str) -> Result<bool> {
         self.inner.exists(key).await

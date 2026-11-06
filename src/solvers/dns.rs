@@ -94,6 +94,7 @@ pub struct Dns01Solver {
     pub(crate) provider: Arc<dyn DnsProvider>,
     pub(crate) options: DnsOptions,
     resolver: Option<Arc<dyn DnsResolver>>,
+    presented: std::sync::Mutex<std::collections::HashMap<String, (String, String, String, bool)>>,
 }
 
 impl Dns01Solver {
@@ -104,6 +105,7 @@ impl Dns01Solver {
             provider,
             options,
             resolver: None,
+            presented: Default::default(),
         }
     }
 
@@ -122,6 +124,7 @@ impl Dns01Solver {
             provider,
             options,
             resolver: Some(resolver),
+            presented: Default::default(),
         }
     }
 
@@ -141,11 +144,11 @@ impl Dns01Solver {
         if let Some(zone) = &self.options.override_domain {
             return Ok(zone.clone());
         }
-        let ident = identifier.trim().trim_start_matches("*.");
+        let ident = self.txt_name(identifier);
         if let Some(resolver) = &self.resolver {
-            resolver.find_zone(ident).await
+            resolver.find_zone(&ident).await
         } else {
-            crate::dnsutil::find_zone_by_fqdn(ident).await
+            crate::dnsutil::find_zone_by_fqdn(&ident).await
         }
     }
 }
@@ -157,12 +160,38 @@ impl Solver for Dns01Solver {
         ct: &CancellationToken,
         chal: &crate::solvers::SolvableChallenge,
     ) -> Result<()> {
+        let owner = crate::solvers::challenge_key(chal);
+        if self
+            .presented
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&owner)
+            .is_some_and(|entry| entry.3)
+        {
+            return Ok(());
+        }
         let zone = self.zone_for(&chal.identifier).await?;
         let name = self.txt_name(&chal.identifier);
         let value = crate::acme::protocol::dns_01_txt_value(&chal.key_authorization)?;
+        self.presented
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                owner.clone(),
+                (zone.clone(), name.clone(), value.clone(), false),
+            );
         self.provider
             .append_txt(ct, &zone, &name, &value, self.options.ttl)
-            .await
+            .await?;
+        if let Some(entry) = self
+            .presented
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&owner)
+        {
+            entry.3 = true;
+        }
+        Ok(())
     }
 
     async fn wait(
@@ -236,29 +265,33 @@ impl Solver for Dns01Solver {
     }
 
     async fn cleanup(&self, chal: &crate::solvers::SolvableChallenge) {
-        // Cleanup must always occur: run with a fresh, cancellation-proof
-        // token and a bounded timeout (the incoming cancellation token is ignored here).
+        let owner = crate::solvers::challenge_key(chal);
+        let prepared = self
+            .presented
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&owner)
+            .cloned();
+        let Some((zone, name, value, _)) = prepared else {
+            return;
+        };
         let ct = CancellationToken::new();
-        let fut = async {
-            match self.zone_for(&chal.identifier).await {
-                Ok(zone) => {
-                    let name = self.txt_name(&chal.identifier);
-                    match crate::acme::protocol::dns_01_txt_value(&chal.key_authorization) {
-                        Ok(value) => {
-                            if let Err(err) =
-                                self.provider.delete_txt(&ct, &zone, &name, &value).await
-                            {
-                                tracing::warn!(zone = %zone, name = %name, error = %err, "DNS cleanup failed");
-                            }
-                        }
-                        Err(err) => tracing::warn!(error = %err, "DNS cleanup derive failed"),
+        let cleanup = async {
+            for attempt in 0..3 {
+                match self.provider.delete_txt(&ct, &zone, &name, &value).await {
+                    Ok(()) => {
+                        self.presented
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&owner);
+                        return;
                     }
+                    Err(error) => tracing::warn!(%error, "DNS provider cleanup failed"),
                 }
-                Err(err) => tracing::warn!(error = %err, "DNS cleanup zone lookup failed"),
+                tokio::time::sleep(Duration::from_secs(attempt + 1)).await;
             }
         };
-        // Bounded effort: don't hang shutdown on a slow provider.
-        let _ = tokio::time::timeout(Duration::from_secs(30), fut).await;
+        let _ = tokio::time::timeout(Duration::from_secs(30), cleanup).await;
     }
 }
 
@@ -454,7 +487,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resolver.zones.lock().unwrap().as_slice(), ["example.com"]);
+        assert_eq!(
+            resolver.zones.lock().unwrap().as_slice(),
+            ["_acme-challenge.example.com"]
+        );
         {
             let queries = resolver.queries.lock().unwrap();
             assert_eq!(queries.len(), 1);
