@@ -4,7 +4,6 @@ version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/houseme/certmagic"
-homepage = "https://github.com/houseme/certmagic"
 documentation = "https://docs.rs/certmagic"
 description = "Automatic TLS certificate acquisition, renewal, and maintenance for Rust servers"
 keywords = ["tls", "acme", "letsencrypt", "https", "certificate"]
