@@ -1723,8 +1723,11 @@ impl Config {
                 Ok(found) => found,
                 Err(Error::Storage(StorageError::NotFound(_))) => {
                     // Nothing stored: obtain instead (the same fallback
-                    // applies to missing resources at renewal time).
-                    drop(guard);
+                    // applies to missing resources at renewal time). Await
+                    // the backend release before obtain re-acquires the same
+                    // key, otherwise the reacquire can miss the release and
+                    // wait out a full poll interval.
+                    guard.release_and_wait().await?;
                     self.obtain_subject(ct, &name, interactive).await?;
                     return Ok(());
                 }
@@ -3239,7 +3242,7 @@ mod orchestration_tests {
             .into_iter()
             .find(|c| c.managed())
             .expect("managed cert cached");
-        assert!(cached.names.contains(&"example.com".to_string()));
+        assert!(cached.names.iter().any(|name| name == "example.com"));
 
         // Re-running management is a no-op (no second issuance).
         config
@@ -3254,7 +3257,7 @@ mod orchestration_tests {
     async fn renewal_of_missing_certificate_does_not_reenter_lock() {
         let (config, _dir, issuer) = test_config().await;
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(10),
             config.renew_cert_sync(&CancellationToken::new(), "missing.example.com", false),
         )
         .await

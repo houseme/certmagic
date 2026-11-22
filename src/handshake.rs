@@ -828,7 +828,7 @@ mod logic_tests {
             .get_certificate(&ct, &hello_for("example.com"))
             .await
             .unwrap();
-        assert!(cert.names.contains(&"example.com".to_string()));
+        assert!(cert.names.iter().any(|name| name == "example.com"));
         Arc::clone(&config.cert_cache).stop_now();
     }
 
